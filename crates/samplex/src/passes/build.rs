@@ -53,6 +53,8 @@ use crate::partition::Partition;
 use crate::virtual_flow_graph::Direction;
 use crate::virtual_type::VirtualType;
 
+use super::utils::IntoPyResult;
+
 /// The synthesizer assumed when a box's annotations do not name one.
 ///
 /// Only `InjectLocalClifford` leaves this open — it has no `decomposition` field. Every other
@@ -167,7 +169,7 @@ pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(CircuitData, Distributio
         dag.num_ops(),
         Param::Float(0.0),
     )
-    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    .into_py_result()?;
     let mut build = Build {
         table: DistributionTable::new(),
         next_emit_id: 0,
@@ -226,7 +228,7 @@ impl Build {
     ) -> PyResult<()> {
         let annotations = box_annotations(py, inst)?;
         let resolved = resolve_annotations(&annotations)
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            .into_py_result()?;
 
         let locals = dag.qargs_interner().get(inst.qubits);
         let out_qargs = scope.out_qubits(locals)?;
@@ -565,13 +567,7 @@ fn box_annotations(py: Python, inst: &PackedInstruction) -> PyResult<Vec<BoxAnno
 }
 
 fn new_body(num_qubits: usize, num_clbits: usize, capacity: usize) -> PyResult<CircuitData> {
-    CircuitData::with_capacity(
-        num_qubits as u32,
-        num_clbits as u32,
-        capacity,
-        Param::Float(0.0),
-    )
-    .map_err(|err| PyValueError::new_err(err.to_string()))
+    super::utils::new_circuit_body(num_qubits, num_clbits, capacity)
 }
 
 /// Copy an instruction verbatim into `out`, remapping its bits through `scope`.
@@ -587,7 +583,7 @@ fn copy_instruction(
         Parameters::Params(inst.params_view().iter().cloned().collect::<SmallVec<[Param; 3]>>())
     });
     out.push_packed_operation(inst.op.clone(), params, &qargs, &cargs)
-        .map_err(|err| PyValueError::new_err(err.to_string()))
+        .into_py_result()
 }
 
 /// Write the `Emit` instructions belonging to one edge of a box, in the order given.
@@ -622,7 +618,7 @@ fn write_emissions(
             ob: emit.into_any(),
         });
         out.push_packed_operation(op, None, &qargs, &[])
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            .into_py_result()?;
     }
     Ok(())
 }
@@ -679,5 +675,5 @@ fn write_box(
     }));
     let block = out.add_block(body);
     out.push_packed_operation(op, Some(Parameters::Blocks(vec![block])), qargs, cargs)
-        .map_err(|err| PyValueError::new_err(err.to_string()))
+        .into_py_result()
 }

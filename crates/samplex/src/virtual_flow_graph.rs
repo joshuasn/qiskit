@@ -176,13 +176,18 @@ pub struct Collect {
     pub steps: Vec<CollectStep>,
 }
 
+/// Filter a slice of collect steps to just the absorbed gates, in order.
+pub fn collect_step_gates(steps: &[CollectStep]) -> impl Iterator<Item = &AbsorbedGate> {
+    steps.iter().filter_map(|step| match step {
+        CollectStep::Gate(gate) => Some(gate),
+        CollectStep::Emission(_) => None,
+    })
+}
+
 impl Collect {
     /// The absorbed gates, in circuit order, ignoring the emissions interleaved between them.
     pub fn gates(&self) -> impl Iterator<Item = &AbsorbedGate> {
-        self.steps.iter().filter_map(|step| match step {
-            CollectStep::Gate(gate) => Some(gate),
-            CollectStep::Emission(_) => None,
-        })
+        collect_step_gates(&self.steps)
     }
 }
 

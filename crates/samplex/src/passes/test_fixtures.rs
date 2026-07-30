@@ -1,0 +1,81 @@
+// This code is a Qiskit project.
+//
+// (C) Copyright IBM 2025, 2026.
+//
+// This code is licensed under the Apache License, Version 2.0. You may
+// obtain a copy of this license in the LICENSE.txt file in the root directory
+// of this source tree or at http://www.apache.org/licenses/LICENSE-2.0.
+//
+// Any modifications or derivative works of this code must retain this
+// copyright notice, and modified files need to carry a notice indicating
+// that they have been altered from the originals.
+
+use qiskit_circuit::standard_gate::StandardGate;
+
+use crate::annotated_circuit::{DistributionType, SynthesizerType};
+use crate::distributions::DistEntry;
+use crate::partition::Partition;
+use crate::virtual_flow_graph::*;
+
+pub fn emit_node(qubits: &[usize]) -> Node {
+    emission_node(
+        qubits,
+        DistEntry::Distribution(DistributionType::UniformPauli),
+    )
+}
+
+pub fn emission_node(qubits: &[usize], entry: DistEntry) -> Node {
+    Node {
+        partition: Partition::from_elements(qubits.iter().copied()),
+        kind: NodeKind::Emission(Emission {
+            id: 0,
+            entry,
+            direction: Direction::Right,
+            virtual_type: VirtualType::Pauli,
+        }),
+    }
+}
+
+pub fn typed_emit_node(qubits: &[usize], distribution: DistributionType) -> Node {
+    Node {
+        partition: Partition::from_elements(qubits.iter().copied()),
+        kind: NodeKind::Emission(Emission {
+            id: 0,
+            entry: DistEntry::Distribution(distribution),
+            direction: Direction::Right,
+            virtual_type: distribution.virtual_type(),
+        }),
+    }
+}
+
+pub fn propagate_node(qubits: &[usize]) -> Node {
+    propagate_node_with(qubits, StandardGate::CX, Direction::Right)
+}
+
+pub fn propagate_node_with(qubits: &[usize], gate: StandardGate, direction: Direction) -> Node {
+    Node {
+        partition: Partition::with_parts(std::iter::once(qubits.to_vec().into_boxed_slice()))
+            .unwrap(),
+        kind: NodeKind::Propagate(Propagate { gate, direction }),
+    }
+}
+
+pub fn collect_node(qubits: &[usize]) -> Node {
+    Node {
+        partition: Partition::from_elements(qubits.iter().copied()),
+        kind: NodeKind::Collect(Collect {
+            synthesizer: SynthesizerType::RzSx,
+            param_indices: vec![],
+            steps: Vec::new(),
+        }),
+    }
+}
+
+pub fn measure_node(qubits: &[usize]) -> Node {
+    Node {
+        partition: Partition::from_elements(qubits.iter().copied()),
+        kind: NodeKind::Measure(Measure {
+            clbit_indices: vec![0],
+        }),
+    }
+}

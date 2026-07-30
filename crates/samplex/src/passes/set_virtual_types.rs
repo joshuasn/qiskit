@@ -70,52 +70,10 @@ mod tests {
     use super::*;
     use crate::distributions::DistEntry;
     use crate::partition::Partition;
+    use crate::passes::test_fixtures::*;
     use crate::virtual_flow_graph::*;
 
-    use qiskit_circuit::standard_gate::StandardGate;
     use rustworkx_core::petgraph::stable_graph::NodeIndex;
-
-    /// An emission whose declared virtual type matches the distribution it draws from, which is what
-    /// the build pass guarantees.
-    fn typed_emit_node(qubits: &[usize], distribution: DistributionType) -> Node {
-        Node {
-            partition: Partition::from_elements(qubits.iter().copied()),
-            kind: NodeKind::Emission(Emission {
-                id: 0,
-                entry: DistEntry::Distribution(distribution),
-                direction: Direction::Right,
-                virtual_type: distribution.virtual_type(),
-            }),
-        }
-    }
-
-    fn emit_node(qubits: &[usize]) -> Node {
-        typed_emit_node(qubits, DistributionType::UniformPauli)
-    }
-
-    fn propagate_node(qubits: &[usize]) -> Node {
-        Node {
-            partition: Partition::with_parts(std::iter::once(
-                qubits.to_vec().into_boxed_slice(),
-            ))
-            .unwrap(),
-            kind: NodeKind::Propagate(Propagate {
-                gate: StandardGate::CX,
-                direction: Direction::Right,
-            }),
-        }
-    }
-
-    fn collect_node(qubits: &[usize]) -> Node {
-        Node {
-            partition: Partition::from_elements(qubits.iter().copied()),
-            kind: NodeKind::Collect(Collect {
-                synthesizer: SynthesizerType::RzSx,
-                param_indices: vec![],
-                steps: Vec::new(),
-            }),
-        }
-    }
 
     fn get_outgoing_vtypes(
         vfg: &VirtualFlowGraph,

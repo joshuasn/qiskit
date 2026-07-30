@@ -162,70 +162,40 @@ pub struct InjectNoiseSpec {
     pub site: InjectionSite,
 }
 
-fn parse_distribution(s: &str) -> PyResult<DistributionType> {
-    match s {
-        "uniform_pauli" => Ok(DistributionType::UniformPauli),
-        "balanced_uniform_pauli" => Ok(DistributionType::BalancedUniformPauli),
-        "uniform_pauli_subset" => Ok(DistributionType::UniformPauliSubset),
-        "uniform_c1" => Ok(DistributionType::UniformC1),
-        "uniform_local_c1" => Ok(DistributionType::UniformLocalC1),
-        "haar_u2" => Ok(DistributionType::HaarU2),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown distribution: '{s}'"
-        ))),
-    }
-}
+parse_enum!(parse_distribution, DistributionType, "distribution", {
+    "uniform_pauli" => UniformPauli,
+    "balanced_uniform_pauli" => BalancedUniformPauli,
+    "uniform_pauli_subset" => UniformPauliSubset,
+    "uniform_c1" => UniformC1,
+    "uniform_local_c1" => UniformLocalC1,
+    "haar_u2" => HaarU2,
+});
 
-fn parse_dressing(s: &str) -> PyResult<Dressing> {
-    match s {
-        "left" => Ok(Dressing::Left),
-        "right" => Ok(Dressing::Right),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown dressing: '{s}', expected 'left' or 'right'"
-        ))),
-    }
-}
+parse_enum!(parse_dressing, Dressing, "dressing", {
+    "left" => Left,
+    "right" => Right,
+});
 
-pub(crate) fn parse_decomposition(s: &str) -> PyResult<SynthesizerType> {
-    match s {
-        "rzsx" => Ok(SynthesizerType::RzSx),
-        "rzrx" => Ok(SynthesizerType::RzRx),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown decomposition: '{s}', expected 'rzsx' or 'rzrx'"
-        ))),
-    }
-}
+parse_enum!(pub(crate) parse_decomposition, SynthesizerType, "decomposition", {
+    "rzsx" => RzSx,
+    "rzrx" => RzRx,
+});
 
-fn parse_change_basis_mode(s: &str) -> PyResult<ChangeBasisMode> {
-    match s {
-        "prepare_pauli" => Ok(ChangeBasisMode::PreparePauli),
-        "measure_pauli" => Ok(ChangeBasisMode::MeasurePauli),
-        "local_clifford" => Ok(ChangeBasisMode::LocalClifford),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown change basis mode: '{s}'"
-        ))),
-    }
-}
+parse_enum!(parse_change_basis_mode, ChangeBasisMode, "change basis mode", {
+    "prepare_pauli" => PreparePauli,
+    "measure_pauli" => MeasurePauli,
+    "local_clifford" => LocalClifford,
+});
 
-fn parse_placement(s: &str) -> PyResult<Placement> {
-    match s {
-        "start" => Ok(Placement::Start),
-        "end" => Ok(Placement::End),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown placement: '{s}', expected 'start' or 'end'"
-        ))),
-    }
-}
+parse_enum!(parse_placement, Placement, "placement", {
+    "start" => Start,
+    "end" => End,
+});
 
-fn parse_injection_site(s: &str) -> PyResult<InjectionSite> {
-    match s {
-        "before" => Ok(InjectionSite::Before),
-        "after" => Ok(InjectionSite::After),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown injection site: '{s}', expected 'before' or 'after'"
-        ))),
-    }
-}
+parse_enum!(parse_injection_site, InjectionSite, "injection site", {
+    "before" => Before,
+    "after" => After,
+});
 
 impl From<Placement> for crate::virtual_flow_graph::Direction {
     fn from(placement: Placement) -> Self {

@@ -20,6 +20,9 @@ mod prune;
 mod set_virtual_types;
 mod utils;
 
+#[cfg(test)]
+pub(crate) mod test_fixtures;
+
 pub use merge_parallel_nodes::merge_parallel_nodes;
 pub use prune::{prune_unreachable_from_sinks, prune_unreachable_from_sources};
 pub use set_virtual_types::set_virtual_types;

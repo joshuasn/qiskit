@@ -24,8 +24,21 @@ use qiskit_circuit::operations::{ControlFlow, OperationRef};
 use qiskit_circuit::packed_instruction::PackedInstruction;
 use qiskit_circuit::{Clbit, Qubit};
 
+use qiskit_circuit::operations::Param;
+
 use crate::emission_circuit::{extract_collect, extract_emit, CollectSpec};
 use crate::virtual_flow_graph::{Edge, Node};
+
+/// Extension trait that converts any `Result<T, E: Display>` into `PyResult<T>` via `PyValueError`.
+pub(super) trait IntoPyResult<T> {
+    fn into_py_result(self) -> PyResult<T>;
+}
+
+impl<T, E: std::fmt::Display> IntoPyResult<T> for Result<T, E> {
+    fn into_py_result(self) -> PyResult<T> {
+        self.map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+}
 
 /// Compute topological generations using Kahn's algorithm.
 pub(super) fn topological_generations(
@@ -96,7 +109,7 @@ pub(super) fn copy_through(
         }
     };
     out.push_packed_operation(inst.op.clone(), params, &qargs, &cargs)
-        .map_err(|err| PyValueError::new_err(err.to_string()))
+        .into_py_result()
 }
 pub(super) fn params_of(inst: &PackedInstruction) -> Option<Parameters<qiskit_circuit::Block>> {
     (!inst.params_view().is_empty())
@@ -147,4 +160,19 @@ pub(super) fn emission_spec(
         OperationRef::PyCustom(py_inst) => extract_emit(py_inst.ob.bind(py)),
         _ => None,
     }
+}
+
+/// Create an empty `CircuitData` with the given dimensions.
+pub(super) fn new_circuit_body(
+    num_qubits: usize,
+    num_clbits: usize,
+    capacity: usize,
+) -> PyResult<CircuitData> {
+    CircuitData::with_capacity(
+        num_qubits as u32,
+        num_clbits as u32,
+        capacity,
+        Param::Float(0.0),
+    )
+    .into_py_result()
 }

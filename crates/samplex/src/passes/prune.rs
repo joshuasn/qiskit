@@ -11,22 +11,25 @@
 // that they have been altered from the originals.
 
 use hashbrown::HashSet;
-use rustworkx_core::petgraph::stable_graph::NodeIndex;
+use rustworkx_core::petgraph::stable_graph::{NodeIndex, StableDiGraph};
 use rustworkx_core::traversal::{ancestors, descendants};
 
-use crate::virtual_flow_graph::VirtualFlowGraph;
+use crate::virtual_flow_graph::{Edge, Node, NodeKind, VirtualFlowGraph};
 
-/// Remove nodes not reachable from any source (Emit, Reset, ChangeBasis, InjectNoise).
-pub fn prune_unreachable_from_sources(vfg: &mut VirtualFlowGraph) {
-    let sources: Vec<NodeIndex> = vfg
+fn prune_unreachable(
+    vfg: &mut VirtualFlowGraph,
+    is_seed: impl Fn(&NodeKind) -> bool,
+    traverse: impl Fn(&StableDiGraph<Node, Edge>, NodeIndex) -> Vec<NodeIndex>,
+) {
+    let seeds: Vec<NodeIndex> = vfg
         .graph
         .node_indices()
-        .filter(|&idx| vfg.graph[idx].kind.is_source())
+        .filter(|&idx| is_seed(&vfg.graph[idx].kind))
         .collect();
 
     let mut reachable: HashSet<NodeIndex> = HashSet::new();
-    for source in sources {
-        reachable.extend(descendants(&vfg.graph, source));
+    for seed in seeds {
+        reachable.extend(traverse(&vfg.graph, seed));
     }
 
     let to_remove: Vec<NodeIndex> = vfg
@@ -40,28 +43,22 @@ pub fn prune_unreachable_from_sources(vfg: &mut VirtualFlowGraph) {
     }
 }
 
+/// Remove nodes not reachable from any source (Emit, Reset, ChangeBasis, InjectNoise).
+pub fn prune_unreachable_from_sources(vfg: &mut VirtualFlowGraph) {
+    prune_unreachable(
+        vfg,
+        |kind| kind.is_source(),
+        |g, n| descendants(g, n).collect(),
+    );
+}
+
 /// Remove nodes that cannot reach any sink (Collect, Measure).
 pub fn prune_unreachable_from_sinks(vfg: &mut VirtualFlowGraph) {
-    let sinks: Vec<NodeIndex> = vfg
-        .graph
-        .node_indices()
-        .filter(|&idx| vfg.graph[idx].kind.is_sink())
-        .collect();
-
-    let mut reachable: HashSet<NodeIndex> = HashSet::new();
-    for sink in sinks {
-        reachable.extend(ancestors(&vfg.graph, sink));
-    }
-
-    let to_remove: Vec<NodeIndex> = vfg
-        .graph
-        .node_indices()
-        .filter(|idx| !reachable.contains(idx))
-        .collect();
-
-    for idx in to_remove {
-        vfg.graph.remove_node(idx);
-    }
+    prune_unreachable(
+        vfg,
+        |kind| kind.is_sink(),
+        |g, n| ancestors(g, n).collect(),
+    );
 }
 
 #[cfg(test)]
@@ -69,61 +66,8 @@ mod tests {
     use super::*;
     use crate::distributions::DistEntry;
     use crate::partition::Partition;
+    use crate::passes::test_fixtures::*;
     use crate::virtual_flow_graph::*;
-
-    use qiskit_circuit::standard_gate::StandardGate;
-
-    fn emission_node(qubits: &[usize], entry: DistEntry) -> Node {
-        Node {
-            partition: Partition::from_elements(qubits.iter().copied()),
-            kind: NodeKind::Emission(Emission {
-                id: 0,
-                entry,
-                direction: Direction::Right,
-                virtual_type: VirtualType::Pauli,
-            }),
-        }
-    }
-
-    fn emit_node(qubits: &[usize]) -> Node {
-        emission_node(
-            qubits,
-            DistEntry::Distribution(DistributionType::UniformPauli),
-        )
-    }
-
-    fn propagate_node(qubits: &[usize]) -> Node {
-        Node {
-            partition: Partition::with_parts(std::iter::once(
-                qubits.to_vec().into_boxed_slice(),
-            ))
-            .unwrap(),
-            kind: NodeKind::Propagate(Propagate {
-                gate: StandardGate::CX,
-                direction: Direction::Right,
-            }),
-        }
-    }
-
-    fn collect_node(qubits: &[usize]) -> Node {
-        Node {
-            partition: Partition::from_elements(qubits.iter().copied()),
-            kind: NodeKind::Collect(Collect {
-                synthesizer: SynthesizerType::RzSx,
-                param_indices: vec![],
-                steps: Vec::new(),
-            }),
-        }
-    }
-
-    fn measure_node(qubits: &[usize]) -> Node {
-        Node {
-            partition: Partition::from_elements(qubits.iter().copied()),
-            kind: NodeKind::Measure(Measure {
-                clbit_indices: vec![0],
-            }),
-        }
-    }
 
     #[test]
     fn test_simple_chain_survives() {

@@ -53,7 +53,7 @@ use qiskit_circuit::packed_instruction::PackedOperation;
 use qiskit_circuit::Qubit;
 
 use super::utils::{
-    block_body, collect_annotation, copy_through, params_of, qubit_indices,
+    IntoPyResult, block_body, collect_annotation, copy_through, params_of, qubit_indices,
 };
 use crate::annotated_circuit::SynthesizerType;
 use crate::emission_circuit::{Collect, CollectItem, CollectSpec};
@@ -239,7 +239,7 @@ fn materialize(
         items.len(),
         Param::Float(0.0),
     )
-    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    .into_py_result()?;
 
     for item in items {
         match item {
@@ -280,7 +280,7 @@ fn write_collector(py: Python, out: &mut CircuitData, collector: &OpenCollector)
                 .collect::<PyResult<_>>()?;
             let params = params_of(inst);
             body.push_packed_operation(inst.op.clone(), params, &qargs, &[])
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                .into_py_result()?;
         }
     }
 
@@ -305,11 +305,10 @@ fn write_collector(py: Python, out: &mut CircuitData, collector: &OpenCollector)
     }));
     let block = out.add_block(body);
     out.push_packed_operation(op, Some(Parameters::Blocks(vec![block])), &qargs, &[])
-        .map_err(|err| PyValueError::new_err(err.to_string()))
+        .into_py_result()
 }
 
 fn new_body(num_qubits: usize) -> PyResult<CircuitData> {
-    CircuitData::with_capacity(num_qubits as u32, 0, 0, Param::Float(0.0))
-        .map_err(|err| PyValueError::new_err(err.to_string()))
+    super::utils::new_circuit_body(num_qubits, 0, 0)
 }
 

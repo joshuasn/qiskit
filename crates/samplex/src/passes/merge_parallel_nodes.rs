@@ -113,45 +113,51 @@ pub fn merge_parallel_nodes(vfg: &mut VirtualFlowGraph) {
 
                 let merged_idx = vfg.graph.add_node(merged_node);
 
-                // Rewire edges, at most one per neighbour: with direction on the nodes, two edges to
-                // the same neighbour can no longer differ in anything.
-                let mut seen_incoming: HashSet<NodeIndex> = HashSet::new();
-                let mut seen_outgoing: HashSet<NodeIndex> = HashSet::new();
-
-                for &old_idx in &cluster {
-                    let incoming: Vec<_> = vfg
-                        .graph
-                        .edges_directed(old_idx, PetDirection::Incoming)
-                        .map(|e| (e.source(), *e.weight()))
-                        .collect();
-                    for (src, edge) in incoming {
-                        if cluster.contains(&src) {
-                            continue;
-                        }
-                        if seen_incoming.insert(src) {
-                            vfg.graph.add_edge(src, merged_idx, edge);
-                        }
-                    }
-
-                    let outgoing: Vec<_> = vfg
-                        .graph
-                        .edges_directed(old_idx, PetDirection::Outgoing)
-                        .map(|e| (e.target(), *e.weight()))
-                        .collect();
-                    for (tgt, edge) in outgoing {
-                        if cluster.contains(&tgt) {
-                            continue;
-                        }
-                        if seen_outgoing.insert(tgt) {
-                            vfg.graph.add_edge(merged_idx, tgt, edge);
-                        }
-                    }
-                }
+                rewire_edges(vfg, &cluster, merged_idx);
 
                 // Remove old nodes
                 for &old_idx in &cluster {
                     vfg.graph.remove_node(old_idx);
                 }
+            }
+        }
+    }
+}
+
+fn rewire_edges(
+    vfg: &mut VirtualFlowGraph,
+    cluster: &[NodeIndex],
+    merged_idx: NodeIndex,
+) {
+    let mut seen_incoming: HashSet<NodeIndex> = HashSet::new();
+    let mut seen_outgoing: HashSet<NodeIndex> = HashSet::new();
+
+    for &old_idx in cluster {
+        let incoming: Vec<_> = vfg
+            .graph
+            .edges_directed(old_idx, PetDirection::Incoming)
+            .map(|e| (e.source(), *e.weight()))
+            .collect();
+        for (src, edge) in incoming {
+            if cluster.contains(&src) {
+                continue;
+            }
+            if seen_incoming.insert(src) {
+                vfg.graph.add_edge(src, merged_idx, edge);
+            }
+        }
+
+        let outgoing: Vec<_> = vfg
+            .graph
+            .edges_directed(old_idx, PetDirection::Outgoing)
+            .map(|e| (e.target(), *e.weight()))
+            .collect();
+        for (tgt, edge) in outgoing {
+            if cluster.contains(&tgt) {
+                continue;
+            }
+            if seen_outgoing.insert(tgt) {
+                vfg.graph.add_edge(merged_idx, tgt, edge);
             }
         }
     }
@@ -194,49 +200,11 @@ fn build_merged_node(nodes: &[&Node]) -> Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distributions::DistEntry;
-    use crate::partition::Partition;
+    use crate::passes::test_fixtures::*;
     use crate::virtual_flow_graph::*;
-
-    fn emit_node(qubits: &[usize]) -> Node {
-        Node {
-            partition: Partition::from_elements(qubits.iter().copied()),
-            kind: NodeKind::Emission(Emission {
-                id: 0,
-                entry: DistEntry::Distribution(DistributionType::UniformPauli),
-                direction: Direction::Right,
-                virtual_type: VirtualType::Pauli,
-            }),
-        }
-    }
-
-    fn propagate_node(qubits: &[usize]) -> Node {
-        propagate_node_with(qubits, StandardGate::CX, Direction::Right)
-    }
 
     fn propagate_node_with_gate(qubits: &[usize], gate: StandardGate) -> Node {
         propagate_node_with(qubits, gate, Direction::Right)
-    }
-
-    fn propagate_node_with(qubits: &[usize], gate: StandardGate, direction: Direction) -> Node {
-        Node {
-            partition: Partition::with_parts(std::iter::once(
-                qubits.to_vec().into_boxed_slice(),
-            ))
-            .unwrap(),
-            kind: NodeKind::Propagate(Propagate { gate, direction }),
-        }
-    }
-
-    fn collect_node(qubits: &[usize]) -> Node {
-        Node {
-            partition: Partition::from_elements(qubits.iter().copied()),
-            kind: NodeKind::Collect(Collect {
-                synthesizer: SynthesizerType::RzSx,
-                param_indices: vec![],
-                steps: Vec::new(),
-            }),
-        }
     }
 
     #[test]

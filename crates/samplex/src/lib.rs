@@ -12,6 +12,20 @@
 
 use pyo3::prelude::*;
 
+macro_rules! parse_enum {
+    ($vis:vis $fn_name:ident, $enum_type:ty, $label:literal,
+     { $($str:literal => $variant:ident),+ $(,)? }) => {
+        $vis fn $fn_name(s: &str) -> pyo3::PyResult<$enum_type> {
+            match s {
+                $( $str => Ok(<$enum_type>::$variant), )+
+                _ => Err(pyo3::exceptions::PyValueError::new_err(
+                    format!(concat!("Unknown ", $label, ": '{}'"), s)
+                )),
+            }
+        }
+    };
+}
+
 pub mod annotated_circuit;
 pub mod distributions;
 pub mod error;

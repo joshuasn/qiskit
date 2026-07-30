@@ -60,38 +60,23 @@ impl EmitSource {
     }
 }
 
-fn parse_source(s: &str) -> PyResult<EmitSource> {
-    match s {
-        "twirl" => Ok(EmitSource::Twirl),
-        "inject_noise" => Ok(EmitSource::InjectNoise),
-        "change_basis" => Ok(EmitSource::ChangeBasis),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown emit source: '{s}', expected 'twirl', 'inject_noise' or 'change_basis'"
-        ))),
-    }
-}
+parse_enum!(parse_source, EmitSource, "emit source", {
+    "twirl" => Twirl,
+    "inject_noise" => InjectNoise,
+    "change_basis" => ChangeBasis,
+});
 
-fn parse_direction(s: &str) -> PyResult<Direction> {
-    match s {
-        "left" => Ok(Direction::Left),
-        "right" => Ok(Direction::Right),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown direction: '{s}', expected 'left' or 'right'"
-        ))),
-    }
-}
+parse_enum!(parse_direction, Direction, "direction", {
+    "left" => Left,
+    "right" => Right,
+});
 
-fn parse_virtual_type(s: &str) -> PyResult<VirtualType> {
-    match s {
-        "pauli" => Ok(VirtualType::Pauli),
-        "c1" => Ok(VirtualType::C1),
-        "u2" => Ok(VirtualType::U2),
-        "z2" => Ok(VirtualType::Z2),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown virtual type: '{s}', expected 'pauli', 'c1', 'u2' or 'z2'"
-        ))),
-    }
-}
+parse_enum!(parse_virtual_type, VirtualType, "virtual type", {
+    "pauli" => Pauli,
+    "c1" => C1,
+    "u2" => U2,
+    "z2" => Z2,
+});
 
 /// The payload of an [`Emit`] instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]

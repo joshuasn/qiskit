@@ -43,7 +43,9 @@ use rustworkx_core::petgraph::stable_graph::NodeIndex;
 
 use qiskit_circuit::operations::StandardInstruction;
 
-use super::utils::{block_body, collect_annotation, copy_through, emission_spec, is_emission};
+use super::utils::{
+    IntoPyResult, block_body, collect_annotation, copy_through, emission_spec, is_emission,
+};
 use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::{DistEntry, DistributionTable};
 use crate::emission_circuit::{CollectItem, EmitSource, EmitSpec};
@@ -84,7 +86,7 @@ pub fn build_template(
         circuit.len(),
         Param::Float(0.0),
     )
-    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    .into_py_result()?;
     let mut collectors = Vec::new();
     let mut next_param = 0usize;
 
@@ -237,7 +239,7 @@ fn write_synth_template(
         for (gate, angle) in sequence {
             let params: Vec<Param> = angle.into_iter().cloned().collect();
             out.push_standard_gate(gate, &params, &target)
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                .into_py_result()?;
         }
     }
     Ok(())
@@ -288,7 +290,7 @@ fn copy_with_qargs(
         });
         return out
             .push_packed_operation(inst.op.clone(), params, qargs, cargs)
-            .map_err(|err| PyValueError::new_err(err.to_string()));
+            .into_py_result();
     }
     // Control flow other than `box` never reaches here — build rejects it.
     copy_through(src, inst, out, None)
@@ -313,10 +315,7 @@ impl CollectorInfo {
     /// The absorbed gates alone, in circuit order. Used by an *enclosing* emission crossing this
     /// collector, which conjugates by the gates and ignores what the collector consumes.
     fn gates(&self) -> impl Iterator<Item = &AbsorbedGate> {
-        self.steps.iter().filter_map(|step| match step {
-            CollectStep::Gate(gate) => Some(gate),
-            CollectStep::Emission(_) => None,
-        })
+        crate::virtual_flow_graph::collect_step_gates(&self.steps)
     }
 }
 
