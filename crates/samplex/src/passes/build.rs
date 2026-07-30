@@ -1,0 +1,683 @@
+// This code is a Qiskit project.
+//
+// (C) Copyright IBM 2026.
+//
+// This code is licensed under the Apache License, Version 2.0. You may
+// obtain a copy of this license in the LICENSE.txt file in the root directory
+// of this source tree or at http://www.apache.org/licenses/LICENSE-2.0.
+//
+// Any modifications or derivative works of this code must retain this
+// copyright notice, and modified files need to carry a notice indicating
+// that they have been altered from the originals.
+
+//! Build pass: annotated circuit (IR1) → emission circuit (IR2).
+//!
+//! Turns each annotated box into `Emit` instructions plus the collect boxes that consume them, and a
+//! box holding the gates virtual state is conjugated by. Also produces the [`DistributionTable`] those
+//! emissions reference.
+//!
+//! **This pass is purely local.** Every annotated box yields exactly two collect boxes, one per side,
+//! consuming only its own emissions and absorbing only its own easy gates. There is no cross-box
+//! state: no qubit-to-collector map, no detach logic, no shared collectors. Merging adjacent
+//! collectors is `merge_collectors`' job, and because that pass rebuilds rather than mutates it can
+//! widen boxes, which this pass could not (a `DAGCircuit` box cannot be widened in place). The
+//! consequence here is that a collect box is *complete* the moment it is emitted, so this is a single
+//! forward sweep with no deferred buffer.
+//!
+//! Parameters are deliberately absent: merging changes how many collectors exist and how wide they
+//! are, so labelling happens in the IR2 → IR3 lowering. See `SAMPLEX_IR_DESIGN.md`.
+
+use hashbrown::HashSet;
+use smallvec::SmallVec;
+
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use qiskit_circuit::annotation::PyAnnotation;
+use qiskit_circuit::circuit_data::{CircuitData, PyCircuitData};
+use qiskit_circuit::dag_circuit::DAGCircuit;
+use qiskit_circuit::instruction::Parameters;
+use qiskit_circuit::operations::{
+    ControlFlow, ControlFlowInstruction, ControlFlowView, Operation, OperationRef, Param,
+    PyInstruction, PyOpKind,
+};
+use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
+use qiskit_circuit::{Clbit, Qubit};
+
+use crate::annotated_circuit::{
+    extract_annotation, resolve_annotations, BasisOrigin, BoxAnnotation, Dressing, ResolvedBox,
+    SynthesizerType,
+};
+use crate::distributions::{DistEntry, DistributionTable};
+use crate::emission_circuit::{Collect, CollectItem, CollectSpec, Emit, EmitSource, EmitSpec};
+use crate::partition::Partition;
+use crate::virtual_flow_graph::Direction;
+use crate::virtual_type::VirtualType;
+
+/// The synthesizer assumed when a box's annotations do not name one.
+///
+/// Only `InjectLocalClifford` leaves this open — it has no `decomposition` field. Every other
+/// annotation defaults to `rzsx`, so that is the assumption here too.
+const DEFAULT_SYNTHESIZER: SynthesizerType = SynthesizerType::RzSx;
+
+/// How deeply an emission nests inside its box, `0` being immediately against the hard content.
+///
+/// This is the ordering the annotation vocabulary implies, and it is what fixes both the spine order and
+/// each collector's composition order:
+///
+/// - A **twirl** *is* the easy/hard boundary, so its pair is innermost.
+/// - An **injection** — noise, or a local Clifford — happens *to the hard content*, so it sits just
+///   outside the twirl point. `InjectLocalClifford` belongs here rather than with `ChangeBasis` despite
+///   resolving to the same `ResolvedBasis`; that is what [`BasisOrigin`] records.
+/// - A **basis change** applies to the box as a whole, so it is outermost — outside even the easy gates
+///   the dressing absorbed.
+///
+/// For a left-dressed box with all of them, the spine reads
+/// `collector, basis start, [easy gates], injections before + twirl, hard, injections after, basis end,
+/// collector`.
+const DEPTH_TWIRL: u8 = 0;
+const DEPTH_INJECTION: u8 = 1;
+const DEPTH_BASIS: u8 = 2;
+
+/// An emission together with where it goes on its box's spine.
+struct Placed {
+    spec: EmitSpec,
+    /// Which side of the hard box it is written on.
+    edge: Direction,
+    /// Distance from the hard content; see the `DEPTH_*` constants.
+    depth: u8,
+}
+
+/// How a walked scope's qubits map outward.
+///
+/// A scope is always walked alongside an output circuit of the same width, so a scope-local index is
+/// also an index into that output. `global` is what the emissions record, since the sampling graph
+/// works in the circuit's own frame rather than any box's.
+struct Scope<'a> {
+    /// Scope-local qubit → index in the output being written.
+    qubits: &'a [usize],
+    /// Scope-local qubit → global circuit qubit.
+    global: &'a [usize],
+    /// Scope-local clbit → index in the output being written.
+    clbits: &'a [usize],
+}
+
+impl Scope<'_> {
+    fn out_qubits(&self, locals: &[Qubit]) -> PyResult<Vec<Qubit>> {
+        locals
+            .iter()
+            .map(|q| {
+                self.qubits
+                    .get(q.index())
+                    .map(|&i| Qubit(i as u32))
+                    .ok_or_else(|| PyValueError::new_err(format!("qubit {} out of scope", q.index())))
+            })
+            .collect()
+    }
+
+    fn out_clbits(&self, locals: &[Clbit]) -> PyResult<Vec<Clbit>> {
+        locals
+            .iter()
+            .map(|c| {
+                self.clbits
+                    .get(c.index())
+                    .map(|&i| Clbit(i as u32))
+                    .ok_or_else(|| {
+                        PyValueError::new_err(format!("clbit {} out of scope", c.index()))
+                    })
+            })
+            .collect()
+    }
+
+    fn global_qubits(&self, locals: &[Qubit]) -> PyResult<Vec<usize>> {
+        locals
+            .iter()
+            .map(|q| {
+                self.global.get(q.index()).copied().ok_or_else(|| {
+                    PyValueError::new_err(format!("qubit {} out of scope", q.index()))
+                })
+            })
+            .collect()
+    }
+}
+
+struct Build {
+    table: DistributionTable,
+    next_emit_id: u32,
+}
+
+/// Build the emission circuit for an annotated circuit.
+#[pyfunction]
+#[pyo3(name = "build_lowered")]
+pub fn py_build(py: Python, dag: &DAGCircuit) -> PyResult<(PyCircuitData, DistributionTable)> {
+    let (circuit, table) = build(py, dag)?;
+    Ok((PyCircuitData { inner: circuit }, table))
+}
+
+/// Build the emission circuit for an annotated circuit.
+pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(CircuitData, DistributionTable)> {
+    crate::emission_circuit::ensure_registered(py)?;
+    let num_qubits = dag.num_qubits();
+    let num_clbits = dag.num_clbits();
+    let identity_q: Vec<usize> = (0..num_qubits).collect();
+    let identity_c: Vec<usize> = (0..num_clbits).collect();
+
+    let mut out = CircuitData::with_capacity(
+        num_qubits as u32,
+        num_clbits as u32,
+        dag.num_ops(),
+        Param::Float(0.0),
+    )
+    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let mut build = Build {
+        table: DistributionTable::new(),
+        next_emit_id: 0,
+    };
+    let scope = Scope {
+        qubits: &identity_q,
+        global: &identity_q,
+        clbits: &identity_c,
+    };
+    build.walk(py, dag, &mut out, &scope)?;
+    Ok((out, build.table))
+}
+
+impl Build {
+    fn fresh_id(&mut self) -> u32 {
+        let id = self.next_emit_id;
+        self.next_emit_id += 1;
+        id
+    }
+
+    /// Emit the IR2 form of every op in `dag` into `out`.
+    fn walk(
+        &mut self,
+        py: Python,
+        dag: &DAGCircuit,
+        out: &mut CircuitData,
+        scope: &Scope,
+    ) -> PyResult<()> {
+        for node in dag.topological_op_nodes(false) {
+            let inst = dag.dag()[node].unwrap_operation();
+            match inst.op.view() {
+                OperationRef::ControlFlow(cf) => {
+                    if !matches!(cf.control_flow, ControlFlow::Box { .. }) {
+                        return Err(PyValueError::new_err(format!(
+                            "Unsupported control flow in a samplex circuit: '{}'. Only `box` is \
+                             supported; see the control-flow section of SAMPLEX_IR_DESIGN.md.",
+                            cf.name()
+                        )));
+                    }
+                    self.walk_box(py, dag, inst, out, scope)?;
+                }
+                _ => copy_instruction(dag, inst, out, scope)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Lower one annotated box, or flatten it if it emits nothing.
+    fn walk_box(
+        &mut self,
+        py: Python,
+        dag: &DAGCircuit,
+        inst: &PackedInstruction,
+        out: &mut CircuitData,
+        scope: &Scope,
+    ) -> PyResult<()> {
+        let annotations = box_annotations(py, inst)?;
+        let resolved = resolve_annotations(&annotations)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let locals = dag.qargs_interner().get(inst.qubits);
+        let out_qargs = scope.out_qubits(locals)?;
+        let global = scope.global_qubits(locals)?;
+        let body = match dag.try_view_control_flow(inst) {
+            Some(ControlFlowView::Box { body, .. }) => body,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "box instruction is missing its body",
+                ))
+            }
+        };
+        let body_clbits: Vec<usize> = dag
+            .cargs_interner()
+            .get(inst.clbits)
+            .iter()
+            .map(|c| c.index())
+            .collect();
+        let out_cargs = scope.out_clbits(dag.cargs_interner().get(inst.clbits))?;
+
+        // A box that emits nothing — unannotated, or `Tag` only — is a transparent wrapper. Flatten
+        // it: walk its body straight into the current output, remapped through this box's qargs.
+        if !resolved.is_emitting() {
+            let flat_q: Vec<usize> = out_qargs.iter().map(|q| q.index()).collect();
+            let flat_c: Vec<usize> = out_cargs.iter().map(|c| c.index()).collect();
+            let inner = Scope {
+                qubits: &flat_q,
+                global: &global,
+                clbits: &flat_c,
+            };
+            return self.walk(py, body, out, &inner);
+        }
+
+        let dressing = resolved.dressing.unwrap_or(Dressing::Left);
+        let emissions = self.build_emissions(&resolved, &global, dressing);
+        let synthesizer = resolved.synthesizer.unwrap_or(DEFAULT_SYNTHESIZER);
+
+        // Both the spine and each collector's `collects` are ordered by nesting depth, so the two agree
+        // by construction. Reading in circuit order that is outermost-first on the left and
+        // innermost-first on the right. The sorts are stable, so a twirl's two halves keep their order.
+        let ordered = |select: &dyn Fn(&Placed) -> bool, side: Direction| -> Vec<&Placed> {
+            let mut group: Vec<&Placed> = emissions.iter().filter(|p| select(p)).collect();
+            match side {
+                Direction::Left => group.sort_by_key(|p| std::cmp::Reverse(p.depth)),
+                Direction::Right => group.sort_by_key(|p| p.depth),
+            }
+            group
+        };
+        // One collector's composition order: its emissions, plus a `Gates` item if it is the side
+        // holding the absorbed easy gates.
+        //
+        // The gates sit *inside* the basis change and *outside* the injections and twirl — they are
+        // part of the box's content, so a frame change for the whole box wraps them, while anything
+        // attached to the hard content composes nearer to it. Left runs outermost-first so the gates
+        // follow the basis items; right runs innermost-first so they precede them.
+        let items = |direction: Direction, gates: usize| -> Vec<CollectItem> {
+            let group = ordered(&|p| p.spec.direction == direction, direction);
+            let mut items = Vec::with_capacity(group.len() + 1);
+            let mut written = gates == 0;
+            for placed in group {
+                let boundary = match direction {
+                    Direction::Left => placed.depth < DEPTH_BASIS,
+                    Direction::Right => placed.depth >= DEPTH_BASIS,
+                };
+                if !written && boundary {
+                    items.push(CollectItem::Gates(gates));
+                    written = true;
+                }
+                items.push(CollectItem::Emission(placed.spec.id));
+            }
+            if !written {
+                items.push(CollectItem::Gates(gates));
+            }
+            items
+        };
+
+        // The body splits into gates the dressing can absorb and everything else. Nested annotated
+        // boxes are always "everything else", and are lowered recursively into the hard box so that
+        // an outer emission crossing them sees their real gates.
+        let width = locals.len();
+        let inner_global = global.clone();
+        let inner_identity_q: Vec<usize> = (0..width).collect();
+        let inner_identity_c: Vec<usize> = (0..body_clbits.len()).collect();
+        let inner = Scope {
+            qubits: &inner_identity_q,
+            global: &inner_global,
+            clbits: &inner_identity_c,
+        };
+
+        let mut easy = new_body(width, body_clbits.len(), body.num_ops())?;
+        let mut hard = new_body(width, body_clbits.len(), body.num_ops())?;
+        self.split_body(
+            py,
+            body,
+            resolved.dressing,
+            &mut Split {
+                easy: &mut easy,
+                hard: &mut hard,
+            },
+            &inner,
+        )?;
+
+        // Easy gates are absorbed on the side they were swept from, which is also where they
+        // physically belong — so only that side's collector accounts for them in its items.
+        let absorbed = easy.len();
+        let (left_body, right_body) = match dressing {
+            Dressing::Left => (easy, new_body(width, body_clbits.len(), 0)?),
+            Dressing::Right => (new_body(width, body_clbits.len(), 0)?, easy),
+        };
+        let (left_gates, right_gates) = match dressing {
+            Dressing::Left => (absorbed, 0),
+            Dressing::Right => (0, absorbed),
+        };
+
+        let left = CollectSpec {
+            synthesizer,
+            items: items(Direction::Left, left_gates),
+        };
+        let right = CollectSpec {
+            synthesizer,
+            items: items(Direction::Right, right_gates),
+        };
+
+        // Each emission is written at the edge it belongs to — see [`emission_edge`] — so the hard box
+        // sits between the two groups and every emission's propagation follows from position alone.
+        write_collect(py, out, left, left_body, &out_qargs, &out_cargs)?;
+        write_emissions(
+            py,
+            out,
+            &ordered(&|p| p.edge == Direction::Left, Direction::Left),
+            scope,
+        )?;
+        write_hard_box(out, hard, &out_qargs, &out_cargs)?;
+        write_emissions(
+            py,
+            out,
+            &ordered(&|p| p.edge == Direction::Right, Direction::Right),
+            scope,
+        )?;
+        write_collect(py, out, right, right_body, &out_qargs, &out_cargs)?;
+        Ok(())
+    }
+
+    /// Turn a resolved box into its emissions, each tagged with where on the spine it belongs.
+    ///
+    /// A `Twirl` yields **two** — the inverse pair — sharing one table key with opposite directions;
+    /// the inversion is implied by the direction rather than recorded. Its pair goes on the *dressing*
+    /// edge, because that edge is the twirl point and the easy/hard split is defined relative to it.
+    ///
+    /// A basis change or noise injection yields one, on the edge its own `placement` / `site` names —
+    /// **not** the dressing edge. When the two differ the hard box would otherwise sit between the
+    /// emission and the collector consuming it, so the propagation walk would conjugate it by content it
+    /// is meant to sit outside of. None of these ever propagate through hard content.
+    fn build_emissions(
+        &mut self,
+        resolved: &ResolvedBox,
+        qubits: &[usize],
+        dressing: Dressing,
+    ) -> Vec<Placed> {
+        let partition = Partition::from_elements(qubits.iter().copied());
+        let dressing_edge = match dressing {
+            Dressing::Left => Direction::Left,
+            Dressing::Right => Direction::Right,
+        };
+        let mut emissions = Vec::new();
+
+        if let Some(twirl) = &resolved.twirl {
+            let dist = self
+                .table
+                .intern(DistEntry::Distribution(twirl.distribution));
+            let virtual_type = twirl.distribution.virtual_type();
+            for direction in [Direction::Left, Direction::Right] {
+                let id = self.fresh_id();
+                emissions.push(Placed {
+                    spec: EmitSpec {
+                        id,
+                        source: EmitSource::Twirl,
+                        dist,
+                        direction,
+                        virtual_type,
+                        partition: partition.clone(),
+                    },
+                    edge: dressing_edge,
+                    depth: DEPTH_TWIRL,
+                });
+            }
+        }
+        if let Some(basis) = &resolved.change_basis {
+            let dist = self.table.intern(DistEntry::Basis {
+                mode: basis.mode,
+                ref_id: basis.ref_id.clone(),
+            });
+            let id = self.fresh_id();
+            let direction: Direction = basis.placement.into();
+            emissions.push(Placed {
+                spec: EmitSpec {
+                    id,
+                    source: EmitSource::ChangeBasis,
+                    dist,
+                    direction,
+                    virtual_type: basis.mode.virtual_type(),
+                    partition: partition.clone(),
+                },
+                edge: direction,
+                // The one place the two basis annotations part ways: a local-Clifford injection flanks
+                // the hard content, a basis change wraps the whole box.
+                depth: match basis.origin {
+                    BasisOrigin::ChangeBasis => DEPTH_BASIS,
+                    BasisOrigin::InjectLocalClifford => DEPTH_INJECTION,
+                },
+            });
+        }
+        if let Some(noise) = &resolved.inject_noise {
+            let dist = self.table.intern(DistEntry::Noise {
+                reference: noise.reference.clone(),
+                modifier: noise.modifier.clone(),
+            });
+            let id = self.fresh_id();
+            let direction: Direction = noise.site.into();
+            emissions.push(Placed {
+                spec: EmitSpec {
+                    id,
+                    source: EmitSource::InjectNoise,
+                    dist,
+                    direction,
+                    virtual_type: VirtualType::Pauli,
+                    partition: partition.clone(),
+                },
+                edge: direction,
+                depth: DEPTH_INJECTION,
+            });
+        }
+        emissions
+    }
+
+    /// Sweep a box body from the dressing edge, splitting absorbable gates from the rest.
+    ///
+    /// **Per qubit, not one latch for the whole body.** A single-qubit gate on a wire that no
+    /// multi-qubit gate has touched is still at the dressing edge *on its own wire*, so it commutes out
+    /// and folds into the dressing even when it sits after an entangler elsewhere in the body.
+    ///
+    /// Poisoning over a topological order is exactly DAG ancestry: a gate is absorbable iff every one
+    /// of its ancestors was absorbed, and since absorbed gates all move to the dressing edge keeping
+    /// their relative order, such a gate can move there too. Poison spreads transitively, so
+    /// `cx(0,1); cx(1,2); s(2)` correctly leaves the `s` as content.
+    fn split_body(
+        &mut self,
+        py: Python,
+        body: &DAGCircuit,
+        dressing: Option<Dressing>,
+        split: &mut Split,
+        scope: &Scope,
+    ) -> PyResult<()> {
+        let nodes: Vec<_> = body.topological_op_nodes(false).collect();
+        // Sweeping from the right means visiting in reverse, then restoring circuit order.
+        let right = matches!(dressing, Some(Dressing::Right));
+        let order: Vec<_> = if right {
+            nodes.iter().rev().copied().collect()
+        } else {
+            nodes.clone()
+        };
+
+        // No dressing at all means nothing is absorbable, which poisoning every wire expresses.
+        let dressed = dressing.is_some();
+        let mut poisoned: HashSet<usize> = HashSet::new();
+        let mut easy_nodes = Vec::new();
+        let mut hard_nodes = Vec::new();
+        for node in order {
+            let inst = body.dag()[node].unwrap_operation();
+            let qargs = body.qargs_interner().get(inst.qubits);
+            let absorbable =
+                dressed && is_absorbable(body, inst) && !poisoned.contains(&qargs[0].index());
+            if absorbable {
+                easy_nodes.push(node);
+            } else {
+                poisoned.extend(qargs.iter().map(|q| q.index()));
+                hard_nodes.push(node);
+            }
+        }
+        if right {
+            easy_nodes.reverse();
+            hard_nodes.reverse();
+        }
+
+        for node in easy_nodes {
+            copy_instruction(body, body.dag()[node].unwrap_operation(), split.easy, scope)?;
+        }
+        for node in hard_nodes {
+            let inst = body.dag()[node].unwrap_operation();
+            match inst.op.view() {
+                OperationRef::ControlFlow(cf) => {
+                    if !matches!(cf.control_flow, ControlFlow::Box { .. }) {
+                        return Err(PyValueError::new_err(format!(
+                            "Unsupported control flow in a samplex circuit: '{}'.",
+                            cf.name()
+                        )));
+                    }
+                    // A nested annotated box is lowered in place, so its collect boxes and
+                    // emissions land inside this hard box. An outer emission's walk descends into
+                    // boxes, so it crosses the inner box's gates — including the ones the inner
+                    // dressing absorbed, which are still real gates in the inner collector's body
+                    // at this stage.
+                    self.walk_box(py, body, inst, split.hard, scope)?;
+                }
+                _ => copy_instruction(body, inst, split.hard, scope)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where a body sweep puts each instruction: absorbed into the dressing, or left as content.
+struct Split<'a> {
+    easy: &'a mut CircuitData,
+    hard: &'a mut CircuitData,
+}
+
+/// Whether the dressing can absorb this instruction: a single-qubit standard gate.
+fn is_absorbable(dag: &DAGCircuit, inst: &PackedInstruction) -> bool {
+    matches!(inst.op.view(), OperationRef::StandardGate(_))
+        && dag.qargs_interner().get(inst.qubits).len() == 1
+}
+
+/// The `BoxAnnotation`s on a box instruction. Annotations that are not ours are ignored.
+fn box_annotations(py: Python, inst: &PackedInstruction) -> PyResult<Vec<BoxAnnotation>> {
+    let OperationRef::ControlFlow(cf) = inst.op.view() else {
+        return Ok(Vec::new());
+    };
+    let ControlFlow::Box { annotations, .. } = &cf.control_flow else {
+        return Ok(Vec::new());
+    };
+    Ok(annotations
+        .iter()
+        .filter_map(|a| extract_annotation(a.bind(py)).ok())
+        .collect())
+}
+
+fn new_body(num_qubits: usize, num_clbits: usize, capacity: usize) -> PyResult<CircuitData> {
+    CircuitData::with_capacity(
+        num_qubits as u32,
+        num_clbits as u32,
+        capacity,
+        Param::Float(0.0),
+    )
+    .map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+/// Copy an instruction verbatim into `out`, remapping its bits through `scope`.
+fn copy_instruction(
+    dag: &DAGCircuit,
+    inst: &PackedInstruction,
+    out: &mut CircuitData,
+    scope: &Scope,
+) -> PyResult<()> {
+    let qargs = scope.out_qubits(dag.qargs_interner().get(inst.qubits))?;
+    let cargs = scope.out_clbits(dag.cargs_interner().get(inst.clbits))?;
+    let params: Option<Parameters<_>> = (!inst.params_view().is_empty()).then(|| {
+        Parameters::Params(inst.params_view().iter().cloned().collect::<SmallVec<[Param; 3]>>())
+    });
+    out.push_packed_operation(inst.op.clone(), params, &qargs, &cargs)
+        .map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+/// Write the `Emit` instructions belonging to one edge of a box, in the order given.
+fn write_emissions(
+    py: Python,
+    out: &mut CircuitData,
+    emissions: &[&Placed],
+    scope: &Scope,
+) -> PyResult<()> {
+    for spec in emissions.iter().map(|placed| &placed.spec) {
+        // The spec's partition is global; the qargs must be in the output's frame.
+        let qargs: Vec<Qubit> = spec
+            .qubits()
+            .iter()
+            .map(|g| {
+                scope
+                    .global
+                    .iter()
+                    .position(|x| x == g)
+                    .and_then(|local| scope.qubits.get(local).copied())
+                    .map(|i| Qubit(i as u32))
+                    .ok_or_else(|| PyValueError::new_err(format!("qubit {g} not in scope")))
+            })
+            .collect::<PyResult<_>>()?;
+        let emit = Py::new(py, Emit::new(spec.clone()))?;
+        let op = PackedOperation::from(PyInstruction {
+            kind: PyOpKind::Operation,
+            qubits: qargs.len() as u32,
+            clbits: 0,
+            params: 0,
+            op_name: spec.source.name().to_string(),
+            ob: emit.into_any(),
+        });
+        out.push_packed_operation(op, None, &qargs, &[])
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Write a collect box. Skipped entirely when it would collect nothing and absorb nothing.
+fn write_collect(
+    py: Python,
+    out: &mut CircuitData,
+    spec: CollectSpec,
+    body: CircuitData,
+    qargs: &[Qubit],
+    cargs: &[Clbit],
+) -> PyResult<()> {
+    if spec.collects_nothing() && body.is_empty() {
+        return Ok(());
+    }
+    debug_assert_eq!(
+        spec.gate_count(),
+        body.len(),
+        "a collector's `Gates` items must account for exactly its body"
+    );
+    let annotation = Py::new(py, (Collect::new_from_spec(spec), PyAnnotation))?;
+    write_box(out, body, vec![annotation.into_any()], qargs, cargs)
+}
+
+/// Write the box holding the gates virtual state is conjugated by. Skipped when empty — with
+/// propagation derived from placement, a gateless box carries no information.
+fn write_hard_box(
+    out: &mut CircuitData,
+    body: CircuitData,
+    qargs: &[Qubit],
+    cargs: &[Clbit],
+) -> PyResult<()> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    write_box(out, body, Vec::new(), qargs, cargs)
+}
+
+fn write_box(
+    out: &mut CircuitData,
+    body: CircuitData,
+    annotations: Vec<Py<PyAny>>,
+    qargs: &[Qubit],
+    cargs: &[Clbit],
+) -> PyResult<()> {
+    let op = PackedOperation::from_control_flow(Box::new(ControlFlowInstruction {
+        control_flow: ControlFlow::Box {
+            duration: None,
+            annotations,
+        },
+        num_qubits: qargs.len() as u32,
+        num_clbits: cargs.len() as u32,
+    }));
+    let block = out.add_block(body);
+    out.push_packed_operation(op, Some(Parameters::Blocks(vec![block])), qargs, cargs)
+        .map_err(|err| PyValueError::new_err(err.to_string()))
+}

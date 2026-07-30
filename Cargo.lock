@@ -2339,6 +2339,7 @@ dependencies = [
  "qiskit-qasm3",
  "qiskit-qpy",
  "qiskit-quantum-info",
+ "qiskit-samplex",
  "qiskit-synthesis",
  "qiskit-transpiler",
 ]
@@ -2414,6 +2415,20 @@ dependencies = [
  "rand_pcg",
  "rayon",
  "rustworkx-core",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "qiskit-samplex"
+version = "2.6.0-dev"
+dependencies = [
+ "hashbrown 0.15.5",
+ "indexmap",
+ "pyo3",
+ "qiskit-circuit",
+ "qiskit-util",
+ "rustworkx-core",
+ "smallvec",
  "thiserror 2.0.19",
 ]
 

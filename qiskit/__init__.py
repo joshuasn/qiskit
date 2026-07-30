@@ -89,6 +89,7 @@ sys.modules["qiskit._accelerate.remove_diagonal_gates_before_measure"] = (
 sys.modules["qiskit._accelerate.results"] = _accelerate.results
 sys.modules["qiskit._accelerate.sabre"] = _accelerate.sabre
 sys.modules["qiskit._accelerate.sampled_exp_val"] = _accelerate.sampled_exp_val
+sys.modules["qiskit._accelerate.samplex"] = _accelerate.samplex
 sys.modules["qiskit._accelerate.sparse_observable"] = _accelerate.sparse_observable
 sys.modules["qiskit._accelerate.scheduling"] = _accelerate.scheduling
 sys.modules["qiskit._accelerate.standard_generators"] = _accelerate.standard_generators

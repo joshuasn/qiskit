@@ -1,0 +1,26 @@
+[package]
+name = "qiskit-samplex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "qiskit_samplex"
+doctest = false
+
+[dependencies]
+qiskit-circuit.workspace = true
+qiskit-util.workspace = true
+hashbrown.workspace = true
+indexmap.workspace = true
+rustworkx-core.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+
+[dependencies.pyo3]
+workspace = true
+features = ["hashbrown"]
+
+[lints]
+workspace = true
