@@ -168,15 +168,9 @@ impl Emit {
                 "Emit requires at least one subsystem.",
             ));
         }
-        let width = subsystems[0].len();
-        let partition = Partition::with_parts(
-            width,
-            subsystems
-                .into_iter()
-                .map(|part| part.into_boxed_slice())
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+        let partition =
+            Partition::with_parts(subsystems.into_iter().map(|part| part.into_boxed_slice()))
+                .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
         Ok(Emit {
             inner: EmitSpec {
                 id,

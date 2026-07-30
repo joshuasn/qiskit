@@ -650,10 +650,9 @@ fn chain(
     let key = (occurrence.0, occurrence.1, direction, virtual_type);
     let node = *gate_nodes.entry(key).or_insert_with(|| {
         vfg.graph.add_node(Node {
-            partition: Partition::with_parts(
-                gate_qubits.len(),
-                std::iter::once(gate_qubits.to_vec().into_boxed_slice()),
-            )
+            partition: Partition::with_parts(std::iter::once(
+                gate_qubits.to_vec().into_boxed_slice(),
+            ))
             .unwrap(),
             kind: NodeKind::Propagate(Propagate { gate, direction }),
         })

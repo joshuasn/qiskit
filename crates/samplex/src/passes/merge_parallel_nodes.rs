@@ -220,10 +220,9 @@ mod tests {
 
     fn propagate_node_with(qubits: &[usize], gate: StandardGate, direction: Direction) -> Node {
         Node {
-            partition: Partition::with_parts(
-                qubits.len(),
-                std::iter::once(qubits.to_vec().into_boxed_slice()),
-            )
+            partition: Partition::with_parts(std::iter::once(
+                qubits.to_vec().into_boxed_slice(),
+            ))
             .unwrap(),
             kind: NodeKind::Propagate(Propagate { gate, direction }),
         }

@@ -432,11 +432,7 @@ mod tests {
     use super::*;
 
     fn make_partition(parts: &[&[usize]]) -> Partition {
-        Partition::with_parts(
-            parts[0].len(),
-            parts.iter().map(|p| p.to_vec().into_boxed_slice()),
-        )
-        .unwrap()
+        Partition::with_parts(parts.iter().map(|p| p.to_vec().into_boxed_slice())).unwrap()
     }
 
     fn emission(entry: DistEntry, direction: Direction) -> Emission {
