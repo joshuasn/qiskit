@@ -27,6 +27,7 @@ from qiskit._accelerate.samplex import (
     ChangeBasis,
     InjectNoise,
     Twirl,
+    absorb_emissions,
     build_lowered,
     lower,
     merge_collectors,
@@ -39,6 +40,7 @@ def graph_of(circuit, optimize=True):
     """The sampling graph, with the IR2 optimizations optionally applied first."""
     data, table = build_lowered(circuit_to_dag(circuit))
     if optimize:
+        data = absorb_emissions(data)
         data = merge_collectors(data)
     _, graph = lower(data, table)
     return graph
@@ -82,12 +84,14 @@ class TestCollectorOwnsAbsorbedGates(QiskitTestCase):
         self.assertEqual(len(collects), 2)
         left, right = collects
         # the h was absorbed into the left dressing, on qubit 0, and composes before the twirl factor
-        self.assertEqual(left[3], [("h", [0]), ("emit", [0])])
+        # the local near twirl half shows its partition qubits [0, 1]
+        self.assertEqual(left[3], [("h", [0]), ("emit", [0, 1])])
         self.assertEqual(gates(right), [])
 
     def test_a_basis_change_composes_outside_the_absorbed_gates(self):
         # The ordering that two independent lists could not express: the basis change applies to the box
         # as a whole, so it wraps the easy gates, while the twirl factor composes inside them.
+        # After absorption both are local, showing their partition qubits.
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left"), ChangeBasis("b", placement="start")]):
             circuit.h(0)
@@ -95,7 +99,7 @@ class TestCollectorOwnsAbsorbedGates(QiskitTestCase):
         graph = graph_of(circuit)
 
         left = of_kind(graph, "collect:")[0]
-        self.assertEqual(left[3], [("emit", [2]), ("h", [0]), ("emit", [0])])
+        self.assertEqual(left[3], [("emit", [0, 1]), ("h", [0]), ("emit", [0, 1])])
 
     def test_absorbed_gates_are_not_propagate_nodes(self):
         circuit = QuantumCircuit(2)
@@ -131,9 +135,10 @@ class TestCollectorOwnsAbsorbedGates(QiskitTestCase):
 
         middle = next(c for c in of_kind(graph, "collect:") if len(gates(c)) > 1)
         # each box's own run, first box then second — so the two layers meet outermost-to-outermost
+        # local emissions show their partition qubits after absorption
         self.assertEqual(
             middle[3],
-            [("emit", [1]), ("s", [0]), ("h", [1]), ("emit", [2])],
+            [("emit", [0, 1]), ("s", [0]), ("h", [1]), ("emit", [0, 1])],
         )
 
 
@@ -147,8 +152,8 @@ class TestPropagation(QiskitTestCase):
             circuit.cx(0, 1)
         graph = graph_of(circuit)
 
-        # emit -> left collector with nothing in between; emit -> cx -> right collector
-        self.assertIn(("emit:UniformPauli", "collect:RzSx", "left"), wiring(graph))
+        # The near (left) factor is local — absorbed, no graph edge. Only the far (right) factor
+        # propagates through the hard box: emit -> cx -> right collector.
         self.assertIn(("emit:UniformPauli", "propagate:cx", "right"), wiring(graph))
         self.assertIn(("propagate:cx", "collect:RzSx", "right"), wiring(graph))
 
@@ -163,15 +168,16 @@ class TestPropagation(QiskitTestCase):
         directions = {d for src, _, d in wiring(graph) if src == "propagate:cx"}
         self.assertEqual(directions, {"left"})
 
-    def test_a_twirl_becomes_two_directed_emissions(self):
+    def test_a_twirl_produces_one_incoming_emission_after_absorption(self):
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl()]):
             circuit.cx(0, 1)
         graph = graph_of(circuit)
-        self.assertEqual(len(of_kind(graph, "emit:")), 2)
-        # one flows each way
+        # After absorption, only the far (incoming) twirl half remains as a VFG node.
+        # The near half is local, absorbed into its collector.
+        self.assertEqual(len(of_kind(graph, "emit:")), 1)
         emitted = {d for src, _, d in wiring(graph) if src.startswith("emit:")}
-        self.assertEqual(emitted, {"left", "right"})
+        self.assertEqual(emitted, {"right"})
 
     def test_a_chain_of_hard_gates_is_sequential(self):
         circuit = QuantumCircuit(2)
@@ -223,7 +229,9 @@ class TestDirectionLivesOnNodes(QiskitTestCase):
 class TestOtherEmissionKinds(QiskitTestCase):
     """Basis changes and noise are emissions too, distinguished by their label rather than a kind."""
 
-    def test_basis_change_and_noise_appear(self):
+    def test_basis_change_and_noise_are_absorbed(self):
+        # After absorption, basis changes and noise injections are local — they become steps on
+        # their collector rather than independent VFG nodes.
         circuit = QuantumCircuit(2)
         with circuit.box(
             [Twirl(), ChangeBasis("b0", placement="start"), InjectNoise("n0", "after")]
@@ -231,8 +239,10 @@ class TestOtherEmissionKinds(QiskitTestCase):
             circuit.cx(0, 1)
         graph = graph_of(circuit)
 
-        self.assertEqual([n[0] for n in of_kind(graph, "change_basis:")], ["change_basis:basis_changes.b0"])
-        self.assertEqual([n[0] for n in of_kind(graph, "inject_noise:")], ["inject_noise:n0"])
+        self.assertEqual(of_kind(graph, "change_basis:"), [])
+        self.assertEqual(of_kind(graph, "inject_noise:"), [])
+        # Only the incoming twirl half remains as a VFG node
+        self.assertEqual(len(of_kind(graph, "emit:")), 1)
 
     def test_a_basis_change_is_never_conjugated_by_box_content(self):
         # It happens at the edge its placement names, so it reaches its collector without crossing the
@@ -286,6 +296,7 @@ class TestAgreementWithTheTemplate(QiskitTestCase):
         with circuit.box([Twirl()]):
             circuit.cx(0, 1)
         data, table = build_lowered(circuit_to_dag(circuit))
+        data = absorb_emissions(data)
         data = merge_collectors(data)
         template, graph = lower(data, table)
 
@@ -311,16 +322,23 @@ class TestUnoptimisedIsStillValid(QiskitTestCase):
             circuit.cx(0, 1)
         with circuit.box([Twirl()]):
             circuit.cx(0, 1)
-        for optimize in (False, True):
-            with self.subTest(optimize=optimize):
-                graph = graph_of(circuit, optimize=optimize)
-                self.assertEqual(len(of_kind(graph, "emit:")), 4)
-                # every emission node is the source of at least one edge, i.e. nothing dangles
-                sources = {a for a, _, _ in graph.edges()}
-                emit_positions = {
-                    i for i, node in enumerate(graph.nodes()) if node[0].startswith("emit:")
-                }
-                self.assertTrue(emit_positions <= sources)
+        # Unoptimized: all 4 emissions are standalone VFG nodes
+        graph = graph_of(circuit, optimize=False)
+        self.assertEqual(len(of_kind(graph, "emit:")), 4)
+        sources = {a for a, _, _ in graph.edges()}
+        emit_positions = {
+            i for i, node in enumerate(graph.nodes()) if node[0].startswith("emit:")
+        }
+        self.assertTrue(emit_positions <= sources)
+
+        # Optimized (with absorption): only incoming (far) halves remain as VFG nodes
+        graph = graph_of(circuit, optimize=True)
+        self.assertEqual(len(of_kind(graph, "emit:")), 2)
+        sources = {a for a, _, _ in graph.edges()}
+        emit_positions = {
+            i for i, node in enumerate(graph.nodes()) if node[0].startswith("emit:")
+        }
+        self.assertTrue(emit_positions <= sources)
 
     def test_optimizing_shrinks_the_graph(self):
         circuit = QuantumCircuit(4)

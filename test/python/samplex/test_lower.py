@@ -22,6 +22,7 @@ from qiskit.converters import circuit_to_dag
 from qiskit._accelerate.samplex import (
     ChangeBasis,
     Twirl,
+    absorb_emissions,
     build_lowered,
     build_template,
     merge_collectors,
@@ -124,7 +125,7 @@ class TestParameterLabelling(QiskitTestCase):
         # would shift. Lowering unmerged is correct, only suboptimal.
         data = emission_circuit(notebook_circuit())
         unmerged, unmerged_collectors = template(data)
-        merged, merged_collectors = template(merge_collectors(data))
+        merged, merged_collectors = template(merge_collectors(absorb_emissions(data)))
 
         self.assertEqual((len(unmerged_collectors), unmerged.num_parameters), (6, 48))
         self.assertEqual((len(merged_collectors), merged.num_parameters), (4, 36))
