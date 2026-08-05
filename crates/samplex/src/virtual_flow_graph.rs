@@ -271,7 +271,12 @@ impl VirtualFlowGraph {
                             .steps
                             .iter()
                             .map(|step| match step {
-                                CollectStep::Local(_) => ("emit".to_string(), vec![0]),
+                                CollectStep::Local(local) => {
+                                    let mut qs: Vec<usize> =
+                                        local.partition.all_elements().iter().copied().collect();
+                                    qs.sort_unstable();
+                                    ("emit".to_string(), qs)
+                                }
                                 CollectStep::Incoming(id) => {
                                     ("emit".to_string(), vec![*id as usize])
                                 }

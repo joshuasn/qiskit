@@ -257,10 +257,6 @@ fn materialize(
 /// into the merged frame.
 fn write_collector(py: Python, out: &mut CircuitData, collector: &OpenCollector) -> PyResult<()> {
     let qubits = collector.qubits();
-    let body_is_empty = collector.absorbed.iter().all(|a| a.body.is_empty());
-    if collector.items.iter().all(|i| matches!(i, CollectItem::Gates(_))) && body_is_empty {
-        return Ok(());
-    }
 
     let mut body = new_body(qubits.len())?;
     for absorbed in &collector.absorbed {

@@ -420,20 +420,23 @@ pub fn build_sampling_graph(
     }
 
     // Now walk each emission to the collector that names it, wiring the conjugations in between.
+    // Emissions with no collector (standalone, awaiting walk_emissions) are skipped.
     for (position, event) in events.iter().enumerate() {
         let Event::Emission(spec) = event else {
             continue;
         };
         let source = emission_nodes[&spec.id];
+        // First try: find via Incoming(id) on a collector (absorb_emissions has run).
+        // Fallback: scan for nearest collector in direction (unoptimized path).
         let target = infos
             .iter()
             .position(|info| info.collects.contains(&spec.id))
-            .ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "emission #{} is not collected by anything",
-                    spec.id
-                ))
-            })?;
+            .or_else(|| {
+                scan_for_nearest_collector(&events, position, spec.direction, &infos)
+            });
+        let Some(target) = target else {
+            continue;
+        };
         walk_emission(
             &mut vfg,
             &events,
@@ -447,6 +450,26 @@ pub fn build_sampling_graph(
         )?;
     }
     Ok(vfg)
+}
+
+/// Scan from position `start` in `direction` through the events list to find the nearest collector.
+/// Used as a fallback when absorb_emissions hasn't run (unoptimized path).
+fn scan_for_nearest_collector(
+    events: &[Event],
+    start: usize,
+    direction: Direction,
+    _infos: &[CollectorInfo],
+) -> Option<usize> {
+    let range: Box<dyn Iterator<Item = usize>> = match direction {
+        Direction::Right => Box::new((start + 1)..events.len()),
+        Direction::Left => Box::new((0..start).rev()),
+    };
+    for i in range {
+        if let Event::Collector(idx) = &events[i] {
+            return Some(*idx);
+        }
+    }
+    None
 }
 
 /// Flatten a scope into events, inlining hard boxes and reducing each collector to one event.

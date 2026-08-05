@@ -28,6 +28,14 @@ pub enum SynthesizerType {
     RzRx,
 }
 
+impl SynthesizerType {
+    pub fn accepts(&self, _vt: VirtualType) -> bool {
+        match self {
+            Self::RzSx | Self::RzRx => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DistributionType {
     UniformPauli,

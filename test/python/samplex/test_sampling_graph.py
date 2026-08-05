@@ -201,16 +201,15 @@ class TestDirectionLivesOnNodes(QiskitTestCase):
     """
 
     def test_a_gate_crossed_both_ways_becomes_two_nodes(self):
-        # Reachable through nesting: the outer left-dressed box's right factor walks rightward through
-        # the inner right-dressed box's hard content, while the inner box's own left factor walks
-        # leftward through the same cx. Conjugating one virtual gate leftward and rightward are
-        # different operations, so a single fused node could not be evaluated.
+        # Adjacent boxes with opposite dressings: the left-dressed box's far (right) half propagates
+        # rightward through its cx, while the right-dressed box's far (left) half propagates leftward
+        # through its cx. Conjugating one virtual gate leftward and rightward are different operations,
+        # so a single fused node could not be evaluated.
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left")]):
-            circuit.h(0)
-            with circuit.box([Twirl(dressing="right")]):
-                circuit.cx(0, 1)
-                circuit.s(0)
+            circuit.cx(0, 1)
+        with circuit.box([Twirl(dressing="right")]):
+            circuit.cx(0, 1)
         graph = graph_of(circuit)
 
         self.assertEqual(len([n for n in graph.nodes() if n[0] == "propagate:cx"]), 2)

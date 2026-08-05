@@ -98,18 +98,16 @@ class TestBuildShape(QiskitTestCase):
         self.assertEqual({e.direction for e in emits}, {"left", "right"})
         self.assertEqual(len(table), 1)
 
-    def test_each_collector_consumes_its_own_side(self):
+    def test_each_side_has_its_own_collector(self):
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl()]):
             circuit.cx(0, 1)
         lowered, _ = lower(circuit)
 
-        by_id = {e.id: e for e in emissions(lowered)}
+        # Build produces two collectors (left and right), each with only Gates items
         left, right = collectors(lowered)
-        (left_id,) = left[0].collects
-        (right_id,) = right[0].collects
-        self.assertEqual(by_id[left_id].direction, "left")
-        self.assertEqual(by_id[right_id].direction, "right")
+        self.assertEqual(left[0].collects, [])
+        self.assertEqual(right[0].collects, [])
 
     def test_noise_and_basis_land_on_the_side_their_placement_names(self):
         circuit = QuantumCircuit(2)
@@ -129,9 +127,23 @@ class TestBuildShape(QiskitTestCase):
         self.assertEqual(noise.direction, "right")  # site="after"
         self.assertEqual(basis.direction, "left")  # placement="start"
 
-        left, right = collectors(lowered)
-        self.assertIn(basis.id, left[0].collects)
-        self.assertIn(noise.id, right[0].collects)
+        # Emissions are placed on the correct side of the hard box (positionally).
+        # Verify via spine ordering: basis is before the hard box, noise is after.
+        names = gate_names(lowered)
+        emit_names = [n for n in names if n.startswith("samplex_emit")]
+        box_positions = [i for i, n in enumerate(names) if n == "box"]
+        # The hard box is the non-annotated box in the middle
+        hard_pos = box_positions[0] if len(box_positions) == 1 else box_positions[1]
+        basis_pos = next(
+            i for i, inst in enumerate(lowered.data)
+            if inst.operation.name.startswith("samplex_emit") and inst.operation.source == "change_basis"
+        )
+        noise_pos = next(
+            i for i, inst in enumerate(lowered.data)
+            if inst.operation.name.startswith("samplex_emit") and inst.operation.source == "inject_noise"
+        )
+        self.assertLess(basis_pos, hard_pos)  # basis on left edge
+        self.assertGreater(noise_pos, hard_pos)  # noise on right edge
         # twirl distribution + noise ref + basis ref
         self.assertEqual(len(table), 3)
 
@@ -191,45 +203,54 @@ class TestBuildShape(QiskitTestCase):
             circuit.cx(0, 1)
         lowered, _ = lower(circuit)
 
-        order = [e.source for e in emissions(lowered)]
-        # twirl pair on the dressing (left) edge, then hard content, then noise, then the basis change
-        self.assertEqual(order, ["twirl", "twirl", "inject_noise", "change_basis"])
-        # and the right collector composes them innermost-first, matching the spine
-        right = collectors(lowered)[-1]
-        by_id = {e.id: e for e in emissions(lowered)}
-        self.assertEqual(
-            [by_id[i].source for i in right[0].collects],
-            ["twirl", "inject_noise", "change_basis"],
-        )
+        # The right-edge emissions sit after the hard box in innermost-first order.
+        right_emits = []
+        past_hard = False
+        for inst in lowered.data:
+            if inst.operation.name == "box" and not getattr(inst.operation, "annotations", None):
+                past_hard = True
+                continue
+            if past_hard and inst.operation.name.startswith("samplex_emit"):
+                right_emits.append(inst.operation.source)
+        # noise then basis change (innermost-first); the far twirl half is on the dressing (left) edge
+        self.assertEqual(right_emits, ["inject_noise", "change_basis"])
 
     def test_a_local_clifford_flanks_the_content_but_a_basis_change_wraps_it(self):
         # The two resolve identically except for placement, so this is the only observable difference —
         # and `mode` cannot stand in for it, since ChangeBasis(mode="local_clifford") is legal.
-        def order(annotation):
+        def right_edge_order(annotation):
             circuit = QuantumCircuit(2)
             with circuit.box([Twirl(), annotation, InjectNoise("n", "after")]):
                 circuit.cx(0, 1)
             lowered, _ = lower(circuit)
-            by_id = {e.id: e for e in emissions(lowered)}
-            return [by_id[i].source for i in collectors(lowered)[-1][0].collects]
+            # Collect right-edge emission sources in spine order (after hard box)
+            right_emits = []
+            past_hard = False
+            for inst in lowered.data:
+                if inst.operation.name == "box" and not getattr(inst.operation, "annotations", None):
+                    past_hard = True
+                    continue
+                if past_hard and inst.operation.name.startswith("samplex_emit"):
+                    right_emits.append(inst.operation.source)
+            return right_emits
 
         # an injection sits inside the noise's own depth band, so construction order decides between them
         self.assertEqual(
-            order(InjectLocalClifford("f", "after")),
-            ["twirl", "change_basis", "inject_noise"],
+            right_edge_order(InjectLocalClifford("f", "after")),
+            ["change_basis", "inject_noise"],
         )
         # a basis change is outermost, so it lands after the noise
         self.assertEqual(
-            order(ChangeBasis("b", placement="end")),
-            ["twirl", "inject_noise", "change_basis"],
+            right_edge_order(ChangeBasis("b", placement="end")),
+            ["inject_noise", "change_basis"],
         )
 
     def test_absorbed_gates_sit_inside_the_basis_change(self):
-        """A collector records one ordered sequence, so the easy gates have a place in it.
+        """A collector holds only absorbed gates after build; emission wiring comes later.
 
-        `ChangeBasis` applies to the box as a whole, so it composes *outside* the gates the dressing
-        absorbed; an injection or twirl attaches to the hard content and composes *inside* them. Left
-        runs outermost-first and right innermost-first, so the two are mirror images.
+        After build, collectors carry only Gates items representing the absorbed easy gates.
+        The absorb_emissions pass later inserts emissions in their correct composition positions.
+        This test verifies the gates are present in the collector body.
         """
         left = QuantumCircuit(3)
         with left.box(
@@ -241,11 +262,10 @@ class TestBuildShape(QiskitTestCase):
         ):
             left.h(0)
             left.cx(1, 2)
-        # basis, then the absorbed gate, then the injection, then the twirl factor
-        self.assertEqual(
-            collectors(lower(left)[0])[0][0].items,
-            [("incoming", 2), ("gates", 1), ("incoming", 3), ("incoming", 0)],
-        )
+        # Left collector holds the absorbed easy gate (h)
+        left_coll = collectors(lower(left)[0])[0]
+        self.assertEqual(left_coll[0].items, [("gates", 1)])
+        self.assertEqual(gate_names(left_coll[1]), ["h"])
 
         right = QuantumCircuit(3)
         with right.box(
@@ -257,11 +277,10 @@ class TestBuildShape(QiskitTestCase):
         ):
             right.cx(1, 2)
             right.h(0)
-        # mirrored: twirl, injection, absorbed gate, basis
-        self.assertEqual(
-            collectors(lower(right)[0])[-1][0].items,
-            [("incoming", 1), ("incoming", 3), ("gates", 1), ("incoming", 2)],
-        )
+        # Right collector holds the absorbed easy gate (h)
+        right_coll = collectors(lower(right)[0])[-1]
+        self.assertEqual(right_coll[0].items, [("gates", 1)])
+        self.assertEqual(gate_names(right_coll[1]), ["h"])
 
     def test_gates_counts_account_for_exactly_the_body(self):
         # The invariant that keeps items and bodies in step. A merge that concatenated one but not the

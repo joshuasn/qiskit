@@ -266,9 +266,7 @@ impl Build {
         let emissions = self.build_emissions(&resolved, &global, dressing);
         let synthesizer = resolved.synthesizer.unwrap_or(DEFAULT_SYNTHESIZER);
 
-        // Both the spine and each collector's `collects` are ordered by nesting depth, so the two agree
-        // by construction. Reading in circuit order that is outermost-first on the left and
-        // innermost-first on the right. The sorts are stable, so a twirl's two halves keep their order.
+        // Emissions at each edge, sorted for writing to the spine.
         let ordered = |select: &dyn Fn(&Placed) -> bool, side: Direction| -> Vec<&Placed> {
             let mut group: Vec<&Placed> = emissions.iter().filter(|p| select(p)).collect();
             match side {
@@ -277,32 +275,14 @@ impl Build {
             }
             group
         };
-        // One collector's composition order: its emissions, plus a `Gates` item if it is the side
-        // holding the absorbed easy gates.
-        //
-        // The gates sit *inside* the basis change and *outside* the injections and twirl — they are
-        // part of the box's content, so a frame change for the whole box wraps them, while anything
-        // attached to the hard content composes nearer to it. Left runs outermost-first so the gates
-        // follow the basis items; right runs innermost-first so they precede them.
-        let items = |direction: Direction, gates: usize| -> Vec<CollectItem> {
-            let group = ordered(&|p| p.spec.direction == direction, direction);
-            let mut items = Vec::with_capacity(group.len() + 1);
-            let mut written = gates == 0;
-            for placed in group {
-                let boundary = match direction {
-                    Direction::Left => placed.depth < DEPTH_BASIS,
-                    Direction::Right => placed.depth >= DEPTH_BASIS,
-                };
-                if !written && boundary {
-                    items.push(CollectItem::Gates(gates));
-                    written = true;
-                }
-                items.push(CollectItem::Incoming(placed.spec.id));
+        // Collectors carry only their absorbed gates. Emission-to-collector wiring is the
+        // responsibility of the absorb_emissions pass, which matches by synthesizer compatibility.
+        let items = |gates: usize| -> Vec<CollectItem> {
+            if gates == 0 {
+                Vec::new()
+            } else {
+                vec![CollectItem::Gates(gates)]
             }
-            if !written {
-                items.push(CollectItem::Gates(gates));
-            }
-            items
         };
 
         // The body splits into gates the dressing can absorb and everything else. Nested annotated
@@ -345,11 +325,11 @@ impl Build {
 
         let left = CollectSpec {
             synthesizer,
-            items: items(Direction::Left, left_gates),
+            items: items(left_gates),
         };
         let right = CollectSpec {
             synthesizer,
-            items: items(Direction::Right, right_gates),
+            items: items(right_gates),
         };
 
         // Each emission is written at the edge it belongs to — see [`emission_edge`] — so the hard box
@@ -632,9 +612,6 @@ fn write_collect(
     qargs: &[Qubit],
     cargs: &[Clbit],
 ) -> PyResult<()> {
-    if spec.collects_nothing() && body.is_empty() {
-        return Ok(());
-    }
     debug_assert_eq!(
         spec.gate_count(),
         body.len(),
