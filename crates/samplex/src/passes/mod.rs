@@ -12,6 +12,7 @@
 
 use pyo3::prelude::*;
 
+pub mod absorb_emissions;
 pub mod build;
 pub mod merge_collectors;
 pub mod lower;

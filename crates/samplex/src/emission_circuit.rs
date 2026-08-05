@@ -328,11 +328,25 @@ pub fn extract_emit(obj: &Bound<'_, PyAny>) -> Option<EmitSpec> {
     obj.cast::<Emit>().ok().map(|e| e.get().inner.clone())
 }
 
+/// An emission owned directly by its collector — adjacent to it, never propagating through gates.
+///
+/// At sampling time the collector reads the sampled value from the distribution table and composes
+/// it at the position its [`CollectItem`] list dictates. No standalone `Emit` instruction, no VFG
+/// `Emission` node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEmission {
+    pub source: EmitSource,
+    pub dist: DistKey,
+    pub direction: Direction,
+    pub virtual_type: VirtualType,
+    pub partition: Partition,
+}
+
 /// One step in what a collector composes, in circuit order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CollectItem {
-    /// A virtual gate this collector consumes, named by its [`Emit`] id.
-    Emission(u32),
+    /// A local emission owned by this collector. No standalone instruction needed.
+    Emission(LocalEmission),
     /// The next `n` gates of the collect box's body.
     ///
     /// A **count**, not an index range. Merging concatenates bodies, and a count needs no offsetting
@@ -340,6 +354,9 @@ pub enum CollectItem {
     /// concatenating bodies is all a merge has to do. The counts of a well-formed collector sum to its
     /// body length.
     Gates(usize),
+    /// A propagating emission (far twirl half) that arrives via graph edges after being conjugated
+    /// by intervening gates. References a standalone [`Emit`] instruction by id.
+    Incoming(u32),
 }
 
 /// The payload of a [`Collect`] annotation.
@@ -362,13 +379,13 @@ pub struct CollectSpec {
 }
 
 impl CollectSpec {
-    /// The emissions this collector consumes, in composition order.
-    pub fn emissions(&self) -> Vec<u32> {
+    /// The IDs of incoming (propagating) emissions, in composition order.
+    pub fn incoming_ids(&self) -> Vec<u32> {
         self.items
             .iter()
             .filter_map(|item| match item {
-                CollectItem::Emission(id) => Some(*id),
-                CollectItem::Gates(_) => None,
+                CollectItem::Incoming(id) => Some(*id),
+                _ => None,
             })
             .collect()
     }
@@ -379,17 +396,16 @@ impl CollectSpec {
             .iter()
             .map(|item| match item {
                 CollectItem::Gates(count) => *count,
-                CollectItem::Emission(_) => 0,
+                _ => 0,
             })
             .sum()
     }
 
-    /// Whether this collector consumes no emissions at all.
+    /// Whether this collector consumes no emissions at all (neither local nor incoming).
     pub fn collects_nothing(&self) -> bool {
-        !self
-            .items
-            .iter()
-            .any(|item| matches!(item, CollectItem::Emission(_)))
+        !self.items.iter().any(|item| {
+            matches!(item, CollectItem::Emission(_) | CollectItem::Incoming(_))
+        })
     }
 }
 
@@ -409,10 +425,10 @@ impl Collect {
 
 #[pymethods]
 impl Collect {
-    /// Construct a `Collect` naming the emissions it consumes, in order.
+    /// Construct a `Collect` naming the incoming emissions it consumes, in order.
     ///
     /// Absorbed-gate positions cannot be given here — a hand-built annotation has no body to slice —
-    /// so this produces emission items only. The build pass constructs the interleaved form directly.
+    /// so this produces incoming items only. The build pass constructs the interleaved form directly.
     #[new]
     #[pyo3(signature = (collects, synthesizer="rzsx"))]
     fn new(collects: Vec<u32>, synthesizer: &str) -> PyResult<PyClassInitializer<Self>> {
@@ -420,7 +436,7 @@ impl Collect {
             PyClassInitializer::from(PyAnnotation).add_subclass(Collect {
                 inner: CollectSpec {
                     synthesizer: parse_decomposition(synthesizer)?,
-                    items: collects.into_iter().map(CollectItem::Emission).collect(),
+                    items: collects.into_iter().map(CollectItem::Incoming).collect(),
                 },
             }),
         )
@@ -439,22 +455,23 @@ impl Collect {
         }
     }
 
-    /// The emissions consumed, in composition order. The absorbed gates interleaved between them are
-    /// not shown here — see [`items`](Self::items).
+    /// The incoming emission IDs consumed, in composition order. Local emissions are not shown
+    /// here — see [`items`](Self::items).
     #[getter]
     fn collects(&self) -> Vec<u32> {
-        self.inner.emissions()
+        self.inner.incoming_ids()
     }
 
-    /// Everything composed, in order: `("emit", id)` for a consumed emission, `("gates", n)` for the
-    /// next `n` gates of this box's body.
+    /// Everything composed, in order: `("local", 0)` for a local emission, `("incoming", id)` for
+    /// a propagating emission, `("gates", n)` for the next `n` gates of this box's body.
     #[getter]
     fn items(&self) -> Vec<(&'static str, usize)> {
         self.inner
             .items
             .iter()
             .map(|item| match item {
-                CollectItem::Emission(id) => ("emit", *id as usize),
+                CollectItem::Emission(_) => ("local", 0),
+                CollectItem::Incoming(id) => ("incoming", *id as usize),
                 CollectItem::Gates(count) => ("gates", *count),
             })
             .collect()
@@ -466,7 +483,8 @@ impl Collect {
             .items
             .iter()
             .map(|item| match item {
-                CollectItem::Emission(id) => format!("#{id}"),
+                CollectItem::Emission(_) => "~".to_string(),
+                CollectItem::Incoming(id) => format!("#{id}"),
                 CollectItem::Gates(count) => format!("{count}g"),
             })
             .collect::<Vec<_>>()

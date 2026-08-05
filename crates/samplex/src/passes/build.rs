@@ -297,7 +297,7 @@ impl Build {
                     items.push(CollectItem::Gates(gates));
                     written = true;
                 }
-                items.push(CollectItem::Emission(placed.spec.id));
+                items.push(CollectItem::Incoming(placed.spec.id));
             }
             if !written {
                 items.push(CollectItem::Gates(gates));

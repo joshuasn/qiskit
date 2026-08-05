@@ -17,6 +17,7 @@ use qiskit_circuit::operations::Operation;
 use rustworkx_core::petgraph::stable_graph::{NodeIndex, StableDiGraph};
 
 use crate::distributions::DistEntry;
+use crate::emission_circuit::LocalEmission;
 use crate::partition::Partition;
 pub use crate::virtual_type::VirtualType;
 
@@ -146,12 +147,15 @@ pub struct AbsorbedGate {
 /// One step in what a collector composes, in circuit order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CollectStep {
-    /// Virtual state arriving from the emission with this id.
+    /// A local emission: read a value from the distribution table and compose it here.
+    /// No VFG Emission node — the collector owns this directly.
+    Local(LocalEmission),
+    /// Virtual state arriving via graph edges from a propagating emission (far twirl half).
     ///
     /// Named by **emission id**, not by graph node: node indices are not stable, since
     /// `merge_parallel_nodes` and `prune` add and remove nodes. The id is assigned once by `build` and
     /// never changes, and [`Emission`] carries it so an incoming edge can be matched to its step.
-    Emission(u32),
+    Incoming(u32),
     /// A gate folded into this layer rather than executed separately.
     Gate(AbsorbedGate),
 }
@@ -180,7 +184,7 @@ pub struct Collect {
 pub fn collect_step_gates(steps: &[CollectStep]) -> impl Iterator<Item = &AbsorbedGate> {
     steps.iter().filter_map(|step| match step {
         CollectStep::Gate(gate) => Some(gate),
-        CollectStep::Emission(_) => None,
+        CollectStep::Local(_) | CollectStep::Incoming(_) => None,
     })
 }
 
@@ -267,7 +271,10 @@ impl VirtualFlowGraph {
                             .steps
                             .iter()
                             .map(|step| match step {
-                                CollectStep::Emission(id) => ("emit".to_string(), vec![*id as usize]),
+                                CollectStep::Local(_) => ("emit".to_string(), vec![0]),
+                                CollectStep::Incoming(id) => {
+                                    ("emit".to_string(), vec![*id as usize])
+                                }
                                 CollectStep::Gate(gate) => {
                                     (gate.gate.name().to_string(), gate.qubits.clone())
                                 }

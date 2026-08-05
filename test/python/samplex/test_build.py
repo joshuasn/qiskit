@@ -244,7 +244,7 @@ class TestBuildShape(QiskitTestCase):
         # basis, then the absorbed gate, then the injection, then the twirl factor
         self.assertEqual(
             collectors(lower(left)[0])[0][0].items,
-            [("emit", 2), ("gates", 1), ("emit", 3), ("emit", 0)],
+            [("incoming", 2), ("gates", 1), ("incoming", 3), ("incoming", 0)],
         )
 
         right = QuantumCircuit(3)
@@ -260,7 +260,7 @@ class TestBuildShape(QiskitTestCase):
         # mirrored: twirl, injection, absorbed gate, basis
         self.assertEqual(
             collectors(lower(right)[0])[-1][0].items,
-            [("emit", 1), ("emit", 3), ("gates", 1), ("emit", 2)],
+            [("incoming", 1), ("incoming", 3), ("gates", 1), ("incoming", 2)],
         )
 
     def test_gates_counts_account_for_exactly_the_body(self):

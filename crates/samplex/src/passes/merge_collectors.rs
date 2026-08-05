@@ -258,7 +258,7 @@ fn materialize(
 fn write_collector(py: Python, out: &mut CircuitData, collector: &OpenCollector) -> PyResult<()> {
     let qubits = collector.qubits();
     let body_is_empty = collector.absorbed.iter().all(|a| a.body.is_empty());
-    if collector.items.iter().all(|i| !matches!(i, CollectItem::Emission(_))) && body_is_empty {
+    if collector.items.iter().all(|i| matches!(i, CollectItem::Gates(_))) && body_is_empty {
         return Ok(());
     }
 

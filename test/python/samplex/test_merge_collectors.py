@@ -174,7 +174,7 @@ class TestSharedMiddleCollector(QiskitTestCase):
 
         middle = next(c for c, body, _ in collectors(out) if len(body.data) > 1)
         # first box's run (twirl factor then its gate), then the second box's (its gate then twirl)
-        self.assertEqual(middle.items, [("emit", 1), ("gates", 1), ("gates", 1), ("emit", 2)])
+        self.assertEqual(middle.items, [("incoming", 1), ("gates", 1), ("gates", 1), ("incoming", 2)])
 
     def test_merging_keeps_items_and_bodies_in_step(self):
         circuit = notebook_circuit()

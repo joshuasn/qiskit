@@ -169,7 +169,7 @@ fn write_scope(
             collectors.push(CollectorParams {
                 qubits,
                 synthesizer: spec.synthesizer,
-                collects: spec.emissions(),
+                collects: spec.incoming_ids(),
                 param_indices,
             });
             continue;
@@ -498,7 +498,10 @@ fn flatten(
             let mut steps = Vec::with_capacity(spec.items.len());
             for item in &spec.items {
                 match item {
-                    CollectItem::Emission(id) => steps.push(CollectStep::Emission(*id)),
+                    CollectItem::Emission(local) => {
+                        steps.push(CollectStep::Local(local.clone()));
+                    }
+                    CollectItem::Incoming(id) => steps.push(CollectStep::Incoming(*id)),
                     CollectItem::Gates(count) => {
                         for gate in &gates[cursor..cursor + count] {
                             steps.push(CollectStep::Gate(gate.clone()));
@@ -511,7 +514,7 @@ fn flatten(
             infos.push(CollectorInfo {
                 qubits,
                 synthesizer: spec.synthesizer,
-                collects: spec.emissions(),
+                collects: spec.incoming_ids(),
                 param_indices: Vec::new(),
                 steps,
             });
