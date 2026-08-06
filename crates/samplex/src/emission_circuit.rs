@@ -381,10 +381,12 @@ pub fn extract_emit(obj: &Bound<'_, PyAny>) -> Option<EmitSpec> {
 /// At sampling time the collector reads the sampled value from the distribution table and composes
 /// it at the position its [`CollectItem`] list dictates. No standalone `Emit` instruction, no VFG
 /// `Emission` node.
+///
+/// Neither direction nor source is stored: position in the collector's items vec IS the composition
+/// order, and the distribution table entry (reachable through [`EmitPart::dist`]) already encodes
+/// the emission kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalEmission {
-    pub source: EmitSource,
-    pub direction: Direction,
     pub partition: Partition,
     /// Per-part descriptors, parallel with `partition.iter()`.
     pub parts: Vec<EmitPart>,

@@ -27,6 +27,7 @@ from qiskit._accelerate.samplex import (
     InjectNoise,
     Tag,
     Twirl,
+    absorb_emissions,
     build_lowered,
 )
 
@@ -36,6 +37,13 @@ from test import QiskitTestCase
 def lower(circuit):
     """Build the emission circuit, returning it as a QuantumCircuit plus the distribution table."""
     data, table = build_lowered(circuit_to_dag(circuit))
+    return QuantumCircuit._from_circuit_data(data), table
+
+
+def lower_absorbed(circuit):
+    """Build and absorb, returning as a QuantumCircuit plus the distribution table."""
+    data, table = build_lowered(circuit_to_dag(circuit))
+    data = absorb_emissions(data)
     return QuantumCircuit._from_circuit_data(data), table
 
 
@@ -248,13 +256,28 @@ class TestBuildShape(QiskitTestCase):
             ["inject_noise", "change_basis"],
         )
 
-    def test_absorbed_gates_sit_inside_the_basis_change(self):
-        """A collector holds only absorbed gates after build; emission wiring comes later.
+    def test_collectors_start_empty_after_build(self):
+        """After build, collectors are empty — gates and emissions live on the spine.
 
-        After build, collectors carry only Gates items representing the absorbed easy gates.
-        The absorb_emissions pass later inserts emissions in their correct composition positions.
-        This test verifies the gates are present in the collector body.
+        The absorb_emissions pass later walks from each collector to populate items and body.
         """
+        circuit = QuantumCircuit(3)
+        with circuit.box(
+            [
+                Twirl(dressing="left"),
+                ChangeBasis("b", placement="start"),
+                InjectNoise("n", "before"),
+            ]
+        ):
+            circuit.h(0)
+            circuit.cx(1, 2)
+        data, _ = build_lowered(circuit_to_dag(circuit))
+        colls = collectors(QuantumCircuit._from_circuit_data(data))
+        for coll in colls:
+            self.assertEqual(coll[0].items, [])
+
+    def test_absorbed_gates_sit_inside_the_basis_change(self):
+        """After absorb_emissions, the collector holds gates and emissions in composition order."""
         left = QuantumCircuit(3)
         with left.box(
             [
@@ -265,9 +288,10 @@ class TestBuildShape(QiskitTestCase):
         ):
             left.h(0)
             left.cx(1, 2)
-        # Left collector holds the absorbed easy gate (h)
-        left_coll = collectors(lower(left)[0])[0]
-        self.assertEqual(left_coll[0].items, [("gates", 1)])
+        data, _ = build_lowered(circuit_to_dag(left))
+        data = absorb_emissions(data)
+        left_coll = collectors(QuantumCircuit._from_circuit_data(data))[0]
+        self.assertIn(("gates", 1), left_coll[0].items)
         self.assertEqual(gate_names(left_coll[1]), ["h"])
 
         right = QuantumCircuit(3)
@@ -280,9 +304,10 @@ class TestBuildShape(QiskitTestCase):
         ):
             right.cx(1, 2)
             right.h(0)
-        # Right collector holds the absorbed easy gate (h)
-        right_coll = collectors(lower(right)[0])[-1]
-        self.assertEqual(right_coll[0].items, [("gates", 1)])
+        data, _ = build_lowered(circuit_to_dag(right))
+        data = absorb_emissions(data)
+        right_coll = collectors(QuantumCircuit._from_circuit_data(data))[-1]
+        self.assertIn(("gates", 1), right_coll[0].items)
         self.assertEqual(gate_names(right_coll[1]), ["h"])
 
     def test_gates_counts_account_for_exactly_the_body(self):
@@ -343,7 +368,7 @@ class TestEasyHardSplit(QiskitTestCase):
         with circuit.box([Twirl(dressing="left")]):
             circuit.h(0)
             circuit.cx(0, 1)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         left, right = collectors(lowered)
         self.assertEqual(gate_names(left[1]), ["h"])
@@ -357,7 +382,7 @@ class TestEasyHardSplit(QiskitTestCase):
             circuit.cx(0, 1)
             circuit.s(0)
             circuit.h(1)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         left, right = collectors(lowered)
         self.assertEqual(gate_names(left[1]), [])
@@ -395,7 +420,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
         with circuit.box([Twirl(dressing="left")]):
             circuit.cx(0, 1)
             circuit.h(2)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         left, _ = collectors(lowered)
         # q2 is untouched by the cx, so h(2) is at the dressing edge on its own wire
@@ -409,7 +434,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
             circuit.cx(0, 1)
             circuit.h(2)
             circuit.s(2)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
         self.assertEqual(gate_names(collectors(lowered)[0][1]), ["h", "s"])
 
     def test_a_poisoned_wire_is_left_alone(self):
@@ -418,7 +443,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
         with circuit.box([Twirl(dressing="left")]):
             circuit.cx(0, 1)
             circuit.h(0)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         self.assertEqual(gate_names(collectors(lowered)[0][1]), [])
         (hard,) = hard_boxes(lowered)
@@ -432,7 +457,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
             circuit.cx(0, 1)
             circuit.cx(1, 2)
             circuit.s(2)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         self.assertEqual(gate_names(collectors(lowered)[0][1]), [])
         (hard,) = hard_boxes(lowered)
@@ -443,7 +468,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
         with circuit.box([Twirl(dressing="right")]):
             circuit.h(2)
             circuit.cx(0, 1)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         left, right = collectors(lowered)
         self.assertEqual(gate_names(left[1]), [])
@@ -458,7 +483,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
         with circuit.box([Twirl(dressing="left")]):
             circuit.h(0)
             circuit.s(1)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         self.assertEqual(hard_boxes(lowered), [])
         self.assertEqual([gate_names(b) for _, b, _ in collectors(lowered)], [["h", "s"], []])
@@ -469,7 +494,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
             with circuit.box([Twirl(dressing="left")]):
                 circuit.cx(0, 1)
                 circuit.h(2)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         (outer_hard,) = hard_boxes(lowered)
         self.assertEqual([gate_names(b) for _, b, _ in collectors(outer_hard)], [["h"], []])
@@ -482,7 +507,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
             circuit.h(2)
             circuit.s(2)
             circuit.cx(1, 2)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         names = [n for _, body, _ in collectors(lowered) for n in gate_names(body)]
         names += [n for body in hard_boxes(lowered) for n in gate_names(body)]
@@ -493,7 +518,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
         with circuit.box([Twirl(dressing="left")]):
             circuit.cx(0, 1)
             circuit.h(2)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         _, body, qubits = collectors(lowered)[0]
         self.assertEqual(qubits, [0, 1, 2])
@@ -510,7 +535,7 @@ class TestFidelity(QiskitTestCase):
         circuit = QuantumCircuit(1)
         with circuit.box([Twirl()]):
             circuit.rz(theta, 0)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         left, _ = collectors(lowered)
         (rz,) = left[1].data
@@ -585,16 +610,12 @@ class TestNesting(QiskitTestCase):
         self.assertEqual(len(emissions(lowered)), 4)
 
     def test_nested_box_absorbs_into_its_own_dressing(self):
-        # A nested box absorbs normally. Its absorbed gate does double duty: multiplied into the
-        # inner factor, and propagated for the outer right factor, which crosses the inner
-        # collector's body. Both roles are live because the body still holds real gates at this
-        # stage; merging is what will need to record the second role explicitly.
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left")]):
             with circuit.box([Twirl(dressing="left")]):
                 circuit.h(0)
                 circuit.cx(0, 1)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         (outer_hard,) = hard_boxes(lowered)
         inner_left, inner_right = collectors(outer_hard)
@@ -609,7 +630,7 @@ class TestNesting(QiskitTestCase):
             circuit.h(0)
             with circuit.box([Twirl()]):
                 circuit.cx(0, 1)
-        lowered, _ = lower(circuit)
+        lowered, _ = lower_absorbed(circuit)
 
         left, _ = collectors(lowered)
         self.assertEqual(gate_names(left[1]), ["h"])

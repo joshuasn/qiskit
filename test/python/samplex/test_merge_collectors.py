@@ -21,6 +21,7 @@ from qiskit.converters import circuit_to_dag
 from qiskit._accelerate.samplex import (
     ChangeBasis,
     Twirl,
+    absorb_emissions,
     build_lowered,
     merge_collectors,
 )
@@ -36,9 +37,11 @@ def build(circuit):
 
 
 def merged(circuit):
-    """The emission circuit after merging."""
+    """The emission circuit after merging (absorb happens after merge)."""
     data, table = build_lowered(circuit_to_dag(circuit))
-    return QuantumCircuit._from_circuit_data(merge_collectors(data)), table
+    data = merge_collectors(data)
+    data = absorb_emissions(data)
+    return QuantumCircuit._from_circuit_data(data), table
 
 
 def notebook_circuit():
@@ -170,8 +173,9 @@ class TestSharedMiddleCollector(QiskitTestCase):
         out, _ = merged(circuit)
 
         middle = next(c for c, body, _ in collectors(out) if len(body.data) > 1)
-        # After build: collectors have only Gates items. The merged middle holds gates from both boxes.
-        self.assertEqual(middle.items, [("gates", 1), ("gates", 1)])
+        # After merge+absorb: the merged middle holds emissions and gates from both boxes.
+        gate_items = [item for item in middle.items if item[0] == "gates"]
+        self.assertEqual(gate_items, [("gates", 1), ("gates", 1)])
 
     def test_merging_keeps_items_and_bodies_in_step(self):
         circuit = notebook_circuit()
@@ -266,9 +270,14 @@ class TestPreservation(QiskitTestCase):
     """What merging must not change."""
 
     def test_emissions_and_content_are_untouched(self):
+        # Propagating emissions (those not absorbed) survive merge unchanged.
         circuit = notebook_circuit()
-        before, _ = build(circuit)
-        after, _ = merged(circuit)
+        data, _ = build_lowered(circuit_to_dag(circuit))
+        no_merge = absorb_emissions(data)
+        with_merge = absorb_emissions(merge_collectors(data))
+
+        before = QuantumCircuit._from_circuit_data(no_merge)
+        after = QuantumCircuit._from_circuit_data(with_merge)
 
         self.assertEqual(
             [(e.source, e.direction, tuple(e.qubits)) for e in emissions(before)],
@@ -276,14 +285,18 @@ class TestPreservation(QiskitTestCase):
         )
 
     def test_emissions_are_preserved_through_merge(self):
+        # Whether or not merge runs, the same propagating emissions remain standalone.
         circuit = notebook_circuit()
-        before, _ = build(circuit)
-        out, _ = merged(circuit)
+        data, _ = build_lowered(circuit_to_dag(circuit))
+        no_merge = absorb_emissions(data)
+        with_merge = absorb_emissions(merge_collectors(data))
 
-        # All emissions remain in the circuit (merge doesn't touch them)
+        before = QuantumCircuit._from_circuit_data(no_merge)
+        after = QuantumCircuit._from_circuit_data(with_merge)
+
         self.assertEqual(
             [(e.source, e.direction) for e in emissions(before)],
-            [(e.source, e.direction) for e in emissions(out)],
+            [(e.source, e.direction) for e in emissions(after)],
         )
 
     def test_hard_content_survives(self):

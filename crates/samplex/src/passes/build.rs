@@ -49,7 +49,7 @@ use crate::annotated_circuit::{
 };
 use crate::distributions::{DistEntry, DistKey, DistributionTable};
 use crate::emission_circuit::{
-    Collect, CollectItem, CollectPart, CollectSpec, Emit, EmitPart, EmitSource, EmitSpec,
+    Collect, CollectPart, CollectSpec, Emit, EmitPart, EmitSource, EmitSpec,
 };
 use crate::partition::Partition;
 use crate::virtual_flow_graph::Direction;
@@ -277,25 +277,6 @@ impl Build {
             .map(|_| CollectPart { synthesizer })
             .collect();
 
-        // Emissions at each edge, sorted for writing to the spine.
-        let ordered = |select: &dyn Fn(&Placed) -> bool, side: Direction| -> Vec<&Placed> {
-            let mut group: Vec<&Placed> = emissions.iter().filter(|p| select(p)).collect();
-            match side {
-                Direction::Left => group.sort_by_key(|p| std::cmp::Reverse(p.depth)),
-                Direction::Right => group.sort_by_key(|p| p.depth),
-            }
-            group
-        };
-        // Collectors carry only their absorbed gates. Emission-to-collector wiring is the
-        // responsibility of the absorb_emissions pass, which matches by synthesizer compatibility.
-        let items = |gates: usize| -> Vec<CollectItem> {
-            if gates == 0 {
-                Vec::new()
-            } else {
-                vec![CollectItem::Gates(gates)]
-            }
-        };
-
         // The body splits into gates the dressing can absorb and everything else. Nested annotated
         // boxes are always "everything else", and are lowered recursively into the hard box so that
         // an outer emission crossing them sees their real gates.
@@ -322,46 +303,102 @@ impl Build {
             &inner,
         )?;
 
-        // Easy gates are absorbed on the side they were swept from, which is also where they
-        // physically belong — so only that side's collector accounts for them in its items.
-        let absorbed = easy.len();
-        let (left_body, right_body) = match dressing {
-            Dressing::Left => (easy, new_body(width, body_clbits.len(), 0)?),
-            Dressing::Right => (new_body(width, body_clbits.len(), 0)?, easy),
-        };
-        let (left_gates, right_gates) = match dressing {
-            Dressing::Left => (absorbed, 0),
-            Dressing::Right => (0, absorbed),
-        };
-
+        // Collectors start empty — the absorb_dressing pass populates them by walking the spine.
+        let empty_body = new_body(width, body_clbits.len(), 0)?;
         let left = CollectSpec {
-            items: items(left_gates),
+            items: Vec::new(),
             partition: partition.clone(),
             parts: collect_parts.clone(),
         };
         let right = CollectSpec {
-            items: items(right_gates),
+            items: Vec::new(),
             partition: partition.clone(),
             parts: collect_parts,
         };
 
-        // Each emission is written at the edge it belongs to — see [`emission_edge`] — so the hard box
-        // sits between the two groups and every emission's propagation follows from position alone.
-        write_collect(py, out, left, left_body, &out_qargs, &out_cargs)?;
-        write_emissions(
-            py,
-            out,
-            &ordered(&|p| p.edge == Direction::Left, Direction::Left),
-            scope,
-        )?;
+        // Partition emissions into groups for each edge. Within each edge, the spine order is:
+        //   outer emissions (depth >= DEPTH_BASIS) | easy gates | inner emissions (local, depth < DEPTH_BASIS)
+        //   | propagating emissions (facing away)
+        // The dressing side carries the easy gates; the opposite side has no gates.
+        let is_outer = |p: &&Placed| p.depth >= DEPTH_BASIS;
+        let is_local = |p: &&Placed, side: Direction| {
+            let faces_collector = match side {
+                Direction::Left => p.spec.direction == Direction::Left,
+                Direction::Right => p.spec.direction == Direction::Right,
+            };
+            faces_collector || p.depth >= DEPTH_BASIS
+        };
+
+        let sorted = |select: &dyn Fn(&&Placed) -> bool, side: Direction| -> Vec<&Placed> {
+            let mut group: Vec<&Placed> = emissions.iter().filter(|p| select(p)).collect();
+            match side {
+                Direction::Left => group.sort_by_key(|p| std::cmp::Reverse(p.depth)),
+                Direction::Right => group.sort_by_key(|p| p.depth),
+            }
+            group
+        };
+
+        // A scope that maps body-local qubits to the output circuit qubits.
+        let body_to_out: Vec<usize> = out_qargs.iter().map(|q| q.index()).collect();
+        let body_scope = Scope {
+            qubits: &body_to_out,
+            global: &global,
+            clbits: scope.clbits,
+        };
+
+        // Write left edge: collector, outer emissions, easy gates (if left-dressed), inner
+        // emissions, propagating emissions.
+        write_collect(py, out, left, empty_body.clone(), &out_qargs, &out_cargs)?;
+        let left_outer = sorted(
+            &|p| p.edge == Direction::Left && is_outer(p),
+            Direction::Left,
+        );
+        write_emissions(py, out, &left_outer, scope)?;
+        if matches!(dressing, Dressing::Left) {
+            write_easy_gates(out, &easy, &body_scope)?;
+        }
+        let left_inner = sorted(
+            &|p| p.edge == Direction::Left && !is_outer(p) && is_local(p, Direction::Left),
+            Direction::Left,
+        );
+        write_emissions(py, out, &left_inner, scope)?;
+        let left_propagating = sorted(
+            &|p| p.edge == Direction::Left && !is_local(p, Direction::Left),
+            Direction::Left,
+        );
+        write_emissions(py, out, &left_propagating, scope)?;
+
+        // Hard box.
         write_hard_box(out, hard, &out_qargs, &out_cargs)?;
-        write_emissions(
+
+        // Write right edge: propagating emissions, inner emissions, easy gates (if right-dressed),
+        // outer emissions, collector.
+        let right_propagating = sorted(
+            &|p| p.edge == Direction::Right && !is_local(p, Direction::Right),
+            Direction::Right,
+        );
+        write_emissions(py, out, &right_propagating, scope)?;
+        let right_inner = sorted(
+            &|p| p.edge == Direction::Right && !is_outer(p) && is_local(p, Direction::Right),
+            Direction::Right,
+        );
+        write_emissions(py, out, &right_inner, scope)?;
+        if matches!(dressing, Dressing::Right) {
+            write_easy_gates(out, &easy, &body_scope)?;
+        }
+        let right_outer = sorted(
+            &|p| p.edge == Direction::Right && is_outer(p),
+            Direction::Right,
+        );
+        write_emissions(py, out, &right_outer, scope)?;
+        write_collect(
             py,
             out,
-            &ordered(&|p| p.edge == Direction::Right, Direction::Right),
-            scope,
+            right,
+            new_body(width, body_clbits.len(), 0)?,
+            &out_qargs,
+            &out_cargs,
         )?;
-        write_collect(py, out, right, right_body, &out_qargs, &out_cargs)?;
         Ok(())
     }
 
@@ -631,6 +668,29 @@ fn write_emissions(
             ob: emit.into_any(),
         });
         out.push_packed_operation(op, None, &qargs, &[])
+            .into_py_result()?;
+    }
+    Ok(())
+}
+
+/// Write the easy (absorbed) gates directly onto the spine.
+///
+/// Each gate is copied from `easy` (a body-local `CircuitData`) into `out`, remapping its qubits
+/// through `scope` so they land on the correct output wires.
+fn write_easy_gates(out: &mut CircuitData, easy: &CircuitData, scope: &Scope) -> PyResult<()> {
+    for inst in easy.data() {
+        let qargs: Vec<Qubit> = easy
+            .qargs_interner()
+            .get(inst.qubits)
+            .iter()
+            .map(|q| Qubit(scope.qubits[q.index()] as u32))
+            .collect();
+        let params: Option<Parameters<_>> = (!inst.params_view().is_empty()).then(|| {
+            Parameters::Params(
+                inst.params_view().iter().cloned().collect::<SmallVec<[Param; 3]>>(),
+            )
+        });
+        out.push_packed_operation(inst.op.clone(), params, &qargs, &[])
             .into_py_result()?;
     }
     Ok(())

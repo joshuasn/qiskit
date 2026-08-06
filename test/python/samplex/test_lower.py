@@ -34,6 +34,7 @@ from test.python.samplex.test_build import gate_names
 
 def emission_circuit(circuit):
     data, _ = build_lowered(circuit_to_dag(circuit))
+    data = absorb_emissions(data)
     return data
 
 

@@ -40,8 +40,8 @@ def graph_of(circuit, optimize=True):
     """The sampling graph, with the IR2 optimizations optionally applied first."""
     data, table = build_lowered(circuit_to_dag(circuit))
     if optimize:
-        data = absorb_emissions(data)
         data = merge_collectors(data)
+        data = absorb_emissions(data)
     _, graph = lower(data, table)
     return graph
 
