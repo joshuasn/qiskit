@@ -56,7 +56,8 @@ use super::utils::{
     IntoPyResult, block_body, collect_annotation, copy_through, params_of, qubit_indices,
 };
 use crate::annotated_circuit::SynthesizerType;
-use crate::emission_circuit::{Collect, CollectItem, CollectSpec};
+use crate::emission_circuit::{Collect, CollectItem, CollectPart, CollectSpec};
+use crate::partition::Partition;
 
 /// One contribution of absorbed gates, with the qubits its body is expressed over.
 ///
@@ -81,7 +82,9 @@ struct OpenCollector {
     /// collector whose wires have all been released must still be wide enough for everything it
     /// collected.
     span: HashSet<usize>,
-    synthesizer: SynthesizerType,
+    /// Per-part descriptors accumulated from merged contributions.
+    partition: Partition,
+    parts: Vec<CollectPart>,
     /// Composition order, one contribution's run after another. A run's `Gates` counts refer to that
     /// contribution's body, and [`write_collector`] concatenates bodies in the same order, so counts
     /// stay valid without any offsetting — which is the whole reason they are counts.
@@ -135,7 +138,7 @@ fn merge_scope(py: Python, src: &CircuitData) -> PyResult<CircuitData> {
                 frame: qubits.clone(),
                 body: block_body(src, inst)?.cloned().unwrap_or(new_body(qubits.len())?),
             };
-            match find_mergeable(&open, &qubits, spec.synthesizer) {
+            match find_mergeable(&open, &qubits, spec.synthesizer()) {
                 Some(idx) => {
                     // Fuse into the open collector: it keeps its position, and gains this one's
                     // emissions, absorbed gates and qubits. Nothing is released — a merged
@@ -147,6 +150,16 @@ fn merge_scope(py: Python, src: &CircuitData) -> PyResult<CircuitData> {
                     target.items.extend_from_slice(&spec.items);
                     target.absorbed.push(absorbed);
                     target.span.extend(qubits.iter().copied());
+                    // Widen the partition to cover both collectors' qubits.
+                    target.partition =
+                        Partition::union(&[&target.partition, &spec.partition])
+                            .unwrap_or_else(|_| spec.partition.clone());
+                    // Rebuild parts to match the widened partition. find_mergeable ensures all parts
+                    // share the same synthesizer, so we replicate uniformly.
+                    let synth = target.parts[0].synthesizer;
+                    target.parts = (0..target.partition.len())
+                        .map(|_| CollectPart { synthesizer: synth })
+                        .collect();
                 }
                 None => {
                     // Nothing compatible is open on these qubits, so this collector gets a position of
@@ -157,7 +170,8 @@ fn merge_scope(py: Python, src: &CircuitData) -> PyResult<CircuitData> {
                     open.push(OpenCollector {
                         frontier: (0..num_qubits).collect(),
                         span: qubits.iter().copied().collect(),
-                        synthesizer: spec.synthesizer,
+                        partition: spec.partition.clone(),
+                        parts: spec.parts.clone(),
                         items: spec.items.clone(),
                         absorbed: vec![absorbed],
                     });
@@ -195,7 +209,7 @@ fn find_mergeable(
     synthesizer: SynthesizerType,
 ) -> Option<usize> {
     open.iter().position(|candidate| {
-        candidate.synthesizer == synthesizer
+        candidate.parts.iter().all(|p| p.synthesizer == synthesizer)
             // A shared qubit is what gives the two collectors a temporal order to follow. Two
             // collectors on disjoint qubits are *concurrent*: their relative position in this circuit
             // is an artifact of whichever topological order `build` happened to walk, so fusing them
@@ -284,8 +298,9 @@ fn write_collector(py: Python, out: &mut CircuitData, collector: &OpenCollector)
         py,
         (
             Collect::new_from_spec(CollectSpec {
-                synthesizer: collector.synthesizer,
                 items: collector.items.clone(),
+                partition: collector.partition.clone(),
+                parts: collector.parts.clone(),
             }),
             PyAnnotation,
         ),

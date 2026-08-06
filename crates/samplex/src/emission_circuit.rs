@@ -78,6 +78,16 @@ parse_enum!(parse_virtual_type, VirtualType, "virtual type", {
     "z2" => Z2,
 });
 
+/// Per-part descriptor for an emission: what distribution is drawn on this subsystem and what
+/// algebraic type results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmitPart {
+    /// The distribution this part draws from.
+    pub dist: DistKey,
+    /// The algebraic type of the emitted virtual gates on this part.
+    pub virtual_type: VirtualType,
+}
+
 /// The payload of an [`Emit`] instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmitSpec {
@@ -88,18 +98,16 @@ pub struct EmitSpec {
     pub id: u32,
     /// Which annotation this emission stands in for.
     pub source: EmitSource,
-    /// The distribution this emission draws from. The two halves of a twirl share this key.
-    pub dist: DistKey,
     /// Which way the emitted virtual state flows.
     pub direction: Direction,
-    /// The algebraic type of the emitted virtual gates.
-    pub virtual_type: VirtualType,
     /// Subsystem grouping over the emission's qubits, in the *global* circuit frame.
     ///
     /// The instruction's qargs are body-local (a box body is its own circuit indexed `0..width`),
     /// so this is the one place the global frame is recorded; the graph reader relies on it rather
     /// than re-deriving it through enclosing box qargs.
     pub partition: Partition,
+    /// Per-part descriptors, parallel with `partition.iter()`.
+    pub parts: Vec<EmitPart>,
 }
 
 impl EmitSpec {
@@ -108,6 +116,18 @@ impl EmitSpec {
         let mut qubits: Vec<usize> = self.partition.all_elements().iter().copied().collect();
         qubits.sort_unstable();
         qubits
+    }
+
+    /// The distribution key of the first part. Convenience for the common uniform case where all
+    /// parts share the same distribution.
+    pub fn dist(&self) -> DistKey {
+        self.parts[0].dist
+    }
+
+    /// The virtual type of the first part. Convenience for the common uniform case where all parts
+    /// share the same virtual type.
+    pub fn virtual_type(&self) -> VirtualType {
+        self.parts[0].virtual_type
     }
 }
 
@@ -153,17 +173,20 @@ impl Emit {
                 "Emit requires at least one subsystem.",
             ));
         }
+        let num_parts = subsystems.len();
         let partition =
             Partition::with_parts(subsystems.into_iter().map(|part| part.into_boxed_slice()))
                 .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+        let dist = DistKey(distribution_key);
+        let vt = parse_virtual_type(virtual_type)?;
+        let parts = vec![EmitPart { dist, virtual_type: vt }; num_parts];
         Ok(Emit {
             inner: EmitSpec {
                 id,
                 source: parse_source(source)?,
-                dist: DistKey(distribution_key),
                 direction: parse_direction(direction)?,
-                virtual_type: parse_virtual_type(virtual_type)?,
                 partition,
+                parts,
             },
         })
     }
@@ -203,7 +226,7 @@ impl Emit {
 
     #[getter]
     fn distribution_key(&self) -> u32 {
-        self.inner.dist.0
+        self.inner.dist().0
     }
 
     #[getter]
@@ -216,7 +239,7 @@ impl Emit {
 
     #[getter]
     fn virtual_type(&self) -> &'static str {
-        match self.inner.virtual_type {
+        match self.inner.virtual_type() {
             VirtualType::Pauli => "pauli",
             VirtualType::C1 => "c1",
             VirtualType::U2 => "u2",
@@ -245,7 +268,7 @@ impl Emit {
             "Emit(#{}, {}, dist={}, {}, {:?})",
             self.inner.id,
             self.source(),
-            self.inner.dist.0,
+            self.inner.dist().0,
             self.direction(),
             self.inner.qubits(),
         )
@@ -286,7 +309,7 @@ impl Emit {
                 self.subsystems(),
                 self.inner.id,
                 self.source(),
-                self.inner.dist.0,
+                self.inner.dist().0,
                 self.direction(),
                 self.virtual_type(),
             ),
@@ -336,10 +359,10 @@ pub fn extract_emit(obj: &Bound<'_, PyAny>) -> Option<EmitSpec> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalEmission {
     pub source: EmitSource,
-    pub dist: DistKey,
     pub direction: Direction,
-    pub virtual_type: VirtualType,
     pub partition: Partition,
+    /// Per-part descriptors, parallel with `partition.iter()`.
+    pub parts: Vec<EmitPart>,
 }
 
 /// One step in what a collector composes, in circuit order.
@@ -359,11 +382,16 @@ pub enum CollectItem {
     Incoming(u32),
 }
 
+/// Per-part descriptor for a collector: what synthesizer to use on this subsystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectPart {
+    /// How the collected virtual gates on this part will be synthesized.
+    pub synthesizer: SynthesizerType,
+}
+
 /// The payload of a [`Collect`] annotation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectSpec {
-    /// How the collected virtual gates will be synthesized into the box body.
-    pub synthesizer: SynthesizerType,
     /// Everything this collector composes, in **circuit order** — which is outermost-first on the left
     /// of a box and innermost-first on the right.
     ///
@@ -376,6 +404,10 @@ pub struct CollectSpec {
     /// references explicitly is what lets the graph reader avoid re-deriving the contextual collection
     /// rules (shared middle collectors, growing qubit sets) a second time.
     pub items: Vec<CollectItem>,
+    /// Subsystem grouping over the collector's qubits, in the *global* circuit frame.
+    pub partition: Partition,
+    /// Per-part descriptors, parallel with `partition.iter()`.
+    pub parts: Vec<CollectPart>,
 }
 
 impl CollectSpec {
@@ -407,6 +439,17 @@ impl CollectSpec {
             matches!(item, CollectItem::Emission(_) | CollectItem::Incoming(_))
         })
     }
+
+    /// The synthesizer of the first part. Convenience for the common uniform case where all parts
+    /// share the same synthesizer.
+    pub fn synthesizer(&self) -> SynthesizerType {
+        self.parts[0].synthesizer
+    }
+
+    /// Whether the given virtual type is accepted by all parts of this collector.
+    pub fn accepts(&self, vt: VirtualType) -> bool {
+        self.parts.iter().all(|part| part.synthesizer.accepts(vt))
+    }
 }
 
 /// Marks a box whose body holds the "easy" gates absorbed into a dressing, to be replaced by a
@@ -432,11 +475,13 @@ impl Collect {
     #[new]
     #[pyo3(signature = (collects, synthesizer="rzsx"))]
     fn new(collects: Vec<u32>, synthesizer: &str) -> PyResult<PyClassInitializer<Self>> {
+        let synth = parse_decomposition(synthesizer)?;
         Ok(
             PyClassInitializer::from(PyAnnotation).add_subclass(Collect {
                 inner: CollectSpec {
-                    synthesizer: parse_decomposition(synthesizer)?,
                     items: collects.into_iter().map(CollectItem::Incoming).collect(),
+                    partition: Partition::new(),
+                    parts: vec![CollectPart { synthesizer: synth }],
                 },
             }),
         )
@@ -449,7 +494,7 @@ impl Collect {
 
     #[getter]
     fn synthesizer(&self) -> &'static str {
-        match self.inner.synthesizer {
+        match self.inner.synthesizer() {
             SynthesizerType::RzSx => "rzsx",
             SynthesizerType::RzRx => "rzrx",
         }
@@ -489,7 +534,7 @@ impl Collect {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        format!("Collect({:?}, [{}])", self.inner.synthesizer, items)
+        format!("Collect({:?}, [{}])", self.inner.synthesizer(), items)
     }
 }
 

@@ -165,10 +165,10 @@ fn write_scope(
             let param_indices: Vec<usize> = (*next_param..*next_param + count).collect();
             *next_param += count;
 
-            write_synth_template(out, spec.synthesizer, &qubits, &param_indices)?;
+            write_synth_template(out, spec.synthesizer(), &qubits, &param_indices)?;
             collectors.push(CollectorParams {
                 qubits,
-                synthesizer: spec.synthesizer,
+                synthesizer: spec.synthesizer(),
                 collects: spec.incoming_ids(),
                 param_indices,
             });
@@ -536,7 +536,7 @@ fn flatten(
             events.push(Event::Collector(infos.len()));
             infos.push(CollectorInfo {
                 qubits,
-                synthesizer: spec.synthesizer,
+                synthesizer: spec.synthesizer(),
                 collects: spec.incoming_ids(),
                 param_indices: Vec::new(),
                 steps,
@@ -618,7 +618,7 @@ fn walk_emission(
                         (index, offset),
                         gate.gate,
                         &gate.qubits,
-                        spec.virtual_type,
+                        spec.virtual_type(),
                     )?;
                 }
             }
@@ -631,7 +631,7 @@ fn walk_emission(
                 (index, 0),
                 *gate,
                 gate_qubits,
-                spec.virtual_type,
+                spec.virtual_type(),
             )?,
             _ => {}
         }
@@ -702,7 +702,7 @@ fn chain(
 /// is check that the tag IR2 recorded and the entry it points at still agree, which they only would
 /// not if IR2 were built inconsistently.
 fn emission_kind(spec: &EmitSpec, table: &DistributionTable) -> PyResult<NodeKind> {
-    let entry = table.get(spec.dist).ok_or_else(|| {
+    let entry = table.get(spec.dist()).ok_or_else(|| {
         PyValueError::new_err(format!(
             "emission #{} references a missing table entry",
             spec.id
@@ -724,6 +724,6 @@ fn emission_kind(spec: &EmitSpec, table: &DistributionTable) -> PyResult<NodeKin
         id: spec.id,
         entry: entry.clone(),
         direction: spec.direction,
-        virtual_type: spec.virtual_type,
+        virtual_type: spec.virtual_type(),
     }))
 }

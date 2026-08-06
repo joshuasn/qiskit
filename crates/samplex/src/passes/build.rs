@@ -48,7 +48,9 @@ use crate::annotated_circuit::{
     SynthesizerType,
 };
 use crate::distributions::{DistEntry, DistributionTable};
-use crate::emission_circuit::{Collect, CollectItem, CollectSpec, Emit, EmitSource, EmitSpec};
+use crate::emission_circuit::{
+    Collect, CollectItem, CollectPart, CollectSpec, Emit, EmitPart, EmitSource, EmitSpec,
+};
 use crate::partition::Partition;
 use crate::virtual_flow_graph::Direction;
 use crate::virtual_type::VirtualType;
@@ -265,6 +267,10 @@ impl Build {
         let dressing = resolved.dressing.unwrap_or(Dressing::Left);
         let emissions = self.build_emissions(&resolved, &global, dressing);
         let synthesizer = resolved.synthesizer.unwrap_or(DEFAULT_SYNTHESIZER);
+        let partition = Partition::from_elements(global.iter().copied());
+        let collect_parts: Vec<CollectPart> = (0..partition.len())
+            .map(|_| CollectPart { synthesizer })
+            .collect();
 
         // Emissions at each edge, sorted for writing to the spine.
         let ordered = |select: &dyn Fn(&Placed) -> bool, side: Direction| -> Vec<&Placed> {
@@ -324,12 +330,14 @@ impl Build {
         };
 
         let left = CollectSpec {
-            synthesizer,
             items: items(left_gates),
+            partition: partition.clone(),
+            parts: collect_parts.clone(),
         };
         let right = CollectSpec {
-            synthesizer,
             items: items(right_gates),
+            partition: partition.clone(),
+            parts: collect_parts,
         };
 
         // Each emission is written at the edge it belongs to — see [`emission_edge`] — so the hard box
@@ -369,6 +377,7 @@ impl Build {
         dressing: Dressing,
     ) -> Vec<Placed> {
         let partition = Partition::from_elements(qubits.iter().copied());
+        let num_parts = partition.len();
         let dressing_edge = match dressing {
             Dressing::Left => Direction::Left,
             Dressing::Right => Direction::Right,
@@ -380,16 +389,16 @@ impl Build {
                 .table
                 .intern(DistEntry::Distribution(twirl.distribution));
             let virtual_type = twirl.distribution.virtual_type();
+            let parts = vec![EmitPart { dist, virtual_type }; num_parts];
             for direction in [Direction::Left, Direction::Right] {
                 let id = self.fresh_id();
                 emissions.push(Placed {
                     spec: EmitSpec {
                         id,
                         source: EmitSource::Twirl,
-                        dist,
                         direction,
-                        virtual_type,
                         partition: partition.clone(),
+                        parts: parts.clone(),
                     },
                     edge: dressing_edge,
                     depth: DEPTH_TWIRL,
@@ -403,18 +412,17 @@ impl Build {
             });
             let id = self.fresh_id();
             let direction: Direction = basis.placement.into();
+            let virtual_type = basis.mode.virtual_type();
+            let parts = vec![EmitPart { dist, virtual_type }; num_parts];
             emissions.push(Placed {
                 spec: EmitSpec {
                     id,
                     source: EmitSource::ChangeBasis,
-                    dist,
                     direction,
-                    virtual_type: basis.mode.virtual_type(),
                     partition: partition.clone(),
+                    parts,
                 },
                 edge: direction,
-                // The one place the two basis annotations part ways: a local-Clifford injection flanks
-                // the hard content, a basis change wraps the whole box.
                 depth: match basis.origin {
                     BasisOrigin::ChangeBasis => DEPTH_BASIS,
                     BasisOrigin::InjectLocalClifford => DEPTH_INJECTION,
@@ -428,14 +436,15 @@ impl Build {
             });
             let id = self.fresh_id();
             let direction: Direction = noise.site.into();
+            let virtual_type = VirtualType::Pauli;
+            let parts = vec![EmitPart { dist, virtual_type }; num_parts];
             emissions.push(Placed {
                 spec: EmitSpec {
                     id,
                     source: EmitSource::InjectNoise,
-                    dist,
                     direction,
-                    virtual_type: VirtualType::Pauli,
                     partition: partition.clone(),
+                    parts,
                 },
                 edge: direction,
                 depth: DEPTH_INJECTION,

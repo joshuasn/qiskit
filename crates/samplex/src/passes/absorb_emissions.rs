@@ -95,7 +95,7 @@ fn scan_for_collector(
         }
 
         if let Some(spec) = collect_annotation(py, inst) {
-            if spec.synthesizer.accepts(emit_spec.virtual_type) {
+            if spec.accepts(emit_spec.virtual_type()) {
                 let mut path = path_prefix.to_vec();
                 path.push(i);
                 if has_gates {
@@ -157,7 +157,7 @@ fn descend_into_box(
         }
 
         if let Some(spec) = collect_annotation(py, inst) {
-            if spec.synthesizer.accepts(emit_spec.virtual_type) {
+            if spec.accepts(emit_spec.virtual_type()) {
                 let mut path = child_prefix;
                 path.push(i);
                 if parent_has_gates {
@@ -352,8 +352,9 @@ fn rebuild(
                 py,
             );
             let new_spec = CollectSpec {
-                synthesizer: spec.synthesizer,
                 items: new_items,
+                partition: spec.partition.clone(),
+                parts: spec.parts.clone(),
             };
             write_collector_with_spec(py, src, inst, &new_spec, &mut out)?;
             continue;
@@ -428,10 +429,9 @@ fn build_collector_items(
     for emit in &local_specs {
         let item = CollectItem::Emission(LocalEmission {
             source: emit.source,
-            dist: emit.dist,
             direction: emit.direction,
-            virtual_type: emit.virtual_type,
             partition: emit.partition.clone(),
+            parts: emit.parts.clone(),
         });
         match emit.source {
             EmitSource::ChangeBasis => before_gates.push(item),
