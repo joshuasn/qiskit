@@ -28,7 +28,6 @@ pub fn emission_node(qubits: &[usize], entry: DistEntry) -> Node {
     Node {
         partition: Partition::from_elements(qubits.iter().copied()),
         kind: NodeKind::Emission(Emission {
-            id: 0,
             entry,
             direction: Direction::Right,
             virtual_type: VirtualType::Pauli,
@@ -40,7 +39,6 @@ pub fn typed_emit_node(qubits: &[usize], distribution: DistributionType) -> Node
     Node {
         partition: Partition::from_elements(qubits.iter().copied()),
         kind: NodeKind::Emission(Emission {
-            id: 0,
             entry: DistEntry::Distribution(distribution),
             direction: Direction::Right,
             virtual_type: distribution.virtual_type(),

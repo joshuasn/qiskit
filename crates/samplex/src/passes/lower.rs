@@ -66,8 +66,6 @@ pub struct CollectorParams {
     /// The collector's qubits, ascending.
     pub qubits: Vec<usize>,
     pub synthesizer: SynthesizerType,
-    /// The emissions this collector consumes, as recorded on its annotation.
-    pub collects: Vec<u32>,
     /// Indices into the template's parameter vector, `qubits.len() * PARAMS_PER_QUBIT` of them,
     /// grouped per qubit in `qubits` order.
     pub param_indices: Vec<usize>,
@@ -103,8 +101,8 @@ pub fn build_template(
     Ok((out, collectors))
 }
 
-/// One collector as seen from Python: qubits, synthesizer name, emissions collected, parameter indices.
-type CollectorSummary = (Vec<usize>, String, Vec<u32>, Vec<usize>);
+/// One collector as seen from Python: qubits, synthesizer name, parameter indices.
+type CollectorSummary = (Vec<usize>, String, Vec<usize>);
 
 /// Python-facing entry point: returns the template and the collector parameter map.
 #[pyfunction]
@@ -121,7 +119,7 @@ pub fn py_build_template(
                 SynthesizerType::RzSx => "rzsx".to_string(),
                 SynthesizerType::RzRx => "rzrx".to_string(),
             };
-            (c.qubits, synth, c.collects, c.param_indices)
+            (c.qubits, synth, c.param_indices)
         })
         .collect();
     Ok((PyCircuitData { inner: template }, summary))
@@ -169,7 +167,6 @@ fn write_scope(
             collectors.push(CollectorParams {
                 qubits,
                 synthesizer: spec.synthesizer,
-                collects: spec.incoming_ids(),
                 param_indices,
             });
             continue;
@@ -305,9 +302,8 @@ fn copy_with_qargs(
 struct CollectorInfo {
     qubits: Vec<usize>,
     synthesizer: SynthesizerType,
-    collects: Vec<u32>,
     param_indices: Vec<usize>,
-    /// Everything this collector composes, in circuit order — emissions and absorbed gates interleaved.
+    /// Everything this collector composes, in circuit order — local emissions and absorbed gates.
     steps: Vec<CollectStep>,
 }
 
@@ -389,7 +385,7 @@ pub fn build_sampling_graph(
     // one. Both cases are reachable — an outer right-walking factor and an inner left-walking factor
     // cross the same nested hard gates in opposite directions.
     let mut gate_nodes: HashMap<GateKey, NodeIndex> = HashMap::new();
-    let mut emission_nodes: HashMap<u32, NodeIndex> = HashMap::new();
+    let mut emission_nodes: HashMap<usize, NodeIndex> = HashMap::new();
 
     for (position, event) in events.iter().enumerate() {
         match event {
@@ -398,8 +394,7 @@ pub fn build_sampling_graph(
                     partition: spec.partition.clone(),
                     kind: emission_kind(spec, table)?,
                 });
-                emission_nodes.insert(spec.id, node);
-                let _ = position;
+                emission_nodes.insert(position, node);
             }
             Event::Measure(qubits, clbits) => {
                 vfg.graph.add_node(Node {
@@ -419,21 +414,15 @@ pub fn build_sampling_graph(
         }
     }
 
-    // Now walk each emission to the collector that names it, wiring the conjugations in between.
-    // Emissions with no collector (standalone, awaiting walk_emissions) are skipped.
+    // Walk each emission to its target collector, wiring the conjugation chain in between.
+    // Target resolution is purely positional: scan from the emission in its travel direction to
+    // find the nearest compatible collector.
     for (position, event) in events.iter().enumerate() {
         let Event::Emission(spec) = event else {
             continue;
         };
-        let source = emission_nodes[&spec.id];
-        // First try: find via Incoming(id) on a collector (absorb_emissions has run).
-        // Fallback: scan for nearest collector in direction (unoptimized path).
-        let target = infos
-            .iter()
-            .position(|info| info.collects.contains(&spec.id))
-            .or_else(|| {
-                scan_for_nearest_collector(&events, position, spec.direction, &infos)
-            });
+        let source = emission_nodes[&position];
+        let target = scan_for_nearest_collector(&events, position, spec.direction, &infos);
         let Some(target) = target else {
             continue;
         };
@@ -524,7 +513,6 @@ fn flatten(
                     CollectItem::Emission(local) => {
                         steps.push(CollectStep::Local(local.clone()));
                     }
-                    CollectItem::Incoming(id) => steps.push(CollectStep::Incoming(*id)),
                     CollectItem::Gates(count) => {
                         for gate in &gates[cursor..cursor + count] {
                             steps.push(CollectStep::Gate(gate.clone()));
@@ -537,7 +525,6 @@ fn flatten(
             infos.push(CollectorInfo {
                 qubits,
                 synthesizer: spec.synthesizer,
-                collects: spec.incoming_ids(),
                 param_indices: Vec::new(),
                 steps,
             });
@@ -704,8 +691,8 @@ fn chain(
 fn emission_kind(spec: &EmitSpec, table: &DistributionTable) -> PyResult<NodeKind> {
     let entry = table.get(spec.dist).ok_or_else(|| {
         PyValueError::new_err(format!(
-            "emission #{} references a missing table entry",
-            spec.id
+            "emission (dist={}) references a missing table entry",
+            spec.dist.0
         ))
     })?;
     let agrees = matches!(
@@ -716,12 +703,11 @@ fn emission_kind(spec: &EmitSpec, table: &DistributionTable) -> PyResult<NodeKin
     );
     if !agrees {
         return Err(PyValueError::new_err(format!(
-            "emission #{} does not match its table entry",
-            spec.id
+            "emission (dist={}) does not match its table entry",
+            spec.dist.0
         )));
     }
     Ok(NodeKind::Emission(Emission {
-        id: spec.id,
         entry: entry.clone(),
         direction: spec.direction,
         virtual_type: spec.virtual_type,

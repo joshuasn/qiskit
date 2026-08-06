@@ -271,8 +271,8 @@ class TestPreservation(QiskitTestCase):
         after, _ = merged(circuit)
 
         self.assertEqual(
-            [(e.id, e.source, e.direction, tuple(e.qubits)) for e in emissions(before)],
-            [(e.id, e.source, e.direction, tuple(e.qubits)) for e in emissions(after)],
+            [(e.source, e.direction, tuple(e.qubits)) for e in emissions(before)],
+            [(e.source, e.direction, tuple(e.qubits)) for e in emissions(after)],
         )
 
     def test_emissions_are_preserved_through_merge(self):
@@ -282,8 +282,8 @@ class TestPreservation(QiskitTestCase):
 
         # All emissions remain in the circuit (merge doesn't touch them)
         self.assertEqual(
-            [(e.id, e.source, e.direction) for e in emissions(before)],
-            [(e.id, e.source, e.direction) for e in emissions(out)],
+            [(e.source, e.direction) for e in emissions(before)],
+            [(e.source, e.direction) for e in emissions(out)],
         )
 
     def test_hard_content_survives(self):

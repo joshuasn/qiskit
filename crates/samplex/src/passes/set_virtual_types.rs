@@ -201,7 +201,6 @@ mod tests {
         Node {
             partition: Partition::from_elements(qubits.iter().copied()),
             kind: NodeKind::Emission(Emission {
-                id: 0,
                 entry: DistEntry::Basis {
                     mode,
                     ref_id: ref_id.to_string(),
@@ -236,7 +235,6 @@ mod tests {
         let inj = vfg.graph.add_node(Node {
             partition: Partition::from_elements([0, 1]),
             kind: NodeKind::Emission(Emission {
-                id: 0,
                 entry: DistEntry::Noise {
                     reference: "noise.0".to_string(),
                     modifier: None,

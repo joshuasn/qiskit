@@ -106,8 +106,10 @@ class TestBuildShape(QiskitTestCase):
 
         # Build produces two collectors (left and right), each with only Gates items
         left, right = collectors(lowered)
-        self.assertEqual(left[0].collects, [])
-        self.assertEqual(right[0].collects, [])
+        left_tags = [tag for tag, _ in left[0].items]
+        right_tags = [tag for tag, _ in right[0].items]
+        self.assertTrue(all(t == "gates" for t in left_tags))
+        self.assertTrue(all(t == "gates" for t in right_tags))
 
     def test_noise_and_basis_land_on_the_side_their_placement_names(self):
         circuit = QuantumCircuit(2)
@@ -121,9 +123,9 @@ class TestBuildShape(QiskitTestCase):
             circuit.cx(0, 1)
         lowered, table = lower(circuit)
 
-        by_id = {e.id: e for e in emissions(lowered)}
-        noise = next(e for e in by_id.values() if e.source == "inject_noise")
-        basis = next(e for e in by_id.values() if e.source == "change_basis")
+        all_emits = list(emissions(lowered))
+        noise = next(e for e in all_emits if e.source == "inject_noise")
+        basis = next(e for e in all_emits if e.source == "change_basis")
         self.assertEqual(noise.direction, "right")  # site="after"
         self.assertEqual(basis.direction, "left")  # placement="start"
 
@@ -171,16 +173,17 @@ class TestBuildShape(QiskitTestCase):
                         emits = [i for i, n in enumerate(names) if n.startswith("samplex_emit")]
                         # the hard box is the middle `box`; the collectors bracket everything
                         box_at = [i for i, n in enumerate(names) if n == "box"][1]
-                        target = next(
-                            e
-                            for e in emissions(lowered)
+                        all_emits = list(emissions(lowered))
+                        target_idx = next(
+                            idx
+                            for idx, e in enumerate(all_emits)
                             if e.source in ("change_basis", "inject_noise")
                         )
-                        at = emits[[e.id for e in emissions(lowered)].index(target.id)]
+                        at = emits[target_idx]
                         self.assertEqual(
                             at < box_at,
                             side == "left",
-                            f"{target.source} landed on the wrong side of the hard box",
+                            f"{all_emits[target_idx].source} landed on the wrong side of the hard box",
                         )
 
     def test_emissions_nest_by_how_close_they_are_to_the_content(self):
@@ -553,9 +556,9 @@ class TestFidelity(QiskitTestCase):
             runs.append(
                 (
                     gate_names(lowered),
-                    [(c.synthesizer, tuple(c.collects)) for c, _, _ in collectors(lowered)],
+                    [(c.synthesizer, tuple(c.items)) for c, _, _ in collectors(lowered)],
                     [tuple(q) for _, _, q in collectors(lowered)],
-                    [(e.id, e.direction, tuple(e.qubits)) for e in emissions(lowered)],
+                    [(e.direction, tuple(e.qubits)) for e in emissions(lowered)],
                     table.entries(),
                 )
             )
