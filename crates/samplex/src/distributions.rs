@@ -69,6 +69,8 @@ pub struct DistributionTable {
     lookup: HashMap<DistEntry, DistKey>,
     /// Modifier references grouped by the noise reference they modify.
     noise_modifiers: HashMap<String, HashSet<String>>,
+    /// How many subsystem draws are allocated for each entry (indexed by `DistKey`).
+    draw_counts: Vec<u32>,
 }
 
 impl DistributionTable {
@@ -94,8 +96,15 @@ impl DistributionTable {
         }
         let key = DistKey(self.entries.len() as u32);
         self.entries.push(entry.clone());
+        self.draw_counts.push(0);
         self.lookup.insert(entry, key);
         key
+    }
+
+    /// Set the total number of subsystem draws for `key`. Called by the build pass after walking
+    /// the full circuit to finalize how large each key's sample array needs to be.
+    pub fn set_draw_count(&mut self, key: DistKey, count: u32) {
+        self.draw_counts[key.index()] = count;
     }
 
     /// Look up an entry by key.
@@ -158,6 +167,12 @@ impl DistributionTable {
                 (reference.clone(), modifiers)
             })
             .collect()
+    }
+
+    /// How many subsystem draws each entry needs, in key order.
+    #[getter]
+    fn get_draw_counts(&self) -> Vec<u32> {
+        self.draw_counts.clone()
     }
 }
 

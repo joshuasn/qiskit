@@ -78,14 +78,22 @@ parse_enum!(parse_virtual_type, VirtualType, "virtual type", {
     "z2" => Z2,
 });
 
-/// Per-part descriptor for an emission: what distribution is drawn on this subsystem and what
-/// algebraic type results.
+/// Per-part descriptor for an emission: what distribution is drawn on this subsystem, what
+/// algebraic type results, and which slot in the distribution's sample array it reads from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmitPart {
     /// The distribution this part draws from.
     pub dist: DistKey,
     /// The algebraic type of the emitted virtual gates on this part.
     pub virtual_type: VirtualType,
+    /// Index into this part's `dist` key's sample array.
+    pub draw: u32,
+    /// Whether to take the adjoint of the sampled value before composing/propagating.
+    ///
+    /// For a twirl pair the near half is `false` (uses the drawn element directly) while the far
+    /// half is `true` (starts from the adjoint, then propagation conjugates it through gates).
+    /// Non-twirl emissions are always `false`.
+    pub adjoint: bool,
 }
 
 /// The payload of an [`Emit`] instruction.
@@ -152,7 +160,7 @@ impl Emit {
     /// The lowering builds these in Rust; this constructor exists so the instruction can be
     /// exercised from Python and from tests without running a full lowering.
     #[new]
-    #[pyo3(signature = (subsystems, source="twirl", distribution_key=0, direction="left", virtual_type="pauli"))]
+    #[pyo3(signature = (subsystems, source="twirl", distribution_key=0, direction="left", virtual_type="pauli", draw_start=0, adjoint=false))]
     fn py_new(
         py: Python,
         subsystems: Vec<Vec<usize>>,
@@ -160,6 +168,8 @@ impl Emit {
         distribution_key: u32,
         direction: &str,
         virtual_type: &str,
+        draw_start: u32,
+        adjoint: bool,
     ) -> PyResult<Self> {
         ensure_registered(py)?;
         if subsystems.is_empty() {
@@ -173,7 +183,14 @@ impl Emit {
                 .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
         let dist = DistKey(distribution_key);
         let vt = parse_virtual_type(virtual_type)?;
-        let parts = vec![EmitPart { dist, virtual_type: vt }; num_parts];
+        let parts = (0..num_parts)
+            .map(|i| EmitPart {
+                dist,
+                virtual_type: vt,
+                draw: draw_start + i as u32,
+                adjoint,
+            })
+            .collect();
         Ok(Emit {
             inner: EmitSpec {
                 source: parse_source(source)?,
@@ -251,13 +268,33 @@ impl Emit {
             .collect()
     }
 
+    /// The draw indices for each part, parallel with `subsystems`.
+    #[getter]
+    fn draws(&self) -> Vec<u32> {
+        self.inner.parts.iter().map(|p| p.draw).collect()
+    }
+
+    /// Whether each part takes the adjoint of its sampled value, parallel with `subsystems`.
+    #[getter]
+    fn adjoints(&self) -> Vec<bool> {
+        self.inner.parts.iter().map(|p| p.adjoint).collect()
+    }
+
     fn __repr__(&self) -> String {
+        let draws: Vec<u32> = self.inner.parts.iter().map(|p| p.draw).collect();
+        let adjoint_marker = if self.inner.parts.iter().any(|p| p.adjoint) {
+            ", adj"
+        } else {
+            ""
+        };
         format!(
-            "Emit({}, dist={}, {}, {:?})",
+            "Emit({}, dist={}, {}, {:?}, draws={:?}{})",
             self.source(),
             self.inner.dist().0,
             self.direction(),
             self.inner.qubits(),
+            draws,
+            adjoint_marker,
         )
     }
 
@@ -298,6 +335,8 @@ impl Emit {
                 self.inner.dist().0,
                 self.direction(),
                 self.virtual_type(),
+                self.inner.parts[0].draw,
+                self.inner.parts[0].adjoint,
             ),
         )
             .into_py_any(py)

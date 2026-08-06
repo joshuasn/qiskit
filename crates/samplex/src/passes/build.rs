@@ -27,7 +27,7 @@
 //! Parameters are deliberately absent: merging changes how many collectors exist and how wide they
 //! are, so labelling happens in the IR2 → IR3 lowering. See `SAMPLEX_IR_DESIGN.md`.
 
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
 
 use pyo3::exceptions::PyValueError;
@@ -47,7 +47,7 @@ use crate::annotated_circuit::{
     extract_annotation, resolve_annotations, BasisOrigin, BoxAnnotation, Dressing, ResolvedBox,
     SynthesizerType,
 };
-use crate::distributions::{DistEntry, DistributionTable};
+use crate::distributions::{DistEntry, DistKey, DistributionTable};
 use crate::emission_circuit::{
     Collect, CollectItem, CollectPart, CollectSpec, Emit, EmitPart, EmitSource, EmitSpec,
 };
@@ -146,6 +146,7 @@ impl Scope<'_> {
 
 struct Build {
     table: DistributionTable,
+    draw_counts: HashMap<DistKey, u32>,
 }
 
 /// Build the emission circuit for an annotated circuit.
@@ -173,6 +174,7 @@ pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(CircuitData, Distributio
     .into_py_result()?;
     let mut build = Build {
         table: DistributionTable::new(),
+        draw_counts: HashMap::new(),
     };
     let scope = Scope {
         qubits: &identity_q,
@@ -180,10 +182,21 @@ pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(CircuitData, Distributio
         clbits: &identity_c,
     };
     build.walk(py, dag, &mut out, &scope)?;
+    for (key, count) in &build.draw_counts {
+        build.table.set_draw_count(*key, *count);
+    }
     Ok((out, build.table))
 }
 
 impl Build {
+    /// Allocate `count` consecutive draw slots for `dist`, returning the start index.
+    fn alloc_draws(&mut self, dist: DistKey, count: u32) -> u32 {
+        let next = self.draw_counts.entry(dist).or_insert(0);
+        let start = *next;
+        *next += count;
+        start
+    }
+
     /// Emit the IR2 form of every op in `dag` into `out`.
     fn walk(
         &mut self,
@@ -381,14 +394,23 @@ impl Build {
                 .table
                 .intern(DistEntry::Distribution(twirl.distribution));
             let virtual_type = twirl.distribution.virtual_type();
-            let parts = vec![EmitPart { dist, virtual_type }; num_parts];
+            let draw_base = self.alloc_draws(dist, num_parts as u32);
             for direction in [Direction::Left, Direction::Right] {
+                let adjoint = direction != dressing_edge;
+                let parts = (0..num_parts)
+                    .map(|i| EmitPart {
+                        dist,
+                        virtual_type,
+                        draw: draw_base + i as u32,
+                        adjoint,
+                    })
+                    .collect();
                 emissions.push(Placed {
                     spec: EmitSpec {
                         source: EmitSource::Twirl,
                         direction,
                         partition: partition.clone(),
-                        parts: parts.clone(),
+                        parts,
                     },
                     edge: dressing_edge,
                     depth: DEPTH_TWIRL,
@@ -402,7 +424,15 @@ impl Build {
             });
             let direction: Direction = basis.placement.into();
             let virtual_type = basis.mode.virtual_type();
-            let parts = vec![EmitPart { dist, virtual_type }; num_parts];
+            let draw_base = self.alloc_draws(dist, num_parts as u32);
+            let parts = (0..num_parts)
+                .map(|i| EmitPart {
+                    dist,
+                    virtual_type,
+                    draw: draw_base + i as u32,
+                    adjoint: false,
+                })
+                .collect();
             emissions.push(Placed {
                 spec: EmitSpec {
                     source: EmitSource::ChangeBasis,
@@ -424,7 +454,15 @@ impl Build {
             });
             let direction: Direction = noise.site.into();
             let virtual_type = VirtualType::Pauli;
-            let parts = vec![EmitPart { dist, virtual_type }; num_parts];
+            let draw_base = self.alloc_draws(dist, num_parts as u32);
+            let parts = (0..num_parts)
+                .map(|i| EmitPart {
+                    dist,
+                    virtual_type,
+                    draw: draw_base + i as u32,
+                    adjoint: false,
+                })
+                .collect();
             emissions.push(Placed {
                 spec: EmitSpec {
                     source: EmitSource::InjectNoise,
