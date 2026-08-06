@@ -88,7 +88,7 @@ class TestTemplateShape(QiskitTestCase):
             circuit.noop(0)
         out, collectors = template(emission_circuit(circuit))
         self.assertEqual(gate_names(out), ["rz", "sx", "rz", "sx", "rz"] * 2)
-        self.assertEqual([len(c[3]) for c in collectors], [3, 3])
+        self.assertEqual([len(c[2]) for c in collectors], [3, 3])
 
     def test_rzrx_fragment(self):
         circuit = QuantumCircuit(1)
@@ -103,7 +103,7 @@ class TestTemplateShape(QiskitTestCase):
             circuit.noop(0, 1, 2)
         out, collectors = template(emission_circuit(circuit))
         # three qubits x three angles, for each of the two collectors
-        self.assertEqual([len(c[3]) for c in collectors], [9, 9])
+        self.assertEqual([len(c[2]) for c in collectors], [9, 9])
         self.assertEqual(out.num_parameters, 18)
 
 
@@ -112,12 +112,12 @@ class TestParameterLabelling(QiskitTestCase):
 
     def test_indices_are_contiguous_and_ordered(self):
         _, collectors = template(emission_circuit(notebook_circuit()))
-        allocated = [i for _, _, _, params in collectors for i in params]
+        allocated = [i for _, _, params in collectors for i in params]
         self.assertEqual(allocated, list(range(len(allocated))))
 
     def test_count_is_three_per_qubit_per_collector(self):
         out, collectors = template(emission_circuit(notebook_circuit()))
-        expected = sum(3 * len(qubits) for qubits, _, _, _ in collectors)
+        expected = sum(3 * len(qubits) for qubits, _, _ in collectors)
         self.assertEqual(out.num_parameters, expected)
 
     def test_merging_reduces_the_parameter_vector(self):
@@ -131,11 +131,11 @@ class TestParameterLabelling(QiskitTestCase):
         self.assertEqual((len(merged_collectors), merged.num_parameters), (4, 36))
 
     def test_lowering_unmerged_is_still_complete(self):
-        # Every emission still has exactly one collector responsible for it.
+        # Every collector has contiguous parameter indices.
         data = emission_circuit(notebook_circuit())
         _, collectors = template(data)
-        collected = [i for _, _, collects, _ in collectors for i in collects]
-        self.assertEqual(sorted(collected), list(range(len(collected))))
+        all_indices = [i for _, _, params in collectors for i in params]
+        self.assertEqual(sorted(all_indices), list(range(len(all_indices))))
 
     def test_parameter_names_are_zero_padded(self):
         # Zero padding makes lexicographic order match numeric order, as samplomatic's ParamIter does.
@@ -155,7 +155,7 @@ class TestDeterminism(QiskitTestCase):
                 (
                     gate_names(out),
                     sorted(p.name for p in out.parameters),
-                    [(tuple(q), s, tuple(c), tuple(p)) for q, s, c, p in collectors],
+                    [(tuple(q), s, tuple(p)) for q, s, p in collectors],
                 )
             )
         self.assertEqual(runs[0], runs[1])

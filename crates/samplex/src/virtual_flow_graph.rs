@@ -120,11 +120,6 @@ impl NodeKind {
 /// rather than referenced by key, so a graph is readable without its table alongside.
 #[derive(Debug, Clone)]
 pub struct Emission {
-    /// Identity within one lowered circuit, carried over from the IR2 `Emit`.
-    ///
-    /// A [`Collect`]'s steps name their emissions by this, so it has to be on the node: it is the only
-    /// stable handle a graph edge's source can be identified by.
-    pub id: u32,
     /// What this emission draws from; its discriminant is the source tag.
     pub entry: DistEntry,
     /// Which way the emitted state flows towards the collector that consumes it.
@@ -145,17 +140,15 @@ pub struct AbsorbedGate {
 }
 
 /// One step in what a collector composes, in circuit order.
+///
+/// Only what the collector *owns*: local emissions (table reads) and absorbed gates. Incoming
+/// emissions (far twirl halves arriving via graph edges) are NOT recorded here — their composition
+/// position is derived from graph topology (direction + generation distance) at evaluation time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CollectStep {
     /// A local emission: read a value from the distribution table and compose it here.
     /// No VFG Emission node — the collector owns this directly.
     Local(LocalEmission),
-    /// Virtual state arriving via graph edges from a propagating emission (far twirl half).
-    ///
-    /// Named by **emission id**, not by graph node: node indices are not stable, since
-    /// `merge_parallel_nodes` and `prune` add and remove nodes. The id is assigned once by `build` and
-    /// never changes, and [`Emission`] carries it so an incoming edge can be matched to its step.
-    Incoming(u32),
     /// A gate folded into this layer rather than executed separately.
     Gate(AbsorbedGate),
 }
@@ -184,7 +177,7 @@ pub struct Collect {
 pub fn collect_step_gates(steps: &[CollectStep]) -> impl Iterator<Item = &AbsorbedGate> {
     steps.iter().filter_map(|step| match step {
         CollectStep::Gate(gate) => Some(gate),
-        CollectStep::Local(_) | CollectStep::Incoming(_) => None,
+        CollectStep::Local(_) => None,
     })
 }
 
@@ -276,9 +269,6 @@ impl VirtualFlowGraph {
                                         local.partition.all_elements().iter().copied().collect();
                                     qs.sort_unstable();
                                     ("emit".to_string(), qs)
-                                }
-                                CollectStep::Incoming(id) => {
-                                    ("emit".to_string(), vec![*id as usize])
                                 }
                                 CollectStep::Gate(gate) => {
                                     (gate.gate.name().to_string(), gate.qubits.clone())
@@ -454,7 +444,6 @@ mod tests {
 
     fn emission(entry: DistEntry, direction: Direction) -> Emission {
         Emission {
-            id: 0,
             entry,
             direction,
             virtual_type: VirtualType::Pauli,

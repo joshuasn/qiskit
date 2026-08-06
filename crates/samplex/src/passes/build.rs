@@ -146,7 +146,6 @@ impl Scope<'_> {
 
 struct Build {
     table: DistributionTable,
-    next_emit_id: u32,
 }
 
 /// Build the emission circuit for an annotated circuit.
@@ -174,7 +173,6 @@ pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(CircuitData, Distributio
     .into_py_result()?;
     let mut build = Build {
         table: DistributionTable::new(),
-        next_emit_id: 0,
     };
     let scope = Scope {
         qubits: &identity_q,
@@ -186,12 +184,6 @@ pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(CircuitData, Distributio
 }
 
 impl Build {
-    fn fresh_id(&mut self) -> u32 {
-        let id = self.next_emit_id;
-        self.next_emit_id += 1;
-        id
-    }
-
     /// Emit the IR2 form of every op in `dag` into `out`.
     fn walk(
         &mut self,
@@ -391,10 +383,8 @@ impl Build {
             let virtual_type = twirl.distribution.virtual_type();
             let parts = vec![EmitPart { dist, virtual_type }; num_parts];
             for direction in [Direction::Left, Direction::Right] {
-                let id = self.fresh_id();
                 emissions.push(Placed {
                     spec: EmitSpec {
-                        id,
                         source: EmitSource::Twirl,
                         direction,
                         partition: partition.clone(),
@@ -410,13 +400,11 @@ impl Build {
                 mode: basis.mode,
                 ref_id: basis.ref_id.clone(),
             });
-            let id = self.fresh_id();
             let direction: Direction = basis.placement.into();
             let virtual_type = basis.mode.virtual_type();
             let parts = vec![EmitPart { dist, virtual_type }; num_parts];
             emissions.push(Placed {
                 spec: EmitSpec {
-                    id,
                     source: EmitSource::ChangeBasis,
                     direction,
                     partition: partition.clone(),
@@ -434,13 +422,11 @@ impl Build {
                 reference: noise.reference.clone(),
                 modifier: noise.modifier.clone(),
             });
-            let id = self.fresh_id();
             let direction: Direction = noise.site.into();
             let virtual_type = VirtualType::Pauli;
             let parts = vec![EmitPart { dist, virtual_type }; num_parts];
             emissions.push(Placed {
                 spec: EmitSpec {
-                    id,
                     source: EmitSource::InjectNoise,
                     direction,
                     partition: partition.clone(),

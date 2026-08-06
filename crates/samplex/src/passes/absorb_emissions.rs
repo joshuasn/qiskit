@@ -27,8 +27,8 @@
 //! between) is absorbed locally — it becomes a `CollectItem::Emission(LocalEmission)` on the
 //! collector and is removed from the spine. An emission separated from its collector by gates
 //! (typically the far twirl half separated by hard box content) stays on the spine as a standalone
-//! instruction and is wired via `CollectItem::Incoming(id)`, so the lower pass can build the
-//! propagation graph through the intervening gates.
+//! instruction — the lower pass builds the propagation graph through the intervening gates and
+//! the evaluator derives the incoming emission's composition position from graph topology.
 
 use hashbrown::{HashMap, HashSet};
 
@@ -61,17 +61,17 @@ type Path = Vec<usize>;
 /// Result of scanning from an emission.
 enum ScanResult {
     /// The emission is directly adjacent to a compatible collector (no gates between).
-    /// Remove from spine and add as LocalEmission.
+    /// Remove from spine and add as LocalEmission on the collector.
     AbsorbLocal { collector_path: Path },
     /// The emission reaches a compatible collector but has gates between them.
-    /// Keep on spine and add as Incoming(id) for graph wiring.
-    AbsorbPropagating { collector_path: Path },
+    /// Keep on spine — the lower pass builds the propagation graph through those gates.
+    AbsorbPropagating,
     /// No compatible collector found; leave the emission standalone.
     Standalone,
 }
 
 /// Scan from position `start` in direction `dir` within `src`, crossing box boundaries.
-/// Returns the path to the first compatible collector (local or propagating), or Standalone.
+/// Returns whether the emission can be absorbed locally, propagates, or is standalone.
 fn scan_for_collector(
     py: Python,
     src: &CircuitData,
@@ -96,11 +96,11 @@ fn scan_for_collector(
 
         if let Some(spec) = collect_annotation(py, inst) {
             if spec.accepts(emit_spec.virtual_type()) {
-                let mut path = path_prefix.to_vec();
-                path.push(i);
                 if has_gates {
-                    return ScanResult::AbsorbPropagating { collector_path: path };
+                    return ScanResult::AbsorbPropagating;
                 } else {
+                    let mut path = path_prefix.to_vec();
+                    path.push(i);
                     return ScanResult::AbsorbLocal { collector_path: path };
                 }
             }
@@ -129,8 +129,8 @@ fn scan_for_collector(
 }
 
 /// Look inside a box body from the near edge (determined by scan direction) for an absorbable
-/// collector. Returns Some(result) if the scan should terminate (found a collector or hit an
-/// incompatible one), None if the box contains no collector at its near edge (transparent content).
+/// collector. Returns `Some(result)` if the scan should terminate (found a collector or hit an
+/// incompatible one), `None` if the box contains no collector at its near edge (transparent content).
 fn descend_into_box(
     py: Python,
     body: &CircuitData,
@@ -158,11 +158,11 @@ fn descend_into_box(
 
         if let Some(spec) = collect_annotation(py, inst) {
             if spec.accepts(emit_spec.virtual_type()) {
-                let mut path = child_prefix;
-                path.push(i);
                 if parent_has_gates {
-                    return Some(ScanResult::AbsorbPropagating { collector_path: path });
+                    return Some(ScanResult::AbsorbPropagating);
                 } else {
+                    let mut path = child_prefix;
+                    path.push(i);
                     return Some(ScanResult::AbsorbLocal { collector_path: path });
                 }
             }
@@ -206,9 +206,9 @@ fn box_body<'a>(src: &'a CircuitData, inst: &PackedInstruction) -> Option<&'a Ci
 /// Process one scope: find all absorptions, then rebuild the circuit.
 fn absorb_scope(py: Python, src: &CircuitData) -> PyResult<CircuitData> {
     // Phase 1: For each emission, determine where it gets absorbed (if anywhere).
-    let mut local_absorptions: HashMap<u32, Path> = HashMap::new();
-    let mut propagating_absorptions: HashMap<u32, Path> = HashMap::new();
-    let mut absorbed_local_ids: HashSet<u32> = HashSet::new();
+    // Key: emission position index in this scope. Value: collector path.
+    let mut local_absorptions: HashMap<usize, Path> = HashMap::new();
+    let mut absorbed_local_positions: HashSet<usize> = HashSet::new();
 
     for (i, inst) in src.data().iter().enumerate() {
         let Some(spec) = emission_spec(py, inst) else {
@@ -218,13 +218,10 @@ fn absorb_scope(py: Python, src: &CircuitData) -> PyResult<CircuitData> {
         let result = scan_for_collector(py, src, i, spec.direction, &spec, &[]);
         match result {
             ScanResult::AbsorbLocal { collector_path } => {
-                local_absorptions.insert(spec.id, collector_path);
-                absorbed_local_ids.insert(spec.id);
+                local_absorptions.insert(i, collector_path);
+                absorbed_local_positions.insert(i);
             }
-            ScanResult::AbsorbPropagating { collector_path } => {
-                propagating_absorptions.insert(spec.id, collector_path);
-            }
-            ScanResult::Standalone => {}
+            ScanResult::AbsorbPropagating | ScanResult::Standalone => {}
         }
     }
 
@@ -234,64 +231,52 @@ fn absorb_scope(py: Python, src: &CircuitData) -> PyResult<CircuitData> {
         src,
         &[],
         &mut local_absorptions,
-        &mut propagating_absorptions,
-        &mut absorbed_local_ids,
+        &mut absorbed_local_positions,
     );
 
     // Phase 2: Rebuild the circuit.
-    rebuild(py, src, &local_absorptions, &propagating_absorptions, &absorbed_local_ids, &[])
+    rebuild(py, src, &local_absorptions, &absorbed_local_positions, &[])
 }
 
 /// Recursively scan for emissions inside boxes that might escape upward.
+///
+/// Uses a path-based key (the emission's position in the circuit tree) to track which inner
+/// emissions are absorbed locally by an outer collector.
 fn scan_inner_emissions(
     py: Python,
     src: &CircuitData,
     path_prefix: &[usize],
-    local_absorptions: &mut HashMap<u32, Path>,
-    propagating_absorptions: &mut HashMap<u32, Path>,
-    absorbed_local_ids: &mut HashSet<u32>,
+    local_absorptions: &mut HashMap<usize, Path>,
+    absorbed_local_positions: &mut HashSet<usize>,
 ) {
     for (i, inst) in src.data().iter().enumerate() {
         let Some(body) = box_body(src, inst) else {
             continue;
         };
 
-        // Check emissions inside this box that might escape.
         let mut child_prefix = path_prefix.to_vec();
         child_prefix.push(i);
 
         for (j, inner_inst) in body.data().iter().enumerate() {
             if let Some(spec) = emission_spec(py, inner_inst) {
-                if absorbed_local_ids.contains(&spec.id)
-                    || propagating_absorptions.contains_key(&spec.id)
-                {
-                    continue;
-                }
                 // Try to find a collector within the box first.
                 let inner_result =
                     scan_for_collector(py, body, j, spec.direction, &spec, &child_prefix);
                 match inner_result {
                     ScanResult::AbsorbLocal { collector_path } => {
-                        local_absorptions.insert(spec.id, collector_path);
-                        absorbed_local_ids.insert(spec.id);
+                        local_absorptions.insert(j, collector_path);
+                        absorbed_local_positions.insert(j);
                     }
-                    ScanResult::AbsorbPropagating { collector_path } => {
-                        propagating_absorptions.insert(spec.id, collector_path);
-                    }
-                    ScanResult::Standalone => {
-                        // The emission couldn't find a collector inside its box.
+                    ScanResult::AbsorbPropagating | ScanResult::Standalone => {
                         // Try scanning outward from the box in the parent scope.
                         let parent_result =
                             scan_for_collector(py, src, i, spec.direction, &spec, path_prefix);
                         match parent_result {
                             ScanResult::AbsorbLocal { collector_path } => {
-                                local_absorptions.insert(spec.id, collector_path);
-                                absorbed_local_ids.insert(spec.id);
+                                local_absorptions.insert(j, collector_path);
+                                absorbed_local_positions.insert(j);
                             }
-                            ScanResult::AbsorbPropagating { collector_path } => {
-                                propagating_absorptions.insert(spec.id, collector_path);
-                            }
-                            ScanResult::Standalone => {}
+                            ScanResult::AbsorbPropagating | ScanResult::Standalone => {}
                         }
                     }
                 }
@@ -304,8 +289,7 @@ fn scan_inner_emissions(
             body,
             &child_prefix,
             local_absorptions,
-            propagating_absorptions,
-            absorbed_local_ids,
+            absorbed_local_positions,
         );
     }
 }
@@ -314,9 +298,8 @@ fn scan_inner_emissions(
 fn rebuild(
     py: Python,
     src: &CircuitData,
-    local_absorptions: &HashMap<u32, Path>,
-    propagating_absorptions: &HashMap<u32, Path>,
-    absorbed_local_ids: &HashSet<u32>,
+    local_absorptions: &HashMap<usize, Path>,
+    absorbed_local_positions: &HashSet<usize>,
     current_path: &[usize],
 ) -> PyResult<CircuitData> {
     let mut out = CircuitData::with_capacity(
@@ -330,8 +313,8 @@ fn rebuild(
     for (i, inst) in src.data().iter().enumerate() {
         // Skip locally absorbed emissions (they become LocalEmission on their collector).
         // Propagating emissions stay on the spine for graph wiring.
-        if let Some(spec) = emission_spec(py, inst) {
-            if absorbed_local_ids.contains(&spec.id) {
+        if is_emission(py, inst) {
+            if absorbed_local_positions.contains(&i) {
                 continue;
             }
             copy_through(src, inst, &mut out, None)?;
@@ -347,7 +330,6 @@ fn rebuild(
                 &spec,
                 &my_path,
                 local_absorptions,
-                propagating_absorptions,
                 src,
                 py,
             );
@@ -368,8 +350,7 @@ fn rebuild(
                 py,
                 body,
                 local_absorptions,
-                propagating_absorptions,
-                absorbed_local_ids,
+                absorbed_local_positions,
                 &child_path,
             )?;
             copy_through(src, inst, &mut out, Some(new_body))?;
@@ -382,41 +363,31 @@ fn rebuild(
     Ok(out)
 }
 
-/// Build the items list for a collector, incorporating any emissions it absorbed.
+/// Build the items list for a collector, incorporating any local emissions it absorbed.
 fn build_collector_items(
     spec: &CollectSpec,
     collector_path: &[usize],
-    local_absorptions: &HashMap<u32, Path>,
-    propagating_absorptions: &HashMap<u32, Path>,
+    local_absorptions: &HashMap<usize, Path>,
     src: &CircuitData,
     py: Python,
 ) -> Vec<CollectItem> {
-    // Find all emissions that target this collector.
-    let local_ids: Vec<u32> = local_absorptions
+    // Find all emissions that target this collector (by position).
+    let local_positions: Vec<usize> = local_absorptions
         .iter()
         .filter(|(_, path)| path.as_slice() == collector_path)
-        .map(|(id, _)| *id)
+        .map(|(pos, _)| *pos)
         .collect();
 
-    let propagating_ids: Vec<u32> = propagating_absorptions
-        .iter()
-        .filter(|(_, path)| path.as_slice() == collector_path)
-        .map(|(id, _)| *id)
-        .collect();
-
-    if local_ids.is_empty() && propagating_ids.is_empty() {
+    if local_positions.is_empty() {
         return spec.items.clone();
     }
 
-    // Find the actual EmitSpecs by scanning the whole circuit tree.
-    let local_specs: Vec<EmitSpec> = local_ids
+    // Collect the EmitSpecs at those positions.
+    let local_specs: Vec<EmitSpec> = local_positions
         .iter()
-        .filter_map(|id| find_emit_spec_in_tree(src, py, *id))
-        .collect();
-
-    let propagating_specs: Vec<EmitSpec> = propagating_ids
-        .iter()
-        .filter_map(|id| find_emit_spec_in_tree(src, py, *id))
+        .filter_map(|&pos| {
+            src.data().get(pos).and_then(|inst| emission_spec(py, inst))
+        })
         .collect();
 
     // Build items with correct ordering based on composition semantics:
@@ -442,39 +413,12 @@ fn build_collector_items(
         }
     }
 
-    for emit in &propagating_specs {
-        match emit.source {
-            EmitSource::ChangeBasis => before_gates.push(CollectItem::Incoming(emit.id)),
-            EmitSource::Twirl | EmitSource::InjectNoise => match emit.direction {
-                Direction::Right => before_gates.push(CollectItem::Incoming(emit.id)),
-                Direction::Left => after_gates.push(CollectItem::Incoming(emit.id)),
-            },
-        }
-    }
-
     // Final items: [before_gates..., original items (Gates)..., after_gates...]
     let mut items = Vec::new();
     items.extend(before_gates);
     items.extend(spec.items.iter().cloned());
     items.extend(after_gates);
     items
-}
-
-/// Find an EmitSpec anywhere in the circuit tree by ID.
-fn find_emit_spec_in_tree(src: &CircuitData, py: Python, id: u32) -> Option<EmitSpec> {
-    for inst in src.data() {
-        if let Some(spec) = emission_spec(py, inst) {
-            if spec.id == id {
-                return Some(spec);
-            }
-        }
-        if let Some(body) = box_body(src, inst) {
-            if let Some(spec) = find_emit_spec_in_tree(body, py, id) {
-                return Some(spec);
-            }
-        }
-    }
-    None
 }
 
 /// Write a collector instruction to the output with a new spec.

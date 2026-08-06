@@ -129,19 +129,16 @@ class TestLocalAbsorption(QiskitTestCase):
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0].operation.direction, "right")
 
-    def test_propagating_emission_wired_to_collector(self):
-        """A far twirl half separated from its collector by gates is wired as Incoming."""
+    def test_propagating_emission_stays_on_spine(self):
+        """A far twirl half separated from its collector by gates stays on the spine."""
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left")]):
             circuit.cx(0, 1)
         ir2 = build(circuit)
-        colls = collectors(ir2)
-        left_coll = colls[0][0]
-        right_coll = colls[-1][0]
-        # The left collector absorbs the near half locally — no Incoming
-        self.assertEqual(left_coll.collects, [])
-        # The right collector gets the far twirl half as Incoming (propagating through cx)
-        self.assertEqual(len(right_coll.collects), 1)
+        # The far twirl half (right-travelling through cx) remains as a standalone Emit
+        remaining = emits(ir2)
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].operation.direction, "right")
 
 
 class TestCrossScopeAbsorption(QiskitTestCase):
