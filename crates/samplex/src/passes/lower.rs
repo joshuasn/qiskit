@@ -26,6 +26,14 @@
 //!
 //! Alongside the template this returns each collector's parameter range, which is what the sampling
 //! graph's `Collect` nodes need in order to know which angles they are responsible for.
+//!
+//! **This is the one pass that reads a DAG and writes a flat circuit.** IR2 is a `DAGCircuit`, but the
+//! template is a terminal artifact handed to `QuantumCircuit._from_circuit_data` rather than a pass
+//! input, so it stays `CircuitData` and nothing here mutates its input. Both readers — the template
+//! writer and the graph's `flatten` — traverse in `topological_op_nodes` order, which is what lets
+//! [`build_sampling_graph`] pair its collectors with the template's parameter ranges by position. The
+//! one place that order is *wrong* is inside a collector body, which is a sequence rather than a graph;
+//! see the note in [`flatten`].
 
 use std::sync::Arc;
 
@@ -44,10 +52,7 @@ use rustworkx_core::petgraph::stable_graph::NodeIndex;
 
 use qiskit_circuit::operations::StandardInstruction;
 
-use super::utils::{
-    IntoPyResult, block_body, collect_annotation, copy_through, emission_spec, is_emission,
-    to_circuit,
-};
+use super::utils::{IntoPyResult, block_body, collect_annotation, emission_spec, is_emission};
 use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::{DistEntry, DistributionTable};
 use crate::emission_circuit::{CollectItem, EmitSource, EmitSpec};
@@ -78,12 +83,12 @@ pub struct CollectorParams {
 /// Returns the template plus one [`CollectorParams`] per collector, in circuit order.
 pub fn build_template(
     py: Python,
-    circuit: &CircuitData,
+    dag: &DAGCircuit,
 ) -> PyResult<(CircuitData, Vec<CollectorParams>)> {
     let mut out = CircuitData::with_capacity(
-        circuit.num_qubits() as u32,
-        circuit.num_clbits() as u32,
-        circuit.len(),
+        dag.num_qubits() as u32,
+        dag.num_clbits() as u32,
+        dag.num_ops(),
         Param::Float(0.0),
     )
     .into_py_result()?;
@@ -91,10 +96,10 @@ pub fn build_template(
     let mut next_param = 0usize;
 
     // The identity frame: at the top level a scope-local qubit is already a circuit qubit.
-    let identity: Vec<usize> = (0..circuit.num_qubits()).collect();
+    let identity: Vec<usize> = (0..dag.num_qubits()).collect();
     write_scope(
         py,
-        circuit,
+        dag,
         &mut out,
         &identity,
         &mut collectors,
@@ -113,7 +118,7 @@ pub fn py_build_template(
     py: Python,
     dag: &DAGCircuit,
 ) -> PyResult<(PyCircuitData, Vec<CollectorSummary>)> {
-    let (template, collectors) = build_template(py, &to_circuit(dag)?)?;
+    let (template, collectors) = build_template(py, dag)?;
     let summary = collectors
         .into_iter()
         .map(|c| {
@@ -138,22 +143,26 @@ pub fn py_lower(
     dag: &DAGCircuit,
     table: &DistributionTable,
 ) -> PyResult<(PyCircuitData, VirtualFlowGraph)> {
-    let circuit = to_circuit(dag)?;
-    let (template, collectors) = build_template(py, &circuit)?;
-    let graph = build_sampling_graph(py, &circuit, table, &collectors)?;
+    let (template, collectors) = build_template(py, dag)?;
+    let graph = build_sampling_graph(py, dag, table, &collectors)?;
     Ok((PyCircuitData { inner: template }, graph))
 }
 
 /// Emit one scope's worth of template content. `frame` maps scope-local qubits to circuit qubits.
 fn write_scope(
     py: Python,
-    src: &CircuitData,
+    src: &DAGCircuit,
     out: &mut CircuitData,
     frame: &[usize],
     collectors: &mut Vec<CollectorParams>,
     next_param: &mut usize,
 ) -> PyResult<()> {
-    for inst in src.data() {
+    // Topological order, which is the order the template's parameters are minted in and hence the
+    // order `CollectorParams` are reported in. [`flatten`] walks the same order, which is what lets
+    // `build_sampling_graph` pair its collectors with these positionally.
+    for node in src.topological_op_nodes(false) {
+        let inst = src.dag()[node].unwrap_operation();
+
         // A collector becomes the parametric fragment its angles drive.
         if let Some(spec) = collect_annotation(py, inst) {
             let qubits: Vec<usize> = src
@@ -200,7 +209,7 @@ fn write_scope(
             .map(|q| Qubit(frame[q.index()] as u32))
             .collect();
         let cargs = src.cargs_interner().get(inst.clbits).to_vec();
-        copy_with_qargs(src, inst, out, &qargs, &cargs)?;
+        copy_with_qargs(inst, out, &qargs, &cargs)?;
     }
     Ok(())
 }
@@ -257,9 +266,9 @@ fn fresh_parameter(index: usize) -> Param {
 
 /// The body of an unannotated box, or `None` if this is not one.
 fn plain_box_body<'a>(
-    src: &'a CircuitData,
+    src: &'a DAGCircuit,
     inst: &PackedInstruction,
-) -> PyResult<Option<&'a CircuitData>> {
+) -> PyResult<Option<&'a DAGCircuit>> {
     match inst.op.view() {
         OperationRef::ControlFlow(cf)
             if matches!(
@@ -273,27 +282,31 @@ fn plain_box_body<'a>(
     }
 }
 
-/// Copy an instruction with explicitly remapped bits. Flattening means qargs change, so
-/// [`copy_through`] cannot be reused directly.
+/// Copy an instruction into the template with explicitly remapped bits.
+///
+/// Nothing block-carrying reaches here: a collector is handled above, and every other `box` is
+/// flattened by [`plain_box_body`], which is exhaustive because `build` rejects control flow that is
+/// not a `box`. Lowering could not do anything sensible with such an instruction anyway — the
+/// template is a flat parametric circuit — so the case is reported rather than guessed at.
 fn copy_with_qargs(
-    src: &CircuitData,
     inst: &PackedInstruction,
     out: &mut CircuitData,
     qargs: &[Qubit],
     cargs: &[qiskit_circuit::Clbit],
 ) -> PyResult<()> {
-    if inst.blocks_view().is_empty() {
-        let params = (!inst.params_view().is_empty()).then(|| {
-            qiskit_circuit::instruction::Parameters::Params(
-                inst.params_view().iter().cloned().collect(),
-            )
-        });
-        return out
-            .push_packed_operation(inst.op.clone(), params, qargs, cargs)
-            .into_py_result();
+    if !inst.blocks_view().is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "cannot lower '{}' into a template: it carries a body but is not a `box`",
+            inst.op.name()
+        )));
     }
-    // Control flow other than `box` never reaches here — build rejects it.
-    copy_through(src, inst, out, None)
+    let params = (!inst.params_view().is_empty()).then(|| {
+        qiskit_circuit::instruction::Parameters::Params(
+            inst.params_view().iter().cloned().collect(),
+        )
+    });
+    out.push_packed_operation(inst.op.clone(), params, qargs, cargs)
+        .into_py_result()
 }
 
 // --- Sampling graph construction ----------------------------------------------------------------
@@ -342,14 +355,14 @@ type GateKey = (usize, usize, Direction, VirtualType);
 /// parameter ranges the template minted.
 pub fn build_sampling_graph(
     py: Python,
-    circuit: &CircuitData,
+    dag: &DAGCircuit,
     table: &DistributionTable,
     collectors: &[CollectorParams],
 ) -> PyResult<VirtualFlowGraph> {
     let mut events = Vec::new();
     let mut infos = Vec::new();
-    let identity: Vec<usize> = (0..circuit.num_qubits()).collect();
-    flatten(py, circuit, &identity, &mut events, &mut infos)?;
+    let identity: Vec<usize> = (0..dag.num_qubits()).collect();
+    flatten(py, dag, &identity, &mut events, &mut infos)?;
 
     if infos.len() != collectors.len() {
         return Err(PyValueError::new_err(format!(
@@ -467,12 +480,15 @@ fn scan_for_nearest_collector(
 /// Flatten a scope into events, inlining hard boxes and reducing each collector to one event.
 fn flatten(
     py: Python,
-    src: &CircuitData,
+    src: &DAGCircuit,
     frame: &[usize],
     events: &mut Vec<Event>,
     infos: &mut Vec<CollectorInfo>,
 ) -> PyResult<()> {
-    for inst in src.data() {
+    // The same order [`write_scope`] uses, so the collectors this produces line up positionally with
+    // the parameter ranges the template minted.
+    for node in src.topological_op_nodes(false) {
+        let inst = src.dag()[node].unwrap_operation();
         let qubits: Vec<usize> = src
             .qargs_interner()
             .get(inst.qubits)
@@ -485,7 +501,12 @@ fn flatten(
             // separate events, because the collector owns them.
             let mut gates = Vec::new();
             if let Some(body) = block_body(src, inst)? {
-                for gate in body.data() {
+                // In written order, not topological order. The annotation's `Gates` counts were minted
+                // by the absorption walk as it appended, so they describe the body as a *sequence*; a
+                // topological read would group a body of single-qubit gates by wire instead and put
+                // gates from two different runs into one. A body is built once and never edited, so
+                // its node indices are its append order.
+                for (_, gate) in body.op_nodes(true) {
                     if let OperationRef::StandardGate(standard) = gate.op.view() {
                         gates.push(AbsorbedGate {
                             gate: standard,

@@ -20,7 +20,6 @@ use rustworkx_core::petgraph::visit::EdgeRef;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use qiskit_circuit::bit::{ShareableClbit, ShareableQubit};
-use qiskit_circuit::circuit_data::CircuitData;
 use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder, NodeType, Wire};
 use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{ControlFlow, OperationRef};
@@ -80,56 +79,11 @@ pub(super) fn topological_generations(
     generations
 }
 
-// --- Temporary IR2 representation bridge --------------------------------------------------------
-//
-// IR2 is a `DAGCircuit` at the Python boundary, but the pass bodies are being migrated one at a
-// time. Until a pass reads the DAG directly, its wrapper converts with this.
-//
-// TODO: delete once every IR2 pass body is DAG-native. Nothing outside a `py_*` wrapper should call
-// it — a pass that still needs it has not been migrated yet.
-
-/// Convert an IR2 `DAGCircuit` to the flat `CircuitData` an unmigrated pass body still wants.
-///
-/// The instruction order is `topological_op_nodes`, which need not match the order the DAG was
-/// built in — see the ordering note in `SAMPLEX_IR_DESIGN.md`.
-pub(super) fn to_circuit(dag: &DAGCircuit) -> PyResult<CircuitData> {
-    Ok(CircuitData::from_dag_ref(dag)?)
-}
-
 // --- Emission circuit (IR2) helpers -------------------------------------------------------------
 //
 // Reading and rewriting an IR2 circuit is common to every IR2 pass, so these live here rather than
 // being duplicated per pass.
 
-/// Copy an instruction into `out`, optionally substituting a rebuilt body for its block.
-pub(super) fn copy_through(
-    src: &CircuitData,
-    inst: &PackedInstruction,
-    out: &mut CircuitData,
-    replacement: Option<CircuitData>,
-) -> PyResult<()> {
-    let qargs: Vec<Qubit> = src.qargs_interner().get(inst.qubits).to_vec();
-    let cargs: Vec<Clbit> = src.cargs_interner().get(inst.clbits).to_vec();
-
-    let params = match replacement {
-        Some(body) => Some(Parameters::Blocks(vec![out.add_block(body)])),
-        None => {
-            let blocks = inst.blocks_view();
-            if blocks.is_empty() {
-                params_of(inst)
-            } else {
-                Some(Parameters::Blocks(
-                    blocks
-                        .iter()
-                        .map(|b| out.add_block(src.blocks()[*b].clone()))
-                        .collect(),
-                ))
-            }
-        }
-    };
-    out.push_packed_operation(inst.op.clone(), params, &qargs, &cargs)
-        .into_py_result()
-}
 pub(super) fn params_of(inst: &PackedInstruction) -> Option<Parameters<qiskit_circuit::Block>> {
     (!inst.params_view().is_empty())
         .then(|| Parameters::Params(inst.params_view().iter().cloned().collect()))
@@ -152,9 +106,9 @@ pub(super) fn is_emission(py: Python, inst: &PackedInstruction) -> bool {
 }
 /// The single body of a box instruction.
 pub(super) fn block_body<'a>(
-    src: &'a CircuitData,
+    src: &'a DAGCircuit,
     inst: &PackedInstruction,
-) -> PyResult<Option<&'a CircuitData>> {
+) -> PyResult<Option<&'a DAGCircuit>> {
     match inst.blocks_view() {
         [] => Ok(None),
         [block] => Ok(Some(&src.blocks()[*block])),
