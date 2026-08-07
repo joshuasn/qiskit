@@ -18,11 +18,10 @@
 //!
 //! **This pass is purely local.** Every annotated box yields exactly two collect boxes, one per side,
 //! consuming only its own emissions and absorbing only its own easy gates. There is no cross-box
-//! state: no qubit-to-collector map, no detach logic, no shared collectors. Merging adjacent
-//! collectors is `merge_collectors`' job, and because that pass rebuilds rather than mutates it can
-//! widen boxes, which this pass could not (a `DAGCircuit` box cannot be widened in place). The
-//! consequence here is that a collect box is *complete* the moment it is emitted, so this is a single
-//! forward sweep with no deferred buffer.
+//! state: no qubit-to-collector map, no detach logic, no shared collectors. Widening those collectors
+//! and fusing adjacent ones is `merge_collectors`' job. The consequence here is that a collect box is
+//! *complete* the moment it is emitted, so this is a single forward sweep with no deferred buffer,
+//! appending to a [`DAGCircuitBuilder`] rather than revisiting anything it has written.
 //!
 //! Parameters are deliberately absent: merging changes how many collectors exist and how wide they
 //! are, so labelling happens in the IR2 → IR3 lowering. See `SAMPLEX_IR_DESIGN.md`.
@@ -33,15 +32,14 @@ use smallvec::SmallVec;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use qiskit_circuit::annotation::PyAnnotation;
-use qiskit_circuit::circuit_data::CircuitData;
-use qiskit_circuit::dag_circuit::DAGCircuit;
+use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder};
 use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{
     ControlFlow, ControlFlowInstruction, ControlFlowView, Operation, OperationRef, Param,
     PyInstruction, PyOpKind,
 };
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
-use qiskit_circuit::{Clbit, Qubit};
+use qiskit_circuit::{BlocksMode, Clbit, Qubit, VarsMode};
 
 use crate::annotated_circuit::{
     extract_annotation, resolve_annotations, BasisOrigin, BoxAnnotation, Dressing, ResolvedBox,
@@ -55,7 +53,7 @@ use crate::partition::Partition;
 use crate::virtual_flow_graph::Direction;
 use crate::virtual_type::VirtualType;
 
-use super::utils::IntoPyResult;
+use super::utils::{append, new_dag_body, IntoPyResult};
 
 /// The synthesizer assumed when a box's annotations do not name one.
 ///
@@ -153,25 +151,22 @@ struct Build {
 #[pyfunction]
 #[pyo3(name = "build_lowered")]
 pub fn py_build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, DistributionTable)> {
-    let (circuit, table) = build(py, dag)?;
-    Ok((super::utils::to_dag(&circuit)?, table))
+    build(py, dag)
 }
 
 /// Build the emission circuit for an annotated circuit.
-pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(CircuitData, DistributionTable)> {
+pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, DistributionTable)> {
     crate::emission_circuit::ensure_registered(py)?;
     let num_qubits = dag.num_qubits();
     let num_clbits = dag.num_clbits();
     let identity_q: Vec<usize> = (0..num_qubits).collect();
     let identity_c: Vec<usize> = (0..num_clbits).collect();
 
-    let mut out = CircuitData::with_capacity(
-        num_qubits as u32,
-        num_clbits as u32,
-        dag.num_ops(),
-        Param::Float(0.0),
-    )
-    .into_py_result()?;
+    // IR2 is over the same wires as IR1, so the output keeps the input's bits and registers; only
+    // the instructions change. Blocks are dropped because every body here is built fresh.
+    let mut out = dag
+        .copy_empty_like_with_capacity(dag.num_ops(), 0, VarsMode::Alike, BlocksMode::Drop)
+        .into_builder();
     let mut build = Build {
         table: DistributionTable::new(),
         draw_counts: HashMap::new(),
@@ -185,7 +180,7 @@ pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(CircuitData, Distributio
     for (key, count) in &build.draw_counts {
         build.table.set_draw_count(*key, *count);
     }
-    Ok((out, build.table))
+    Ok((out.build(), build.table))
 }
 
 impl Build {
@@ -202,7 +197,7 @@ impl Build {
         &mut self,
         py: Python,
         dag: &DAGCircuit,
-        out: &mut CircuitData,
+        out: &mut DAGCircuitBuilder,
         scope: &Scope,
     ) -> PyResult<()> {
         for node in dag.topological_op_nodes(false) {
@@ -230,7 +225,7 @@ impl Build {
         py: Python,
         dag: &DAGCircuit,
         inst: &PackedInstruction,
-        out: &mut CircuitData,
+        out: &mut DAGCircuitBuilder,
         scope: &Scope,
     ) -> PyResult<()> {
         let annotations = box_annotations(py, inst)?;
@@ -290,18 +285,20 @@ impl Build {
             clbits: &inner_identity_c,
         };
 
-        let mut easy = new_body(width, body_clbits.len(), body.num_ops())?;
-        let mut hard = new_body(width, body_clbits.len(), body.num_ops())?;
+        let mut easy_builder = new_body(width, body_clbits.len(), body.num_ops())?.into_builder();
+        let mut hard_builder = new_body(width, body_clbits.len(), body.num_ops())?.into_builder();
         self.split_body(
             py,
             body,
             resolved.dressing,
             &mut Split {
-                easy: &mut easy,
-                hard: &mut hard,
+                easy: &mut easy_builder,
+                hard: &mut hard_builder,
             },
             &inner,
         )?;
+        let easy = easy_builder.build();
+        let hard = hard_builder.build();
 
         // Collectors start empty — the absorb_dressing pass populates them by walking the spine.
         let empty_body = new_body(width, body_clbits.len(), 0)?;
@@ -592,8 +589,8 @@ impl Build {
 
 /// Where a body sweep puts each instruction: absorbed into the dressing, or left as content.
 struct Split<'a> {
-    easy: &'a mut CircuitData,
-    hard: &'a mut CircuitData,
+    easy: &'a mut DAGCircuitBuilder,
+    hard: &'a mut DAGCircuitBuilder,
 }
 
 /// Whether the dressing can absorb this instruction: a single-qubit standard gate.
@@ -616,15 +613,15 @@ fn box_annotations(py: Python, inst: &PackedInstruction) -> PyResult<Vec<BoxAnno
         .collect())
 }
 
-fn new_body(num_qubits: usize, num_clbits: usize, capacity: usize) -> PyResult<CircuitData> {
-    super::utils::new_circuit_body(num_qubits, num_clbits, capacity)
+fn new_body(num_qubits: usize, num_clbits: usize, capacity: usize) -> PyResult<DAGCircuit> {
+    new_dag_body(num_qubits, num_clbits, capacity)
 }
 
 /// Copy an instruction verbatim into `out`, remapping its bits through `scope`.
 fn copy_instruction(
     dag: &DAGCircuit,
     inst: &PackedInstruction,
-    out: &mut CircuitData,
+    out: &mut DAGCircuitBuilder,
     scope: &Scope,
 ) -> PyResult<()> {
     let qargs = scope.out_qubits(dag.qargs_interner().get(inst.qubits))?;
@@ -632,14 +629,13 @@ fn copy_instruction(
     let params: Option<Parameters<_>> = (!inst.params_view().is_empty()).then(|| {
         Parameters::Params(inst.params_view().iter().cloned().collect::<SmallVec<[Param; 3]>>())
     });
-    out.push_packed_operation(inst.op.clone(), params, &qargs, &cargs)
-        .into_py_result()
+    append(out, inst.op.clone(), params, &qargs, &cargs)
 }
 
 /// Write the `Emit` instructions belonging to one edge of a box, in the order given.
 fn write_emissions(
     py: Python,
-    out: &mut CircuitData,
+    out: &mut DAGCircuitBuilder,
     emissions: &[&Placed],
     scope: &Scope,
 ) -> PyResult<()> {
@@ -667,18 +663,19 @@ fn write_emissions(
             op_name: spec.source.name().to_string(),
             ob: emit.into_any(),
         });
-        out.push_packed_operation(op, None, &qargs, &[])
-            .into_py_result()?;
+        append(out, op, None, &qargs, &[])?;
     }
     Ok(())
 }
 
 /// Write the easy (absorbed) gates directly onto the spine.
 ///
-/// Each gate is copied from `easy` (a body-local `CircuitData`) into `out`, remapping its qubits
-/// through `scope` so they land on the correct output wires.
-fn write_easy_gates(out: &mut CircuitData, easy: &CircuitData, scope: &Scope) -> PyResult<()> {
-    for inst in easy.data() {
+/// Each gate is copied from `easy` (a body-local DAG) into `out`, remapping its qubits through
+/// `scope` so they land on the correct output wires. Every absorbable gate is single-qubit, so
+/// topological order preserves each wire's run, which is the only order that carries meaning.
+fn write_easy_gates(out: &mut DAGCircuitBuilder, easy: &DAGCircuit, scope: &Scope) -> PyResult<()> {
+    for node in easy.topological_op_nodes(false) {
+        let inst = easy.dag()[node].unwrap_operation();
         let qargs: Vec<Qubit> = easy
             .qargs_interner()
             .get(inst.qubits)
@@ -690,8 +687,7 @@ fn write_easy_gates(out: &mut CircuitData, easy: &CircuitData, scope: &Scope) ->
                 inst.params_view().iter().cloned().collect::<SmallVec<[Param; 3]>>(),
             )
         });
-        out.push_packed_operation(inst.op.clone(), params, &qargs, &[])
-            .into_py_result()?;
+        append(out, inst.op.clone(), params, &qargs, &[])?;
     }
     Ok(())
 }
@@ -699,15 +695,15 @@ fn write_easy_gates(out: &mut CircuitData, easy: &CircuitData, scope: &Scope) ->
 /// Write a collect box. Skipped entirely when it would collect nothing and absorb nothing.
 fn write_collect(
     py: Python,
-    out: &mut CircuitData,
+    out: &mut DAGCircuitBuilder,
     spec: CollectSpec,
-    body: CircuitData,
+    body: DAGCircuit,
     qargs: &[Qubit],
     cargs: &[Clbit],
 ) -> PyResult<()> {
     debug_assert_eq!(
         spec.gate_count(),
-        body.len(),
+        body.num_ops(),
         "a collector's `Gates` items must account for exactly its body"
     );
     let annotation = Py::new(py, (Collect::new_from_spec(spec), PyAnnotation))?;
@@ -717,20 +713,20 @@ fn write_collect(
 /// Write the box holding the gates virtual state is conjugated by. Skipped when empty — with
 /// propagation derived from placement, a gateless box carries no information.
 fn write_hard_box(
-    out: &mut CircuitData,
-    body: CircuitData,
+    out: &mut DAGCircuitBuilder,
+    body: DAGCircuit,
     qargs: &[Qubit],
     cargs: &[Clbit],
 ) -> PyResult<()> {
-    if body.is_empty() {
+    if body.num_ops() == 0 {
         return Ok(());
     }
     write_box(out, body, Vec::new(), qargs, cargs)
 }
 
 fn write_box(
-    out: &mut CircuitData,
-    body: CircuitData,
+    out: &mut DAGCircuitBuilder,
+    body: DAGCircuit,
     annotations: Vec<Py<PyAny>>,
     qargs: &[Qubit],
     cargs: &[Clbit],
@@ -744,6 +740,5 @@ fn write_box(
         num_clbits: cargs.len() as u32,
     }));
     let block = out.add_block(body);
-    out.push_packed_operation(op, Some(Parameters::Blocks(vec![block])), qargs, cargs)
-        .into_py_result()
+    append(out, op, Some(Parameters::Blocks(vec![block])), qargs, cargs)
 }

@@ -18,12 +18,13 @@ use rustworkx_core::petgraph::Direction as PetDirection;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use qiskit_circuit::bit::{ShareableClbit, ShareableQubit};
 use qiskit_circuit::circuit_data::CircuitData;
-use qiskit_circuit::dag_circuit::DAGCircuit;
+use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder};
 use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{ControlFlow, OperationRef};
-use qiskit_circuit::packed_instruction::PackedInstruction;
-use qiskit_circuit::{Clbit, Qubit};
+use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
+use qiskit_circuit::{Block, Clbit, Qubit};
 
 use qiskit_circuit::operations::Param;
 
@@ -186,6 +187,55 @@ pub(super) fn emission_spec(
         OperationRef::PyCustom(py_inst) => extract_emit(py_inst.ob.bind(py)),
         _ => None,
     }
+}
+
+/// Append an operation to the back of a DAG under construction.
+///
+/// Exists to keep the `cache_pygates` parameter of
+/// [`DAGCircuitBuilder::apply_operation_back`] in one place: everything samplex appends is built
+/// from a `PackedOperation`, never from a live Python object, so there is never a cached gate to
+/// pass. `CircuitData::push_packed_operation` is the same convenience on the flat side.
+pub(super) fn append(
+    out: &mut DAGCircuitBuilder,
+    op: PackedOperation,
+    params: Option<Parameters<Block>>,
+    qargs: &[Qubit],
+    cargs: &[Clbit],
+) -> PyResult<()> {
+    out.apply_operation_back(
+        op,
+        qargs,
+        cargs,
+        params,
+        None,
+        #[cfg(feature = "cache_pygates")]
+        None,
+    )
+    .into_py_result()?;
+    Ok(())
+}
+
+/// Create an empty `DAGCircuit` body with the given dimensions.
+///
+/// The wires are anonymous: a box body's qubits are positional, addressed only through the box's
+/// qargs, so there is nothing outside for them to be identified with. `with_capacity` reserves
+/// space but registers no wires, hence the explicit adds.
+pub(super) fn new_dag_body(
+    num_qubits: usize,
+    num_clbits: usize,
+    capacity: usize,
+) -> PyResult<DAGCircuit> {
+    let mut body =
+        DAGCircuit::with_capacity(num_qubits, num_clbits, None, Some(capacity), None, None);
+    for _ in 0..num_qubits {
+        body.add_qubit_unchecked(ShareableQubit::new_anonymous())
+            .into_py_result()?;
+    }
+    for _ in 0..num_clbits {
+        body.add_clbit_unchecked(ShareableClbit::new_anonymous())
+            .into_py_result()?;
+    }
+    Ok(body)
 }
 
 /// Create an empty `CircuitData` with the given dimensions.
