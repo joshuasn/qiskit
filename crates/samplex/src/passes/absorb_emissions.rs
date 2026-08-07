@@ -27,22 +27,27 @@
 use hashbrown::HashSet;
 
 use pyo3::prelude::*;
-use qiskit_circuit::circuit_data::{CircuitData, PyCircuitData};
+use qiskit_circuit::circuit_data::CircuitData;
+use qiskit_circuit::dag_circuit::DAGCircuit;
 use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{ControlFlow, ControlFlowInstruction, OperationRef, Param};
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use qiskit_circuit::{Clbit, Qubit};
 
-use super::utils::{collect_annotation, copy_through, emission_spec, IntoPyResult};
+use super::utils::{
+    IntoPyResult, collect_annotation, copy_through, emission_spec, to_circuit, to_dag,
+};
 use crate::emission_circuit::{Collect, CollectItem, CollectSpec, LocalEmission};
 use crate::virtual_flow_graph::Direction;
 
+/// Absorb dressing into every collector, in place.
 #[pyfunction]
 #[pyo3(name = "absorb_emissions")]
-pub fn py_absorb_emissions(py: Python, circuit: &PyCircuitData) -> PyResult<PyCircuitData> {
-    Ok(PyCircuitData {
-        inner: absorb_dressing(py, &circuit.inner)?,
-    })
+pub fn py_absorb_emissions(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
+    let src = to_circuit(dag)?;
+    let out = absorb_dressing(py, &src)?;
+    *dag = to_dag(&out)?;
+    Ok(())
 }
 
 pub fn absorb_emissions(py: Python, src: &CircuitData) -> PyResult<CircuitData> {

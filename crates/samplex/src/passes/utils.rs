@@ -19,6 +19,7 @@ use rustworkx_core::petgraph::Direction as PetDirection;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use qiskit_circuit::circuit_data::CircuitData;
+use qiskit_circuit::dag_circuit::DAGCircuit;
 use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{ControlFlow, OperationRef};
 use qiskit_circuit::packed_instruction::PackedInstruction;
@@ -75,6 +76,31 @@ pub(super) fn topological_generations(
     }
 
     generations
+}
+
+// --- Temporary IR2 representation bridges -------------------------------------------------------
+//
+// IR2 is a `DAGCircuit` at the Python boundary, but the pass bodies are being migrated one at a
+// time. Until a pass reads and writes the DAG directly, its wrapper converts in and out with these.
+//
+// TODO: delete both once every IR2 pass body is DAG-native. Nothing outside a `py_*` wrapper should
+// call them — a pass that still needs one has not been migrated yet.
+
+/// Convert an IR2 `CircuitData` to the `DAGCircuit` the boundary expects.
+///
+/// Block bodies convert recursively, so a nested box body arrives as a `DAGCircuit` block.
+pub(super) fn to_dag(circuit: &CircuitData) -> PyResult<DAGCircuit> {
+    Ok(DAGCircuit::from_circuit_data(
+        circuit, false, None, None, None, None,
+    )?)
+}
+
+/// Convert an IR2 `DAGCircuit` to the flat `CircuitData` an unmigrated pass body still wants.
+///
+/// The instruction order is `topological_op_nodes`, which need not match the order the DAG was
+/// built in — see the ordering note in `SAMPLEX_IR_DESIGN.md`.
+pub(super) fn to_circuit(dag: &DAGCircuit) -> PyResult<CircuitData> {
+    Ok(CircuitData::from_dag_ref(dag)?)
 }
 
 // --- Emission circuit (IR2) helpers -------------------------------------------------------------

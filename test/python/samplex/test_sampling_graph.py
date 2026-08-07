@@ -38,11 +38,11 @@ from test import QiskitTestCase
 
 def graph_of(circuit, optimize=True):
     """The sampling graph, with the IR2 optimizations optionally applied first."""
-    data, table = build_lowered(circuit_to_dag(circuit))
+    dag, table = build_lowered(circuit_to_dag(circuit))
     if optimize:
-        data = merge_collectors(data)
-        data = absorb_emissions(data)
-    _, graph = lower(data, table)
+        merge_collectors(dag)
+        absorb_emissions(dag)
+    _, graph = lower(dag, table)
     return graph
 
 
@@ -294,10 +294,10 @@ class TestAgreementWithTheTemplate(QiskitTestCase):
             circuit.cx(2, 3)
         with circuit.box([Twirl()]):
             circuit.cx(0, 1)
-        data, table = build_lowered(circuit_to_dag(circuit))
-        data = absorb_emissions(data)
-        data = merge_collectors(data)
-        template, graph = lower(data, table)
+        dag, table = build_lowered(circuit_to_dag(circuit))
+        absorb_emissions(dag)
+        merge_collectors(dag)
+        template, graph = lower(dag, table)
 
         allocated = sorted(i for node in graph.nodes() for i in node[2])
         self.assertEqual(allocated, list(range(len(allocated))))

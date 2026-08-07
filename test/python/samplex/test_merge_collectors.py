@@ -16,8 +16,10 @@ Build is local, so every annotated box gets its own two collectors. This pass ap
 collection model, letting adjacent boxes that share a synthesizer share a middle collector.
 """
 
+import copy
+
 from qiskit import QuantumCircuit
-from qiskit.converters import circuit_to_dag
+from qiskit.converters import circuit_to_dag, dag_to_circuit
 from qiskit._accelerate.samplex import (
     ChangeBasis,
     Twirl,
@@ -32,16 +34,16 @@ from test.python.samplex.test_build import collectors, emissions, gate_names, ha
 
 def build(circuit):
     """The emission circuit before merging."""
-    data, table = build_lowered(circuit_to_dag(circuit))
-    return QuantumCircuit._from_circuit_data(data), table
+    dag, table = build_lowered(circuit_to_dag(circuit))
+    return dag_to_circuit(dag), table
 
 
 def merged(circuit):
     """The emission circuit after merging (absorb happens after merge)."""
-    data, table = build_lowered(circuit_to_dag(circuit))
-    data = merge_collectors(data)
-    data = absorb_emissions(data)
-    return QuantumCircuit._from_circuit_data(data), table
+    dag, table = build_lowered(circuit_to_dag(circuit))
+    merge_collectors(dag)
+    absorb_emissions(dag)
+    return dag_to_circuit(dag), table
 
 
 def notebook_circuit():
@@ -272,12 +274,15 @@ class TestPreservation(QiskitTestCase):
     def test_emissions_and_content_are_untouched(self):
         # Propagating emissions (those not absorbed) survive merge unchanged.
         circuit = notebook_circuit()
-        data, _ = build_lowered(circuit_to_dag(circuit))
-        no_merge = absorb_emissions(data)
-        with_merge = absorb_emissions(merge_collectors(data))
+        dag, _ = build_lowered(circuit_to_dag(circuit))
+        no_merge = copy.copy(dag)
+        absorb_emissions(no_merge)
+        with_merge = copy.copy(dag)
+        merge_collectors(with_merge)
+        absorb_emissions(with_merge)
 
-        before = QuantumCircuit._from_circuit_data(no_merge)
-        after = QuantumCircuit._from_circuit_data(with_merge)
+        before = dag_to_circuit(no_merge)
+        after = dag_to_circuit(with_merge)
 
         self.assertEqual(
             [(e.source, e.direction, tuple(e.qubits)) for e in emissions(before)],
@@ -287,12 +292,15 @@ class TestPreservation(QiskitTestCase):
     def test_emissions_are_preserved_through_merge(self):
         # Whether or not merge runs, the same propagating emissions remain standalone.
         circuit = notebook_circuit()
-        data, _ = build_lowered(circuit_to_dag(circuit))
-        no_merge = absorb_emissions(data)
-        with_merge = absorb_emissions(merge_collectors(data))
+        dag, _ = build_lowered(circuit_to_dag(circuit))
+        no_merge = copy.copy(dag)
+        absorb_emissions(no_merge)
+        with_merge = copy.copy(dag)
+        merge_collectors(with_merge)
+        absorb_emissions(with_merge)
 
-        before = QuantumCircuit._from_circuit_data(no_merge)
-        after = QuantumCircuit._from_circuit_data(with_merge)
+        before = dag_to_circuit(no_merge)
+        after = dag_to_circuit(with_merge)
 
         self.assertEqual(
             [(e.source, e.direction) for e in emissions(before)],
@@ -323,12 +331,13 @@ class TestPreservation(QiskitTestCase):
         self.assertEqual(runs[0], runs[2])
 
     def test_merging_is_idempotent(self):
-        data, _ = build_lowered(circuit_to_dag(notebook_circuit()))
-        once = merge_collectors(data)
-        twice = merge_collectors(once)
+        once, _ = build_lowered(circuit_to_dag(notebook_circuit()))
+        merge_collectors(once)
+        twice = copy.copy(once)
+        merge_collectors(twice)
 
-        def shape(circuit_data):
-            circuit = QuantumCircuit._from_circuit_data(circuit_data)
+        def shape(dag):
+            circuit = dag_to_circuit(dag)
             return [
                 (c.synthesizer, tuple(c.items), tuple(q)) for c, _, q in collectors(circuit)
             ]

@@ -46,7 +46,8 @@ use hashbrown::HashSet;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use qiskit_circuit::annotation::PyAnnotation;
-use qiskit_circuit::circuit_data::{CircuitData, PyCircuitData};
+use qiskit_circuit::circuit_data::CircuitData;
+use qiskit_circuit::dag_circuit::DAGCircuit;
 use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{ControlFlow, ControlFlowInstruction, OperationRef, Param};
 use qiskit_circuit::packed_instruction::PackedOperation;
@@ -54,6 +55,7 @@ use qiskit_circuit::Qubit;
 
 use super::utils::{
     IntoPyResult, block_body, collect_annotation, copy_through, params_of, qubit_indices,
+    to_circuit, to_dag,
 };
 use crate::annotated_circuit::SynthesizerType;
 use crate::emission_circuit::{Collect, CollectItem, CollectPart, CollectSpec};
@@ -111,13 +113,14 @@ enum Item {
     Rebuilt(usize, Box<CircuitData>),
 }
 
-/// Merge adjacent collectors throughout an emission circuit.
+/// Merge adjacent collectors throughout an emission circuit, in place.
 #[pyfunction]
 #[pyo3(name = "merge_collectors")]
-pub fn py_merge_collectors(py: Python, circuit: &PyCircuitData) -> PyResult<PyCircuitData> {
-    Ok(PyCircuitData {
-        inner: merge_collectors(py, &circuit.inner)?,
-    })
+pub fn py_merge_collectors(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
+    let src = to_circuit(dag)?;
+    let out = merge_collectors(py, &src)?;
+    *dag = to_dag(&out)?;
+    Ok(())
 }
 
 /// Merge adjacent collectors throughout an emission circuit.

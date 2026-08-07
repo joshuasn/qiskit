@@ -33,7 +33,7 @@ use smallvec::SmallVec;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use qiskit_circuit::annotation::PyAnnotation;
-use qiskit_circuit::circuit_data::{CircuitData, PyCircuitData};
+use qiskit_circuit::circuit_data::CircuitData;
 use qiskit_circuit::dag_circuit::DAGCircuit;
 use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{
@@ -152,9 +152,9 @@ struct Build {
 /// Build the emission circuit for an annotated circuit.
 #[pyfunction]
 #[pyo3(name = "build_lowered")]
-pub fn py_build(py: Python, dag: &DAGCircuit) -> PyResult<(PyCircuitData, DistributionTable)> {
+pub fn py_build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, DistributionTable)> {
     let (circuit, table) = build(py, dag)?;
-    Ok((PyCircuitData { inner: circuit }, table))
+    Ok((super::utils::to_dag(&circuit)?, table))
 }
 
 /// Build the emission circuit for an annotated circuit.

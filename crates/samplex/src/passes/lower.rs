@@ -33,6 +33,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use qiskit_circuit::Qubit;
 use qiskit_circuit::circuit_data::{CircuitData, PyCircuitData};
+use qiskit_circuit::dag_circuit::DAGCircuit;
 use qiskit_circuit::operations::{Operation, OperationRef, Param, StandardGate};
 use qiskit_circuit::packed_instruction::PackedInstruction;
 use qiskit_circuit::parameter::parameter_expression::ParameterExpression;
@@ -45,6 +46,7 @@ use qiskit_circuit::operations::StandardInstruction;
 
 use super::utils::{
     IntoPyResult, block_body, collect_annotation, copy_through, emission_spec, is_emission,
+    to_circuit,
 };
 use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::{DistEntry, DistributionTable};
@@ -109,9 +111,9 @@ type CollectorSummary = (Vec<usize>, String, Vec<usize>);
 #[pyo3(name = "build_template")]
 pub fn py_build_template(
     py: Python,
-    circuit: &PyCircuitData,
+    dag: &DAGCircuit,
 ) -> PyResult<(PyCircuitData, Vec<CollectorSummary>)> {
-    let (template, collectors) = build_template(py, &circuit.inner)?;
+    let (template, collectors) = build_template(py, &to_circuit(dag)?)?;
     let summary = collectors
         .into_iter()
         .map(|c| {
@@ -133,11 +135,12 @@ pub fn py_build_template(
 #[pyo3(name = "lower")]
 pub fn py_lower(
     py: Python,
-    circuit: &PyCircuitData,
+    dag: &DAGCircuit,
     table: &DistributionTable,
 ) -> PyResult<(PyCircuitData, VirtualFlowGraph)> {
-    let (template, collectors) = build_template(py, &circuit.inner)?;
-    let graph = build_sampling_graph(py, &circuit.inner, table, &collectors)?;
+    let circuit = to_circuit(dag)?;
+    let (template, collectors) = build_template(py, &circuit)?;
+    let graph = build_sampling_graph(py, &circuit, table, &collectors)?;
     Ok((PyCircuitData { inner: template }, graph))
 }
 

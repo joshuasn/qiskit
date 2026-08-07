@@ -20,7 +20,7 @@ is not a stable artifact.
 
 from qiskit import QuantumCircuit
 from qiskit.circuit import Parameter
-from qiskit.converters import circuit_to_dag
+from qiskit.converters import circuit_to_dag, dag_to_circuit
 from qiskit._accelerate.samplex import (
     ChangeBasis,
     InjectLocalClifford,
@@ -36,15 +36,15 @@ from test import QiskitTestCase
 
 def lower(circuit):
     """Build the emission circuit, returning it as a QuantumCircuit plus the distribution table."""
-    data, table = build_lowered(circuit_to_dag(circuit))
-    return QuantumCircuit._from_circuit_data(data), table
+    dag, table = build_lowered(circuit_to_dag(circuit))
+    return dag_to_circuit(dag), table
 
 
 def lower_absorbed(circuit):
     """Build and absorb, returning as a QuantumCircuit plus the distribution table."""
-    data, table = build_lowered(circuit_to_dag(circuit))
-    data = absorb_emissions(data)
-    return QuantumCircuit._from_circuit_data(data), table
+    dag, table = build_lowered(circuit_to_dag(circuit))
+    absorb_emissions(dag)
+    return dag_to_circuit(dag), table
 
 
 def collectors(circuit):
@@ -271,8 +271,8 @@ class TestBuildShape(QiskitTestCase):
         ):
             circuit.h(0)
             circuit.cx(1, 2)
-        data, _ = build_lowered(circuit_to_dag(circuit))
-        colls = collectors(QuantumCircuit._from_circuit_data(data))
+        dag, _ = build_lowered(circuit_to_dag(circuit))
+        colls = collectors(dag_to_circuit(dag))
         for coll in colls:
             self.assertEqual(coll[0].items, [])
 
@@ -288,9 +288,9 @@ class TestBuildShape(QiskitTestCase):
         ):
             left.h(0)
             left.cx(1, 2)
-        data, _ = build_lowered(circuit_to_dag(left))
-        data = absorb_emissions(data)
-        left_coll = collectors(QuantumCircuit._from_circuit_data(data))[0]
+        dag, _ = build_lowered(circuit_to_dag(left))
+        absorb_emissions(dag)
+        left_coll = collectors(dag_to_circuit(dag))[0]
         self.assertIn(("gates", 1), left_coll[0].items)
         self.assertEqual(gate_names(left_coll[1]), ["h"])
 
@@ -304,9 +304,9 @@ class TestBuildShape(QiskitTestCase):
         ):
             right.cx(1, 2)
             right.h(0)
-        data, _ = build_lowered(circuit_to_dag(right))
-        data = absorb_emissions(data)
-        right_coll = collectors(QuantumCircuit._from_circuit_data(data))[-1]
+        dag, _ = build_lowered(circuit_to_dag(right))
+        absorb_emissions(dag)
+        right_coll = collectors(dag_to_circuit(dag))[-1]
         self.assertIn(("gates", 1), right_coll[0].items)
         self.assertEqual(gate_names(right_coll[1]), ["h"])
 

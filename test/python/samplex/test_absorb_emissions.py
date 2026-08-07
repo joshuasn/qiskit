@@ -20,8 +20,10 @@ Emissions that cannot reach a compatible collector (gate in the way, incompatibl
 standalone for the future walk_emissions pass.
 """
 
+import copy
+
 from qiskit import QuantumCircuit
-from qiskit.converters import circuit_to_dag
+from qiskit.converters import circuit_to_dag, dag_to_circuit
 from qiskit._accelerate.samplex import (
     ChangeBasis,
     InjectNoise,
@@ -36,9 +38,9 @@ from test import QiskitTestCase
 
 def build(circuit):
     """Build and absorb, returning the emission circuit as a QuantumCircuit."""
-    data, _table = build_lowered(circuit_to_dag(circuit))
-    data = absorb_emissions(data)
-    return QuantumCircuit._from_circuit_data(data)
+    dag, _table = build_lowered(circuit_to_dag(circuit))
+    absorb_emissions(dag)
+    return dag_to_circuit(dag)
 
 
 def collectors(circuit):
@@ -196,10 +198,10 @@ class TestAbsorptionWithMerge(QiskitTestCase):
             circuit.cx(0, 1)
         with circuit.box([Twirl(dressing="left")]):
             circuit.cx(0, 1)
-        data, _table = build_lowered(circuit_to_dag(circuit))
-        data = absorb_emissions(data)
-        data = merge_collectors(data)
-        ir2 = QuantumCircuit._from_circuit_data(data)
+        dag, _table = build_lowered(circuit_to_dag(circuit))
+        absorb_emissions(dag)
+        merge_collectors(dag)
+        ir2 = dag_to_circuit(dag)
         # The two adjacent near-half collectors merge into one middle collector.
         # Outer collectors with no content are elided.
         colls = collectors(ir2)
@@ -211,10 +213,10 @@ class TestAbsorptionWithMerge(QiskitTestCase):
             circuit.cx(0, 1)
         with circuit.box([Twirl(dressing="left")]):
             circuit.cx(0, 1)
-        data, _table = build_lowered(circuit_to_dag(circuit))
-        data = merge_collectors(data)
-        data = absorb_emissions(data)
-        ir2 = QuantumCircuit._from_circuit_data(data)
+        dag, _table = build_lowered(circuit_to_dag(circuit))
+        merge_collectors(dag)
+        absorb_emissions(dag)
+        ir2 = dag_to_circuit(dag)
         colls = collectors(ir2)
         self.assertGreaterEqual(len(colls), 1)
 
@@ -224,15 +226,19 @@ class TestAbsorptionWithMerge(QiskitTestCase):
             circuit.cx(0, 1)
         with circuit.box([Twirl(dressing="left")]):
             circuit.cx(0, 1)
-        data, _table = build_lowered(circuit_to_dag(circuit))
+        dag, _table = build_lowered(circuit_to_dag(circuit))
 
-        # absorb then merge
-        am = absorb_emissions(merge_collectors(data))
-        # merge then absorb
-        ma = merge_collectors(absorb_emissions(data))
+        # The passes mutate in place, so each ordering gets its own copy of the same input.
+        am = copy.copy(dag)
+        merge_collectors(am)
+        absorb_emissions(am)
 
-        ir2_am = QuantumCircuit._from_circuit_data(am)
-        ir2_ma = QuantumCircuit._from_circuit_data(ma)
+        ma = copy.copy(dag)
+        absorb_emissions(ma)
+        merge_collectors(ma)
+
+        ir2_am = dag_to_circuit(am)
+        ir2_ma = dag_to_circuit(ma)
 
         # Same number of standalone emits remain either way
         self.assertEqual(len(emits(ir2_am)), len(emits(ir2_ma)))

@@ -17,6 +17,8 @@ they fold into those angles; emissions disappear; hard boxes flatten. Parameters
 nowhere earlier.
 """
 
+import copy
+
 from qiskit import QuantumCircuit
 from qiskit.converters import circuit_to_dag
 from qiskit._accelerate.samplex import (
@@ -33,13 +35,13 @@ from test.python.samplex.test_build import gate_names
 
 
 def emission_circuit(circuit):
-    data, _ = build_lowered(circuit_to_dag(circuit))
-    data = absorb_emissions(data)
-    return data
+    dag, _ = build_lowered(circuit_to_dag(circuit))
+    absorb_emissions(dag)
+    return dag
 
 
-def template(circuit_data):
-    data, collectors = build_template(circuit_data)
+def template(dag):
+    data, collectors = build_template(dag)
     return QuantumCircuit._from_circuit_data(data), collectors
 
 
@@ -124,9 +126,12 @@ class TestParameterLabelling(QiskitTestCase):
     def test_merging_reduces_the_parameter_vector(self):
         # This is why labels cannot be minted before merging: the count and every subsequent index
         # would shift. Lowering unmerged is correct, only suboptimal.
-        data = emission_circuit(notebook_circuit())
-        unmerged, unmerged_collectors = template(data)
-        merged, merged_collectors = template(merge_collectors(absorb_emissions(data)))
+        dag = emission_circuit(notebook_circuit())
+        unmerged, unmerged_collectors = template(dag)
+        merged_dag = copy.copy(dag)
+        absorb_emissions(merged_dag)
+        merge_collectors(merged_dag)
+        merged, merged_collectors = template(merged_dag)
 
         self.assertEqual((len(unmerged_collectors), unmerged.num_parameters), (6, 48))
         self.assertEqual((len(merged_collectors), merged.num_parameters), (4, 36))
