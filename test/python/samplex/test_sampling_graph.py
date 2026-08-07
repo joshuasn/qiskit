@@ -27,7 +27,7 @@ from qiskit._accelerate.samplex import (
     ChangeBasis,
     InjectNoise,
     Twirl,
-    absorb_emissions,
+    absorb_dressing,
     build_lowered,
     lower,
     merge_collectors,
@@ -41,7 +41,7 @@ def graph_of(circuit, optimize=True):
     data, table = build_lowered(circuit_to_dag(circuit))
     if optimize:
         data = merge_collectors(data)
-        data = absorb_emissions(data)
+        data = absorb_dressing(data)
     _, graph = lower(data, table)
     return graph
 
@@ -295,7 +295,7 @@ class TestAgreementWithTheTemplate(QiskitTestCase):
         with circuit.box([Twirl()]):
             circuit.cx(0, 1)
         data, table = build_lowered(circuit_to_dag(circuit))
-        data = absorb_emissions(data)
+        data = absorb_dressing(data)
         data = merge_collectors(data)
         template, graph = lower(data, table)
 

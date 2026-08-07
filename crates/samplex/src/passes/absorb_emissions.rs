@@ -38,19 +38,15 @@ use crate::emission_circuit::{Collect, CollectItem, CollectSpec, LocalEmission};
 use crate::virtual_flow_graph::Direction;
 
 #[pyfunction]
-#[pyo3(name = "absorb_emissions")]
-pub fn py_absorb_emissions(py: Python, circuit: &PyCircuitData) -> PyResult<PyCircuitData> {
+#[pyo3(name = "absorb_dressing")]
+pub fn py_absorb_dressing(py: Python, circuit: &PyCircuitData) -> PyResult<PyCircuitData> {
     Ok(PyCircuitData {
         inner: absorb_dressing(py, &circuit.inner)?,
     })
 }
 
-pub fn absorb_emissions(py: Python, src: &CircuitData) -> PyResult<CircuitData> {
-    absorb_dressing(py, src)
-}
-
 /// Walk from each collector, absorbing adjacent dressing content.
-fn absorb_dressing(py: Python, src: &CircuitData) -> PyResult<CircuitData> {
+pub fn absorb_dressing(py: Python, src: &CircuitData) -> PyResult<CircuitData> {
     absorb_scope(py, src)
 }
 

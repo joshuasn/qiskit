@@ -10,7 +10,7 @@
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
 
-"""Tests for the absorb_emissions pass: scope-agnostic emission absorption.
+"""Tests for the absorb_dressing pass: scope-agnostic emission absorption.
 
 After build, every emission is a standalone Emit instruction and every collector carries only Gates
 items. This pass scans from each emission in its travel direction, crossing box boundaries, and
@@ -26,7 +26,7 @@ from qiskit._accelerate.samplex import (
     ChangeBasis,
     InjectNoise,
     Twirl,
-    absorb_emissions,
+    absorb_dressing,
     build_lowered,
     merge_collectors,
 )
@@ -37,7 +37,7 @@ from test import QiskitTestCase
 def build(circuit):
     """Build and absorb, returning the emission circuit as a QuantumCircuit."""
     data, _table = build_lowered(circuit_to_dag(circuit))
-    data = absorb_emissions(data)
+    data = absorb_dressing(data)
     return QuantumCircuit._from_circuit_data(data)
 
 
@@ -197,7 +197,7 @@ class TestAbsorptionWithMerge(QiskitTestCase):
         with circuit.box([Twirl(dressing="left")]):
             circuit.cx(0, 1)
         data, _table = build_lowered(circuit_to_dag(circuit))
-        data = absorb_emissions(data)
+        data = absorb_dressing(data)
         data = merge_collectors(data)
         ir2 = QuantumCircuit._from_circuit_data(data)
         # The two adjacent near-half collectors merge into one middle collector.
@@ -213,7 +213,7 @@ class TestAbsorptionWithMerge(QiskitTestCase):
             circuit.cx(0, 1)
         data, _table = build_lowered(circuit_to_dag(circuit))
         data = merge_collectors(data)
-        data = absorb_emissions(data)
+        data = absorb_dressing(data)
         ir2 = QuantumCircuit._from_circuit_data(data)
         colls = collectors(ir2)
         self.assertGreaterEqual(len(colls), 1)
@@ -227,9 +227,9 @@ class TestAbsorptionWithMerge(QiskitTestCase):
         data, _table = build_lowered(circuit_to_dag(circuit))
 
         # absorb then merge
-        am = absorb_emissions(merge_collectors(data))
+        am = absorb_dressing(merge_collectors(data))
         # merge then absorb
-        ma = merge_collectors(absorb_emissions(data))
+        ma = merge_collectors(absorb_dressing(data))
 
         ir2_am = QuantumCircuit._from_circuit_data(am)
         ir2_ma = QuantumCircuit._from_circuit_data(ma)

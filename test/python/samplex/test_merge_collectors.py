@@ -21,7 +21,7 @@ from qiskit.converters import circuit_to_dag
 from qiskit._accelerate.samplex import (
     ChangeBasis,
     Twirl,
-    absorb_emissions,
+    absorb_dressing,
     build_lowered,
     merge_collectors,
 )
@@ -40,7 +40,7 @@ def merged(circuit):
     """The emission circuit after merging (absorb happens after merge)."""
     data, table = build_lowered(circuit_to_dag(circuit))
     data = merge_collectors(data)
-    data = absorb_emissions(data)
+    data = absorb_dressing(data)
     return QuantumCircuit._from_circuit_data(data), table
 
 
@@ -273,8 +273,8 @@ class TestPreservation(QiskitTestCase):
         # Propagating emissions (those not absorbed) survive merge unchanged.
         circuit = notebook_circuit()
         data, _ = build_lowered(circuit_to_dag(circuit))
-        no_merge = absorb_emissions(data)
-        with_merge = absorb_emissions(merge_collectors(data))
+        no_merge = absorb_dressing(data)
+        with_merge = absorb_dressing(merge_collectors(data))
 
         before = QuantumCircuit._from_circuit_data(no_merge)
         after = QuantumCircuit._from_circuit_data(with_merge)
@@ -288,8 +288,8 @@ class TestPreservation(QiskitTestCase):
         # Whether or not merge runs, the same propagating emissions remain standalone.
         circuit = notebook_circuit()
         data, _ = build_lowered(circuit_to_dag(circuit))
-        no_merge = absorb_emissions(data)
-        with_merge = absorb_emissions(merge_collectors(data))
+        no_merge = absorb_dressing(data)
+        with_merge = absorb_dressing(merge_collectors(data))
 
         before = QuantumCircuit._from_circuit_data(no_merge)
         after = QuantumCircuit._from_circuit_data(with_merge)
