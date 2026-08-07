@@ -42,8 +42,8 @@ use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use qiskit_circuit::{BlocksMode, Clbit, Qubit, VarsMode};
 
 use crate::annotated_circuit::{
-    extract_annotation, resolve_annotations, BasisOrigin, BoxAnnotation, Dressing, ResolvedBox,
-    SynthesizerType,
+    BasisOrigin, BoxAnnotation, Dressing, ResolvedBox, SynthesizerType, extract_annotation,
+    resolve_annotations,
 };
 use crate::distributions::{DistEntry, DistKey, DistributionTable};
 use crate::emission_circuit::{
@@ -53,7 +53,7 @@ use crate::partition::Partition;
 use crate::virtual_flow_graph::Direction;
 use crate::virtual_type::VirtualType;
 
-use super::utils::{append, new_dag_body, IntoPyResult};
+use super::utils::{IntoPyResult, append, new_dag_body};
 
 /// The synthesizer assumed when a box's annotations do not name one.
 ///
@@ -111,7 +111,9 @@ impl Scope<'_> {
                 self.qubits
                     .get(q.index())
                     .map(|&i| Qubit(i as u32))
-                    .ok_or_else(|| PyValueError::new_err(format!("qubit {} out of scope", q.index())))
+                    .ok_or_else(|| {
+                        PyValueError::new_err(format!("qubit {} out of scope", q.index()))
+                    })
             })
             .collect()
     }
@@ -229,19 +231,14 @@ impl Build {
         scope: &Scope,
     ) -> PyResult<()> {
         let annotations = box_annotations(py, inst)?;
-        let resolved = resolve_annotations(&annotations)
-            .into_py_result()?;
+        let resolved = resolve_annotations(&annotations).into_py_result()?;
 
         let locals = dag.qargs_interner().get(inst.qubits);
         let out_qargs = scope.out_qubits(locals)?;
         let global = scope.global_qubits(locals)?;
         let body = match dag.try_view_control_flow(inst) {
             Some(ControlFlowView::Box { body, .. }) => body,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "box instruction is missing its body",
-                ))
-            }
+            _ => return Err(PyValueError::new_err("box instruction is missing its body")),
         };
         let body_clbits: Vec<usize> = dag
             .cargs_interner()
@@ -627,7 +624,12 @@ fn copy_instruction(
     let qargs = scope.out_qubits(dag.qargs_interner().get(inst.qubits))?;
     let cargs = scope.out_clbits(dag.cargs_interner().get(inst.clbits))?;
     let params: Option<Parameters<_>> = (!inst.params_view().is_empty()).then(|| {
-        Parameters::Params(inst.params_view().iter().cloned().collect::<SmallVec<[Param; 3]>>())
+        Parameters::Params(
+            inst.params_view()
+                .iter()
+                .cloned()
+                .collect::<SmallVec<[Param; 3]>>(),
+        )
     });
     append(out, inst.op.clone(), params, &qargs, &cargs)
 }
@@ -684,7 +686,10 @@ fn write_easy_gates(out: &mut DAGCircuitBuilder, easy: &DAGCircuit, scope: &Scop
             .collect();
         let params: Option<Parameters<_>> = (!inst.params_view().is_empty()).then(|| {
             Parameters::Params(
-                inst.params_view().iter().cloned().collect::<SmallVec<[Param; 3]>>(),
+                inst.params_view()
+                    .iter()
+                    .cloned()
+                    .collect::<SmallVec<[Param; 3]>>(),
             )
         });
         append(out, inst.op.clone(), params, &qargs, &[])?;

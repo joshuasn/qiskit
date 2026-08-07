@@ -13,14 +13,15 @@
 use std::collections::VecDeque;
 
 use hashbrown::HashMap;
-use rustworkx_core::petgraph::stable_graph::NodeIndex;
 use rustworkx_core::petgraph::Direction as PetDirection;
+use rustworkx_core::petgraph::stable_graph::NodeIndex;
+use rustworkx_core::petgraph::visit::EdgeRef;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use qiskit_circuit::bit::{ShareableClbit, ShareableQubit};
 use qiskit_circuit::circuit_data::CircuitData;
-use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder};
+use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder, NodeType, Wire};
 use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{ControlFlow, OperationRef};
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
@@ -28,8 +29,8 @@ use qiskit_circuit::{Block, Clbit, Qubit};
 
 use qiskit_circuit::operations::Param;
 
-use crate::emission_circuit::{extract_collect, extract_emit, CollectSpec};
-use crate::virtual_flow_graph::{Edge, Node};
+use crate::emission_circuit::{CollectSpec, extract_collect, extract_emit};
+use crate::virtual_flow_graph::{Direction, Edge, Node};
 
 /// Extension trait that converts any `Result<T, E: Display>` into `PyResult<T>` via `PyValueError`.
 pub(super) trait IntoPyResult<T> {
@@ -50,7 +51,9 @@ pub(super) fn topological_generations(
     for idx in graph.node_indices() {
         in_degree.insert(
             idx,
-            graph.neighbors_directed(idx, PetDirection::Incoming).count(),
+            graph
+                .neighbors_directed(idx, PetDirection::Incoming)
+                .count(),
         );
     }
 
@@ -150,9 +153,7 @@ pub(super) fn collect_annotation(py: Python, inst: &PackedInstruction) -> Option
     let ControlFlow::Box { annotations, .. } = &cf.control_flow else {
         return None;
     };
-    annotations
-        .iter()
-        .find_map(|a| extract_collect(a.bind(py)))
+    annotations.iter().find_map(|a| extract_collect(a.bind(py)))
 }
 pub(super) fn is_emission(py: Python, inst: &PackedInstruction) -> bool {
     match inst.op.view() {
@@ -168,7 +169,10 @@ pub(super) fn qubit_indices(src: &CircuitData, inst: &PackedInstruction) -> Vec<
         .collect()
 }
 /// The single body of a box instruction.
-pub(super) fn block_body<'a>(src: &'a CircuitData, inst: &PackedInstruction) -> PyResult<Option<&'a CircuitData>> {
+pub(super) fn block_body<'a>(
+    src: &'a CircuitData,
+    inst: &PackedInstruction,
+) -> PyResult<Option<&'a CircuitData>> {
     match inst.blocks_view() {
         [] => Ok(None),
         [block] => Ok(Some(&src.blocks()[*block])),
@@ -187,6 +191,32 @@ pub(super) fn emission_spec(
         OperationRef::PyCustom(py_inst) => extract_emit(py_inst.ob.bind(py)),
         _ => None,
     }
+}
+
+/// The next operation node along one wire, or `None` at the end of it.
+///
+/// This is the whole per-wire adjacency notion the IR2 passes need: "what does this qubit see next",
+/// as opposed to `quantum_successors`, which pools every wire of a node together. Reaching the wire's
+/// output node counts as the end.
+pub(super) fn next_on_wire(
+    dag: &DAGCircuit,
+    from: NodeIndex,
+    qubit: Qubit,
+    direction: Direction,
+) -> Option<NodeIndex> {
+    let (search, wire) = match direction {
+        Direction::Right => (PetDirection::Outgoing, Wire::Qubit(qubit)),
+        Direction::Left => (PetDirection::Incoming, Wire::Qubit(qubit)),
+    };
+    let next = dag
+        .dag()
+        .edges_directed(from, search)
+        .find(|edge| *edge.weight() == wire)
+        .map(|edge| match direction {
+            Direction::Right => edge.target(),
+            Direction::Left => edge.source(),
+        })?;
+    matches!(dag.dag()[next], NodeType::Operation(_)).then_some(next)
 }
 
 /// Append an operation to the back of a DAG under construction.
