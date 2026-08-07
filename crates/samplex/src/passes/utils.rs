@@ -27,8 +27,6 @@ use qiskit_circuit::operations::{ControlFlow, OperationRef};
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use qiskit_circuit::{Block, Clbit, Qubit};
 
-use qiskit_circuit::operations::Param;
-
 use crate::emission_circuit::{CollectSpec, extract_collect, extract_emit};
 use crate::virtual_flow_graph::{Direction, Edge, Node};
 
@@ -82,22 +80,13 @@ pub(super) fn topological_generations(
     generations
 }
 
-// --- Temporary IR2 representation bridges -------------------------------------------------------
+// --- Temporary IR2 representation bridge --------------------------------------------------------
 //
 // IR2 is a `DAGCircuit` at the Python boundary, but the pass bodies are being migrated one at a
-// time. Until a pass reads and writes the DAG directly, its wrapper converts in and out with these.
+// time. Until a pass reads the DAG directly, its wrapper converts with this.
 //
-// TODO: delete both once every IR2 pass body is DAG-native. Nothing outside a `py_*` wrapper should
-// call them — a pass that still needs one has not been migrated yet.
-
-/// Convert an IR2 `CircuitData` to the `DAGCircuit` the boundary expects.
-///
-/// Block bodies convert recursively, so a nested box body arrives as a `DAGCircuit` block.
-pub(super) fn to_dag(circuit: &CircuitData) -> PyResult<DAGCircuit> {
-    Ok(DAGCircuit::from_circuit_data(
-        circuit, false, None, None, None, None,
-    )?)
-}
+// TODO: delete once every IR2 pass body is DAG-native. Nothing outside a `py_*` wrapper should call
+// it — a pass that still needs it has not been migrated yet.
 
 /// Convert an IR2 `DAGCircuit` to the flat `CircuitData` an unmigrated pass body still wants.
 ///
@@ -160,13 +149,6 @@ pub(super) fn is_emission(py: Python, inst: &PackedInstruction) -> bool {
         OperationRef::PyCustom(py_inst) => extract_emit(py_inst.ob.bind(py)).is_some(),
         _ => false,
     }
-}
-pub(super) fn qubit_indices(src: &CircuitData, inst: &PackedInstruction) -> Vec<usize> {
-    src.qargs_interner()
-        .get(inst.qubits)
-        .iter()
-        .map(|q| q.index())
-        .collect()
 }
 /// The single body of a box instruction.
 pub(super) fn block_body<'a>(
@@ -266,19 +248,4 @@ pub(super) fn new_dag_body(
             .into_py_result()?;
     }
     Ok(body)
-}
-
-/// Create an empty `CircuitData` with the given dimensions.
-pub(super) fn new_circuit_body(
-    num_qubits: usize,
-    num_clbits: usize,
-    capacity: usize,
-) -> PyResult<CircuitData> {
-    CircuitData::with_capacity(
-        num_qubits as u32,
-        num_clbits as u32,
-        capacity,
-        Param::Float(0.0),
-    )
-    .into_py_result()
 }
