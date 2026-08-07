@@ -29,7 +29,7 @@ class SamplexMergeCollectors(TransformationPass):
     round -- merging after lowering would invalidate parameter labels already minted -- so the pass is
     freely switchable but must precede lowering.
 
-    Runs in place and may be composed either side of :class:`.SamplexAbsorbEmissions`.
+    Runs in place and may be composed either side of :class:`.SamplexAbsorbDressing`.
     """
 
     def run(self, dag):

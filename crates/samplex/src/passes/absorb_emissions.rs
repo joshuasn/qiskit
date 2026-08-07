@@ -55,13 +55,13 @@ use crate::virtual_flow_graph::Direction;
 
 /// Absorb dressing into every collector, in place.
 #[pyfunction]
-#[pyo3(name = "absorb_emissions")]
-pub fn py_absorb_emissions(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
-    absorb_emissions(py, dag)
+#[pyo3(name = "absorb_dressing")]
+pub fn py_absorb_dressing(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
+    absorb_dressing(py, dag)
 }
 
 /// Absorb dressing into every collector, in place.
-pub fn absorb_emissions(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
+pub fn absorb_dressing(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
     absorb_scope(py, dag)
 }
 

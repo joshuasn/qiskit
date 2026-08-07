@@ -23,7 +23,7 @@ from qiskit.converters import circuit_to_dag, dag_to_circuit
 from qiskit._accelerate.samplex import (
     ChangeBasis,
     Twirl,
-    absorb_emissions,
+    absorb_dressing,
     build_lowered,
     merge_collectors,
 )
@@ -42,7 +42,7 @@ def merged(circuit):
     """The emission circuit after merging (absorb happens after merge)."""
     dag, table = build_lowered(circuit_to_dag(circuit))
     merge_collectors(dag)
-    absorb_emissions(dag)
+    absorb_dressing(dag)
     return dag_to_circuit(dag), table
 
 
@@ -276,10 +276,10 @@ class TestPreservation(QiskitTestCase):
         circuit = notebook_circuit()
         dag, _ = build_lowered(circuit_to_dag(circuit))
         no_merge = copy.copy(dag)
-        absorb_emissions(no_merge)
+        absorb_dressing(no_merge)
         with_merge = copy.copy(dag)
         merge_collectors(with_merge)
-        absorb_emissions(with_merge)
+        absorb_dressing(with_merge)
 
         before = dag_to_circuit(no_merge)
         after = dag_to_circuit(with_merge)
@@ -294,10 +294,10 @@ class TestPreservation(QiskitTestCase):
         circuit = notebook_circuit()
         dag, _ = build_lowered(circuit_to_dag(circuit))
         no_merge = copy.copy(dag)
-        absorb_emissions(no_merge)
+        absorb_dressing(no_merge)
         with_merge = copy.copy(dag)
         merge_collectors(with_merge)
-        absorb_emissions(with_merge)
+        absorb_dressing(with_merge)
 
         before = dag_to_circuit(no_merge)
         after = dag_to_circuit(with_merge)

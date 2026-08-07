@@ -23,7 +23,7 @@ from qiskit.converters import circuit_to_dag
 from qiskit.transpiler import PassManager
 from qiskit.transpiler.exceptions import TranspilerError
 from qiskit.transpiler.passes.samplex import (
-    SamplexAbsorbEmissions,
+    SamplexAbsorbDressing,
     SamplexBuild,
     SamplexLower,
     SamplexMergeCollectors,
@@ -31,7 +31,7 @@ from qiskit.transpiler.passes.samplex import (
 from qiskit._accelerate.samplex import (
     ChangeBasis,
     Twirl,
-    absorb_emissions,
+    absorb_dressing,
     build_lowered,
     lower,
     merge_collectors,
@@ -58,7 +58,7 @@ def pipeline(merge=True):
     passes = [SamplexBuild()]
     if merge:
         passes.append(SamplexMergeCollectors())
-    passes += [SamplexAbsorbEmissions(), SamplexLower()]
+    passes += [SamplexAbsorbDressing(), SamplexLower()]
     return PassManager(passes)
 
 
@@ -67,7 +67,7 @@ def directly(circuit, merge=True):
     dag, table = build_lowered(circuit_to_dag(circuit))
     if merge:
         merge_collectors(dag)
-    absorb_emissions(dag)
+    absorb_dressing(dag)
     return lower(dag, table)
 
 
@@ -125,4 +125,4 @@ class TestSamplexPasses(QiskitTestCase):
         # worthwhile.
         dag, _table = build_lowered(circuit_to_dag(notebook_circuit()))
         self.assertIs(SamplexMergeCollectors().run(dag), dag)
-        self.assertIs(SamplexAbsorbEmissions().run(dag), dag)
+        self.assertIs(SamplexAbsorbDressing().run(dag), dag)

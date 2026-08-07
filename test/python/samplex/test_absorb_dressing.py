@@ -10,7 +10,7 @@
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
 
-"""Tests for the absorb_emissions pass: scope-agnostic emission absorption.
+"""Tests for the absorb_dressing pass: scope-agnostic emission absorption.
 
 After build, every emission is a standalone Emit instruction and every collector carries only Gates
 items. This pass scans from each emission in its travel direction, crossing box boundaries, and
@@ -28,7 +28,7 @@ from qiskit._accelerate.samplex import (
     ChangeBasis,
     InjectNoise,
     Twirl,
-    absorb_emissions,
+    absorb_dressing,
     build_lowered,
     merge_collectors,
 )
@@ -39,7 +39,7 @@ from test import QiskitTestCase
 def build(circuit):
     """Build and absorb, returning the emission circuit as a QuantumCircuit."""
     dag, _table = build_lowered(circuit_to_dag(circuit))
-    absorb_emissions(dag)
+    absorb_dressing(dag)
     return dag_to_circuit(dag)
 
 
@@ -199,7 +199,7 @@ class TestAbsorptionWithMerge(QiskitTestCase):
         with circuit.box([Twirl(dressing="left")]):
             circuit.cx(0, 1)
         dag, _table = build_lowered(circuit_to_dag(circuit))
-        absorb_emissions(dag)
+        absorb_dressing(dag)
         merge_collectors(dag)
         ir2 = dag_to_circuit(dag)
         # The two adjacent near-half collectors merge into one middle collector.
@@ -215,7 +215,7 @@ class TestAbsorptionWithMerge(QiskitTestCase):
             circuit.cx(0, 1)
         dag, _table = build_lowered(circuit_to_dag(circuit))
         merge_collectors(dag)
-        absorb_emissions(dag)
+        absorb_dressing(dag)
         ir2 = dag_to_circuit(dag)
         colls = collectors(ir2)
         self.assertGreaterEqual(len(colls), 1)
@@ -231,10 +231,10 @@ class TestAbsorptionWithMerge(QiskitTestCase):
         # The passes mutate in place, so each ordering gets its own copy of the same input.
         am = copy.copy(dag)
         merge_collectors(am)
-        absorb_emissions(am)
+        absorb_dressing(am)
 
         ma = copy.copy(dag)
-        absorb_emissions(ma)
+        absorb_dressing(ma)
         merge_collectors(ma)
 
         ir2_am = dag_to_circuit(am)

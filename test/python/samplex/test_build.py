@@ -27,7 +27,7 @@ from qiskit._accelerate.samplex import (
     InjectNoise,
     Tag,
     Twirl,
-    absorb_emissions,
+    absorb_dressing,
     build_lowered,
 )
 
@@ -43,7 +43,7 @@ def lower(circuit):
 def lower_absorbed(circuit):
     """Build and absorb, returning as a QuantumCircuit plus the distribution table."""
     dag, table = build_lowered(circuit_to_dag(circuit))
-    absorb_emissions(dag)
+    absorb_dressing(dag)
     return dag_to_circuit(dag), table
 
 
@@ -259,7 +259,7 @@ class TestBuildShape(QiskitTestCase):
     def test_collectors_start_empty_after_build(self):
         """After build, collectors are empty — gates and emissions live on the spine.
 
-        The absorb_emissions pass later walks from each collector to populate items and body.
+        The absorb_dressing pass later walks from each collector to populate items and body.
         """
         circuit = QuantumCircuit(3)
         with circuit.box(
@@ -277,7 +277,7 @@ class TestBuildShape(QiskitTestCase):
             self.assertEqual(coll[0].items, [])
 
     def test_absorbed_gates_sit_inside_the_basis_change(self):
-        """After absorb_emissions, the collector holds gates and emissions in composition order."""
+        """After absorb_dressing, the collector holds gates and emissions in composition order."""
         left = QuantumCircuit(3)
         with left.box(
             [
@@ -289,7 +289,7 @@ class TestBuildShape(QiskitTestCase):
             left.h(0)
             left.cx(1, 2)
         dag, _ = build_lowered(circuit_to_dag(left))
-        absorb_emissions(dag)
+        absorb_dressing(dag)
         left_coll = collectors(dag_to_circuit(dag))[0]
         self.assertIn(("gates", 1), left_coll[0].items)
         self.assertEqual(gate_names(left_coll[1]), ["h"])
@@ -305,7 +305,7 @@ class TestBuildShape(QiskitTestCase):
             right.cx(1, 2)
             right.h(0)
         dag, _ = build_lowered(circuit_to_dag(right))
-        absorb_emissions(dag)
+        absorb_dressing(dag)
         right_coll = collectors(dag_to_circuit(dag))[-1]
         self.assertIn(("gates", 1), right_coll[0].items)
         self.assertEqual(gate_names(right_coll[1]), ["h"])

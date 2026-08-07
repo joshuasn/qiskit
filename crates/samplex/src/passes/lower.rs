@@ -458,7 +458,7 @@ pub fn build_sampling_graph(
 }
 
 /// Scan from position `start` in `direction` through the events list to find the nearest collector.
-/// Used as a fallback when absorb_emissions hasn't run (unoptimized path).
+/// Used as a fallback when absorb_dressing hasn't run (unoptimized path).
 fn scan_for_nearest_collector(
     events: &[Event],
     start: usize,

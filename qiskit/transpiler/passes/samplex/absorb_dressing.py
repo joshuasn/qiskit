@@ -12,11 +12,11 @@
 
 """Absorb dressing gates and emission markers into samplex collectors."""
 
-from qiskit._accelerate.samplex import absorb_emissions
+from qiskit._accelerate.samplex import absorb_dressing
 from qiskit.transpiler.basepasses import TransformationPass
 
 
-class SamplexAbsorbEmissions(TransformationPass):
+class SamplexAbsorbDressing(TransformationPass):
     """Take the dressing around each collector into the collector itself.
 
     After build, every emission marker and every easy single-qubit gate sits on the circuit spine and
@@ -34,7 +34,7 @@ class SamplexAbsorbEmissions(TransformationPass):
     """
 
     def run(self, dag):
-        """Run the SamplexAbsorbEmissions pass on ``dag``, in place.
+        """Run the SamplexAbsorbDressing pass on ``dag``, in place.
 
         Args:
             dag (DAGCircuit): the emission circuit (IR2).
@@ -42,5 +42,5 @@ class SamplexAbsorbEmissions(TransformationPass):
         Returns:
             DAGCircuit: the same ``dag``, with dressing absorbed into its collectors.
         """
-        absorb_emissions(dag)
+        absorb_dressing(dag)
         return dag

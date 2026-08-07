@@ -46,7 +46,7 @@ pub fn samplex_mod(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<emission_circuit::Emit>()?;
     m.add_class::<virtual_flow_graph::VirtualFlowGraph>()?;
     m.add_wrapped(wrap_pyfunction!(passes::build::py_build))?;
-    m.add_wrapped(wrap_pyfunction!(passes::absorb_emissions::py_absorb_emissions))?;
+    m.add_wrapped(wrap_pyfunction!(passes::absorb_emissions::py_absorb_dressing))?;
     m.add_wrapped(wrap_pyfunction!(passes::merge_collectors::py_merge_collectors))?;
     m.add_wrapped(wrap_pyfunction!(passes::lower::py_build_template))?;
     m.add_wrapped(wrap_pyfunction!(passes::lower::py_lower))?;

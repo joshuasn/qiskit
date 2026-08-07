@@ -24,7 +24,7 @@ from qiskit.converters import circuit_to_dag
 from qiskit._accelerate.samplex import (
     ChangeBasis,
     Twirl,
-    absorb_emissions,
+    absorb_dressing,
     build_lowered,
     build_template,
     merge_collectors,
@@ -36,7 +36,7 @@ from test.python.samplex.test_build import gate_names
 
 def emission_circuit(circuit):
     dag, _ = build_lowered(circuit_to_dag(circuit))
-    absorb_emissions(dag)
+    absorb_dressing(dag)
     return dag
 
 
@@ -129,7 +129,7 @@ class TestParameterLabelling(QiskitTestCase):
         dag = emission_circuit(notebook_circuit())
         unmerged, unmerged_collectors = template(dag)
         merged_dag = copy.copy(dag)
-        absorb_emissions(merged_dag)
+        absorb_dressing(merged_dag)
         merge_collectors(merged_dag)
         merged, merged_collectors = template(merged_dag)
 

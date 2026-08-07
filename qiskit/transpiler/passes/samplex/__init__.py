@@ -24,7 +24,7 @@ work and the passes below compose in a :class:`~qiskit.transpiler.PassManager`::
     PassManager([
         SamplexBuild(),
         SamplexMergeCollectors(),   # optional; fewer, wider dressing layers
-        SamplexAbsorbEmissions(),
+        SamplexAbsorbDressing(),
         SamplexLower(),
     ])
 
@@ -39,13 +39,13 @@ These passes are deliberately not re-exported from :mod:`qiskit.transpiler.passe
 stable Python surface yet, and importing from this module is what keeps that explicit.
 """
 
-from .absorb_emissions import SamplexAbsorbEmissions
+from .absorb_dressing import SamplexAbsorbDressing
 from .build import SamplexBuild
 from .lower import SamplexLower
 from .merge_collectors import SamplexMergeCollectors
 
 __all__ = [
-    "SamplexAbsorbEmissions",
+    "SamplexAbsorbDressing",
     "SamplexBuild",
     "SamplexLower",
     "SamplexMergeCollectors",
