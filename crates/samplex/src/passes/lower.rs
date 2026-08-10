@@ -55,11 +55,11 @@ use qiskit_circuit::operations::StandardInstruction;
 use super::utils::{IntoPyResult, block_body, collect_annotation, emission_spec, is_emission};
 use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::{DistEntry, DistributionTable};
-use crate::emission_circuit::{EmitSource, EmitSpec, LocalEmission};
+use crate::emission_circuit::{EmitSource, EmitSpec};
 use crate::partition::Partition;
 use crate::virtual_flow_graph::{
-    AbsorbedGate, Collect, CollectStep, Direction, Edge, Emission, Measure, Node, NodeKind,
-    Propagate, VirtualFlowGraph,
+    AbsorbedGate, Collect, CollectStep, Direction, Edge, Emission, LocalEmission, Measure, Node,
+    NodeKind, Propagate, VirtualFlowGraph,
 };
 use crate::virtual_type::{VirtualType, propagates};
 

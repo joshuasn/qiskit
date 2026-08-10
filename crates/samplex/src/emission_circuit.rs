@@ -409,23 +409,6 @@ pub fn extract_emit(obj: &Bound<'_, PyAny>) -> Option<EmitSpec> {
     obj.cast::<Emit>().ok().map(|e| e.get().inner.clone())
 }
 
-/// An emission owned directly by its collector — adjacent to it, never propagating through gates.
-///
-/// At sampling time the collector reads the sampled value from the distribution table and composes
-/// it at the position its local `Emit` instruction (`direction: None`) sits at in the collector body.
-/// No VFG `Emission` node — the local emission is folded straight into the collector's own step
-/// list.
-///
-/// Neither direction nor source is stored: position in the collector body IS the composition order,
-/// and the distribution table entry (reachable through [`EmitPart::dist`]) already encodes the
-/// emission kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalEmission {
-    pub partition: Partition,
-    /// Per-part descriptors, parallel with `partition.iter()`.
-    pub parts: Vec<EmitPart>,
-}
-
 /// Per-part descriptor for a collector: what synthesizer to use on this subsystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectPart {

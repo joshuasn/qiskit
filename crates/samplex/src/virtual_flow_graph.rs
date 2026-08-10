@@ -17,7 +17,7 @@ use qiskit_circuit::operations::Operation;
 use rustworkx_core::petgraph::stable_graph::{NodeIndex, StableDiGraph};
 
 use crate::distributions::DistEntry;
-use crate::emission_circuit::LocalEmission;
+use crate::emission_circuit::EmitPart;
 use crate::partition::Partition;
 pub use crate::virtual_type::VirtualType;
 
@@ -137,6 +137,23 @@ pub struct AbsorbedGate {
     pub gate: StandardGate,
     /// Circuit qubits, ascending.
     pub qubits: Vec<usize>,
+}
+
+/// An emission owned directly by its collector — adjacent to it, never propagating through gates.
+///
+/// At sampling time the collector reads the sampled value from the distribution table and composes
+/// it at the position its local `Emit` instruction (`direction: None`) sits at in the collector body.
+/// No VFG `Emission` node — the local emission is folded straight into the collector's own step
+/// list.
+///
+/// Neither direction nor source is stored: position in the collector body IS the composition order,
+/// and the distribution table entry (reachable through [`EmitPart::dist`]) already encodes the
+/// emission kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEmission {
+    pub partition: Partition,
+    /// Per-part descriptors, parallel with `partition.iter()`.
+    pub parts: Vec<EmitPart>,
 }
 
 /// One step in what a collector composes, in circuit order.
