@@ -29,13 +29,7 @@ from qiskit._accelerate.samplex import (
 )
 
 from test import QiskitTestCase
-from test.python.samplex.test_build import (
-    collectors,
-    emissions,
-    gate_names,
-    hard_boxes,
-    hard_gates,
-)
+from test.python.samplex.test_build import collectors, emissions, gate_names, hard_boxes, real_gates
 
 
 def build(circuit):
@@ -154,42 +148,21 @@ class TestSharedMiddleCollector(QiskitTestCase):
             circuit.cx(0, 1)
         out, _ = merged(circuit)
 
-        bodies = [gate_names(body) for _, body, _ in collectors(out)]
+        bodies = [real_gates(body) for _, body, _ in collectors(out)]
         # first box's absorbed `s` and second box's absorbed `h` land in the same middle collector
         self.assertIn(["s", "h"], bodies)
-        middle = next(c for c in collectors(out) if gate_names(c[1]) == ["s", "h"])
+        middle = next(c for c in collectors(out) if real_gates(c[1]) == ["s", "h"])
         self.assertEqual(middle[2], [0, 1, 2, 3])
         # and they are still on the right qubits after remapping
         body = middle[1]
         self.assertEqual(
-            [(i.operation.name, [body.find_bit(b).index for b in i.qubits]) for i in body.data],
+            [
+                (i.operation.name, [body.find_bit(b).index for b in i.qubits])
+                for i in body.data
+                if not i.operation.name.startswith("samplex_emit")
+            ],
             [("s", [0]), ("h", [3])],
         )
-
-    def test_a_merged_collector_holds_one_run_per_contribution(self):
-        # Items and bodies both append, in the same order, so the counts stay valid without any
-        # offsetting — which is why they are counts rather than index ranges. The resulting sequence is
-        # right: the first box's outermost element ends up adjacent to the second box's outermost.
-        circuit = QuantumCircuit(2)
-        with circuit.box([Twirl(dressing="right")]):
-            circuit.cx(0, 1)
-            circuit.s(0)
-        with circuit.box([Twirl(dressing="left")]):
-            circuit.h(1)
-            circuit.cx(0, 1)
-        out, _ = merged(circuit)
-
-        middle = next(c for c, body, _ in collectors(out) if len(body.data) > 1)
-        # After merge+absorb: the merged middle holds emissions and gates from both boxes.
-        gate_items = [item for item in middle.items if item[0] == "gates"]
-        self.assertEqual(gate_items, [("gates", 1), ("gates", 1)])
-
-    def test_merging_keeps_items_and_bodies_in_step(self):
-        circuit = notebook_circuit()
-        out, _ = merged(circuit)
-        for annotation, body, _ in collectors(out):
-            counted = sum(n for kind, n in annotation.items if kind == "gates")
-            self.assertEqual(counted, len(body.data), repr(annotation))
 
 
 class TestMergeBarriers(QiskitTestCase):
@@ -289,9 +262,12 @@ class TestPreservation(QiskitTestCase):
         before = dag_to_circuit(no_merge)
         after = dag_to_circuit(with_merge)
 
+        # Only propagating (standalone) emissions have a position the test can pin down. An absorbed
+        # local emission lives in a collector body alongside other content on disjoint qubits, where
+        # relative order is deliberately unconstrained — see lower.rs's topological-order argument.
         self.assertEqual(
-            [(e.source, e.direction, tuple(e.qubits)) for e in emissions(before)],
-            [(e.source, e.direction, tuple(e.qubits)) for e in emissions(after)],
+            [(e.source, e.direction, tuple(e.qubits)) for e in emissions(before) if e.direction != "local"],
+            [(e.source, e.direction, tuple(e.qubits)) for e in emissions(after) if e.direction != "local"],
         )
 
     def test_emissions_are_preserved_through_merge(self):
@@ -319,7 +295,7 @@ class TestPreservation(QiskitTestCase):
         with circuit.box([Twirl()]):
             circuit.cx(1, 0)
         out, _ = merged(circuit)
-        self.assertEqual([hard_gates(h) for h in hard_boxes(out)], [["cx"], ["cx"]])
+        self.assertEqual([real_gates(h) for h in hard_boxes(out)], [["cx"], ["cx"]])
 
     def test_merge_is_deterministic(self):
         runs = []
@@ -328,7 +304,7 @@ class TestPreservation(QiskitTestCase):
             runs.append(
                 (
                     gate_names(out),
-                    [(c.synthesizer, tuple(c.items), tuple(q)) for c, _, q in collectors(out)],
+                    [(c.synthesizer, tuple(gate_names(b)), tuple(q)) for c, b, q in collectors(out)],
                     table.entries(),
                 )
             )
@@ -343,7 +319,7 @@ class TestPreservation(QiskitTestCase):
 
         def shape(dag):
             circuit = dag_to_circuit(dag)
-            return [(c.synthesizer, tuple(c.items), tuple(q)) for c, _, q in collectors(circuit)]
+            return [(c.synthesizer, tuple(gate_names(b)), tuple(q)) for c, b, q in collectors(circuit)]
 
         self.assertEqual(shape(once), shape(twice))
 

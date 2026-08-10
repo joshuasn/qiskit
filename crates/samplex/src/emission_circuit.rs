@@ -71,6 +71,15 @@ parse_enum!(parse_direction, Direction, "direction", {
     "right" => Right,
 });
 
+/// Parse a direction that may also be `"local"`, meaning the emission resolves in place rather
+/// than propagating.
+fn parse_direction_opt(s: &str) -> PyResult<Option<Direction>> {
+    match s {
+        "local" => Ok(None),
+        _ => parse_direction(s).map(Some),
+    }
+}
+
 parse_enum!(parse_virtual_type, VirtualType, "virtual type", {
     "pauli" => Pauli,
     "c1" => C1,
@@ -113,8 +122,9 @@ pub struct EmitSpec {
     pub box_id: u32,
     /// Which annotation this emission stands in for.
     pub source: EmitSource,
-    /// Which way the emitted virtual state flows.
-    pub direction: Direction,
+    /// Which way the emitted virtual state flows, or `None` if it has already resolved in place —
+    /// owned directly by the collector body it sits in, rather than propagating towards one.
+    pub direction: Option<Direction>,
     /// Subsystem grouping over the emission's qubits, in the *global* circuit frame.
     ///
     /// The instruction's qargs are body-local (a box body is its own circuit indexed `0..width`),
@@ -209,7 +219,7 @@ impl Emit {
             inner: EmitSpec {
                 box_id,
                 source: parse_source(source)?,
-                direction: parse_direction(direction)?,
+                direction: parse_direction_opt(direction)?,
                 partition,
                 parts,
             },
@@ -258,8 +268,9 @@ impl Emit {
     #[getter]
     fn direction(&self) -> &'static str {
         match self.inner.direction {
-            Direction::Left => "left",
-            Direction::Right => "right",
+            Some(Direction::Left) => "left",
+            Some(Direction::Right) => "right",
+            None => "local",
         }
     }
 
@@ -401,35 +412,18 @@ pub fn extract_emit(obj: &Bound<'_, PyAny>) -> Option<EmitSpec> {
 /// An emission owned directly by its collector — adjacent to it, never propagating through gates.
 ///
 /// At sampling time the collector reads the sampled value from the distribution table and composes
-/// it at the position its [`CollectItem`] list dictates. No standalone `Emit` instruction, no VFG
-/// `Emission` node.
+/// it at the position its local `Emit` instruction (`direction: None`) sits at in the collector body.
+/// No VFG `Emission` node — the local emission is folded straight into the collector's own step
+/// list.
 ///
-/// Neither direction nor source is stored: position in the collector's items vec IS the composition
-/// order, and the distribution table entry (reachable through [`EmitPart::dist`]) already encodes
-/// the emission kind.
+/// Neither direction nor source is stored: position in the collector body IS the composition order,
+/// and the distribution table entry (reachable through [`EmitPart::dist`]) already encodes the
+/// emission kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalEmission {
     pub partition: Partition,
     /// Per-part descriptors, parallel with `partition.iter()`.
     pub parts: Vec<EmitPart>,
-}
-
-/// One step in what a collector composes, in circuit order.
-///
-/// Only what the collector *owns*: local emissions (direct table reads) and absorbed gates. Incoming
-/// emissions (far twirl halves) are not recorded here — their composition position is derived from
-/// graph topology (direction + generation distance) at evaluation time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CollectItem {
-    /// A local emission owned by this collector. No standalone instruction needed.
-    Emission(LocalEmission),
-    /// The next `n` gates of the collect box's body.
-    ///
-    /// A **count**, not an index range. Merging concatenates bodies, and a count needs no offsetting
-    /// when it does: the reader walks the items with a cursor into the body, so concatenating items and
-    /// concatenating bodies is all a merge has to do. The counts of a well-formed collector sum to its
-    /// body length.
-    Gates(usize),
 }
 
 /// Per-part descriptor for a collector: what synthesizer to use on this subsystem.
@@ -442,18 +436,6 @@ pub struct CollectPart {
 /// The payload of a [`Collect`] annotation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectSpec {
-    /// Everything this collector composes, in **circuit order** — which is outermost-first on the left
-    /// of a box and innermost-first on the right.
-    ///
-    /// Ordered, and interleaved with the absorbed gates, because position in the layer is meaningful: a
-    /// `ChangeBasis` wraps the whole box and so composes outside the easy gates the dressing absorbed,
-    /// whereas an injection or a twirl attaches to the hard content and composes inside them. Two
-    /// independent lists could not express that.
-    ///
-    /// Each `Emit` carries its own direction, so no per-reference metadata is needed here. Recording the
-    /// references explicitly is what lets the graph reader avoid re-deriving the contextual collection
-    /// rules (shared middle collectors, growing qubit sets) a second time.
-    pub items: Vec<CollectItem>,
     /// The annotated boxes whose emissions this collector may consume, ascending.
     ///
     /// Build gives each of a box's two collectors that box's own id. Merging unions them, so a shared
@@ -471,25 +453,6 @@ pub struct CollectSpec {
 }
 
 impl CollectSpec {
-    /// How many body gates the items account for. Should equal the collect box's body length.
-    pub fn gate_count(&self) -> usize {
-        self.items
-            .iter()
-            .map(|item| match item {
-                CollectItem::Gates(count) => *count,
-                _ => 0,
-            })
-            .sum()
-    }
-
-    /// Whether this collector consumes no local emissions.
-    pub fn collects_nothing(&self) -> bool {
-        !self
-            .items
-            .iter()
-            .any(|item| matches!(item, CollectItem::Emission(_)))
-    }
-
     /// The synthesizer of the first part. Convenience for the common uniform case where all parts
     /// share the same synthesizer.
     pub fn synthesizer(&self) -> SynthesizerType {
@@ -535,8 +498,8 @@ impl Collect {
 impl Collect {
     /// Construct a `Collect` annotation.
     ///
-    /// From Python this produces an empty-items collector (no body to slice). The build pass
-    /// constructs the interleaved form directly in Rust.
+    /// From Python this produces an empty collector, with no body yet. The build pass populates
+    /// the body directly in Rust.
     #[new]
     #[pyo3(signature = (synthesizer="rzsx"))]
     fn new(synthesizer: &str) -> PyResult<PyClassInitializer<Self>> {
@@ -544,7 +507,6 @@ impl Collect {
         Ok(
             PyClassInitializer::from(PyAnnotation).add_subclass(Collect {
                 inner: CollectSpec {
-                    items: Vec::new(),
                     owned: Vec::new(),
                     partition: Partition::new(),
                     parts: vec![CollectPart { synthesizer: synth }],
@@ -572,32 +534,8 @@ impl Collect {
         self.inner.owned.clone()
     }
 
-    /// Everything composed, in order: `("local", 0)` for a local emission, `("gates", n)` for
-    /// the next `n` gates of this box's body.
-    #[getter]
-    fn items(&self) -> Vec<(&'static str, usize)> {
-        self.inner
-            .items
-            .iter()
-            .map(|item| match item {
-                CollectItem::Emission(_) => ("local", 0),
-                CollectItem::Gates(count) => ("gates", *count),
-            })
-            .collect()
-    }
-
     fn __repr__(&self) -> String {
-        let items = self
-            .inner
-            .items
-            .iter()
-            .map(|item| match item {
-                CollectItem::Emission(_) => "~".to_string(),
-                CollectItem::Gates(count) => format!("{count}g"),
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("Collect({:?}, [{}])", self.inner.synthesizer(), items)
+        format!("Collect({:?})", self.inner.synthesizer())
     }
 }
 

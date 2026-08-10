@@ -94,14 +94,23 @@ def gate_names(circuit):
     return [inst.operation.name for inst in circuit.data]
 
 
-def hard_gates(circuit):
-    """The real gates of a hard body, without the `Emit` markers written inside it.
+def real_gates(body):
+    """Gate names in a body, excluding the `Emit` markers sitting in it.
 
-    A propagating emission lives *inside* the hard box, at the edge it starts from, because the hard
-    content is exactly what conjugates it on the way to the far collector. It is a marker rather than
-    something that executes, so it is not part of what the easy/hard split put here.
+    Both kinds of body have them now: a collector body holds the local emissions it absorbed, and a
+    hard body holds the propagating emission written at the edge it starts from. Neither executes, so
+    neither is a gate.
     """
-    return [name for name in gate_names(circuit) if not name.startswith("samplex_emit")]
+    return [inst.operation.name for inst in body.data if not inst.operation.name.startswith("samplex_emit")]
+
+
+def body_locals(body):
+    """Absorbed local emissions in a collector body, in body order."""
+    return [
+        inst.operation
+        for inst in body.data
+        if inst.operation.name.startswith("samplex_emit") and inst.operation.direction == "local"
+    ]
 
 
 class TestBuildShape(QiskitTestCase):
@@ -128,12 +137,11 @@ class TestBuildShape(QiskitTestCase):
             circuit.cx(0, 1)
         lowered, _ = lower(circuit)
 
-        # Build produces two collectors (left and right), each with only Gates items
+        # Build produces two collectors (left and right), each with an empty body — nothing has
+        # been absorbed into them yet.
         left, right = collectors(lowered)
-        left_tags = [tag for tag, _ in left[0].items]
-        right_tags = [tag for tag, _ in right[0].items]
-        self.assertTrue(all(t == "gates" for t in left_tags))
-        self.assertTrue(all(t == "gates" for t in right_tags))
+        self.assertEqual(len(left[1].data), 0)
+        self.assertEqual(len(right[1].data), 0)
 
     def test_noise_and_basis_land_on_the_side_their_placement_names(self):
         circuit = QuantumCircuit(2)
@@ -280,7 +288,7 @@ class TestBuildShape(QiskitTestCase):
     def test_collectors_start_empty_after_build(self):
         """After build, collectors are empty — gates and emissions live on the spine.
 
-        The absorb_dressing pass later walks from each collector to populate items and body.
+        The absorb_dressing pass later walks from each collector to populate its body.
         """
         circuit = QuantumCircuit(3)
         with circuit.box(
@@ -295,7 +303,7 @@ class TestBuildShape(QiskitTestCase):
         dag, _ = build_lowered(circuit_to_dag(circuit))
         colls = collectors(dag_to_circuit(dag))
         for coll in colls:
-            self.assertEqual(coll[0].items, [])
+            self.assertEqual(len(coll[1].data), 0)
 
     def test_absorbed_gates_sit_inside_the_basis_change(self):
         """After absorb_dressing, the collector holds gates and emissions in composition order."""
@@ -312,8 +320,8 @@ class TestBuildShape(QiskitTestCase):
         dag, _ = build_lowered(circuit_to_dag(left))
         absorb_dressing(dag)
         left_coll = collectors(dag_to_circuit(dag))[0]
-        self.assertIn(("gates", 1), left_coll[0].items)
-        self.assertEqual(gate_names(left_coll[1]), ["h"])
+        self.assertEqual(real_gates(left_coll[1]), ["h"])
+        self.assertTrue(body_locals(left_coll[1]))
 
         right = QuantumCircuit(3)
         with right.box(
@@ -328,26 +336,8 @@ class TestBuildShape(QiskitTestCase):
         dag, _ = build_lowered(circuit_to_dag(right))
         absorb_dressing(dag)
         right_coll = collectors(dag_to_circuit(dag))[-1]
-        self.assertIn(("gates", 1), right_coll[0].items)
-        self.assertEqual(gate_names(right_coll[1]), ["h"])
-
-    def test_gates_counts_account_for_exactly_the_body(self):
-        # The invariant that keeps items and bodies in step. A merge that concatenated one but not the
-        # other would show up here rather than as a wrong answer much later.
-        circuit = QuantumCircuit(4)
-        with circuit.box([Twirl(), ChangeBasis("b", placement="start")]):
-            circuit.h(0)
-            circuit.s(2)
-            circuit.cx(0, 1)
-            circuit.cx(2, 3)
-        with circuit.box([Twirl(dressing="right"), InjectNoise("n", "after")]):
-            circuit.cx(0, 1)
-            circuit.s(0)
-        lowered, _ = lower(circuit)
-
-        for annotation, body, _ in collectors(lowered):
-            counted = sum(n for kind, n in annotation.items if kind == "gates")
-            self.assertEqual(counted, len(body.data), f"{annotation!r} vs {gate_names(body)}")
+        self.assertEqual(real_gates(right_coll[1]), ["h"])
+        self.assertTrue(body_locals(right_coll[1]))
 
     def test_inject_local_clifford_resolves_to_a_basis_change(self):
         circuit = QuantumCircuit(1)
@@ -392,10 +382,10 @@ class TestEasyHardSplit(QiskitTestCase):
         lowered, _ = lower_absorbed(circuit)
 
         left, right = collectors(lowered)
-        self.assertEqual(gate_names(left[1]), ["h"])
-        self.assertEqual(gate_names(right[1]), [])
+        self.assertEqual(real_gates(left[1]), ["h"])
+        self.assertEqual(real_gates(right[1]), [])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(hard_gates(hard), ["cx"])
+        self.assertEqual(real_gates(hard), ["cx"])
 
     def test_right_dressing_absorbs_from_the_right(self):
         circuit = QuantumCircuit(2)
@@ -406,11 +396,11 @@ class TestEasyHardSplit(QiskitTestCase):
         lowered, _ = lower_absorbed(circuit)
 
         left, right = collectors(lowered)
-        self.assertEqual(gate_names(left[1]), [])
+        self.assertEqual(real_gates(left[1]), [])
         # absorbed gates keep circuit order even though the sweep runs backwards
-        self.assertEqual(gate_names(right[1]), ["s", "h"])
+        self.assertEqual(real_gates(right[1]), ["s", "h"])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(hard_gates(hard), ["cx"])
+        self.assertEqual(real_gates(hard), ["cx"])
 
     def test_emissions_sit_on_the_dressing_edge(self):
         # Placement is load-bearing: the factor the easy gates absorb must reach its collector
@@ -445,9 +435,9 @@ class TestPerQubitAbsorption(QiskitTestCase):
 
         left, _ = collectors(lowered)
         # q2 is untouched by the cx, so h(2) is at the dressing edge on its own wire
-        self.assertEqual(gate_names(left[1]), ["h"])
+        self.assertEqual(real_gates(left[1]), ["h"])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(hard_gates(hard), ["cx"])
+        self.assertEqual(real_gates(hard), ["cx"])
 
     def test_a_run_on_a_clean_wire_is_absorbed(self):
         circuit = QuantumCircuit(3)
@@ -456,7 +446,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
             circuit.h(2)
             circuit.s(2)
         lowered, _ = lower_absorbed(circuit)
-        self.assertEqual(gate_names(collectors(lowered)[0][1]), ["h", "s"])
+        self.assertEqual(real_gates(collectors(lowered)[0][1]), ["h", "s"])
 
     def test_a_poisoned_wire_is_left_alone(self):
         # h(0) really is behind the cx on its own wire, so it cannot be commuted out.
@@ -466,9 +456,9 @@ class TestPerQubitAbsorption(QiskitTestCase):
             circuit.h(0)
         lowered, _ = lower_absorbed(circuit)
 
-        self.assertEqual(gate_names(collectors(lowered)[0][1]), [])
+        self.assertEqual(real_gates(collectors(lowered)[0][1]), [])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(hard_gates(hard), ["cx", "h"])
+        self.assertEqual(real_gates(hard), ["cx", "h"])
 
     def test_poison_spreads_transitively(self):
         # q2 is clean until cx(1,2), which is itself poisoned by cx(0,1) — so s(2) is content. This is
@@ -480,9 +470,9 @@ class TestPerQubitAbsorption(QiskitTestCase):
             circuit.s(2)
         lowered, _ = lower_absorbed(circuit)
 
-        self.assertEqual(gate_names(collectors(lowered)[0][1]), [])
+        self.assertEqual(real_gates(collectors(lowered)[0][1]), [])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(hard_gates(hard), ["cx", "cx", "s"])
+        self.assertEqual(real_gates(hard), ["cx", "cx", "s"])
 
     def test_right_dressing_sweeps_from_the_other_end(self):
         circuit = QuantumCircuit(3)
@@ -492,11 +482,11 @@ class TestPerQubitAbsorption(QiskitTestCase):
         lowered, _ = lower_absorbed(circuit)
 
         left, right = collectors(lowered)
-        self.assertEqual(gate_names(left[1]), [])
+        self.assertEqual(real_gates(left[1]), [])
         # absorbed into the right collector, which is where a right dressing sits
-        self.assertEqual(gate_names(right[1]), ["h"])
+        self.assertEqual(real_gates(right[1]), ["h"])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(hard_gates(hard), ["cx"])
+        self.assertEqual(real_gates(hard), ["cx"])
 
     def test_a_fully_absorbed_box_has_no_hard_box(self):
         # An empty box carries no information once propagation is derived from placement.
@@ -507,7 +497,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
         lowered, _ = lower_absorbed(circuit)
 
         self.assertEqual(hard_boxes(lowered), [])
-        self.assertEqual([gate_names(b) for _, b, _ in collectors(lowered)], [["h", "s"], []])
+        self.assertEqual([real_gates(b) for _, b, _ in collectors(lowered)], [["h", "s"], []])
 
     def test_a_nested_box_is_split_the_same_way(self):
         circuit = QuantumCircuit(3)
@@ -518,8 +508,8 @@ class TestPerQubitAbsorption(QiskitTestCase):
         lowered, _ = lower_absorbed(circuit)
 
         (outer_hard,) = hard_boxes(lowered)
-        self.assertEqual([gate_names(b) for _, b, _ in collectors(outer_hard)], [["h"], []])
-        self.assertEqual([hard_gates(b) for b in hard_boxes(outer_hard)], [["cx"]])
+        self.assertEqual([real_gates(b) for _, b, _ in collectors(outer_hard)], [["h"], []])
+        self.assertEqual([real_gates(b) for b in hard_boxes(outer_hard)], [["cx"]])
 
     def test_no_gate_is_lost_or_duplicated(self):
         circuit = QuantumCircuit(3)
@@ -530,8 +520,8 @@ class TestPerQubitAbsorption(QiskitTestCase):
             circuit.cx(1, 2)
         lowered, _ = lower_absorbed(circuit)
 
-        names = [n for _, body, _ in collectors(lowered) for n in gate_names(body)]
-        names += [n for body in hard_boxes(lowered) for n in hard_gates(body)]
+        names = [n for _, body, _ in collectors(lowered) for n in real_gates(body)]
+        names += [n for body in hard_boxes(lowered) for n in real_gates(body)]
         self.assertEqual(sorted(names), ["cx", "cx", "h", "s"])
 
     def test_an_absorbed_gate_keeps_its_qubit(self):
@@ -543,7 +533,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
 
         _, body, qubits = collectors(lowered)[0]
         self.assertEqual(qubits, [0, 1, 2])
-        (gate,) = body.data
+        (gate,) = [i for i in body.data if not i.operation.name.startswith("samplex_emit")]
         self.assertEqual(gate.operation.name, "h")
         self.assertEqual([body.find_bit(b).index for b in gate.qubits], [2])
 
@@ -559,7 +549,7 @@ class TestFidelity(QiskitTestCase):
         lowered, _ = lower_absorbed(circuit)
 
         left, _ = collectors(lowered)
-        (rz,) = left[1].data
+        (rz,) = [i for i in left[1].data if not i.operation.name.startswith("samplex_emit")]
         self.assertEqual(rz.operation.name, "rz")
         self.assertEqual(rz.operation.params, [theta])
 
@@ -600,7 +590,7 @@ class TestFidelity(QiskitTestCase):
             runs.append(
                 (
                     gate_names(lowered),
-                    [(c.synthesizer, tuple(c.items)) for c, _, _ in collectors(lowered)],
+                    [(c.synthesizer, tuple(gate_names(b))) for c, b, _ in collectors(lowered)],
                     [tuple(q) for _, _, q in collectors(lowered)],
                     [(e.direction, tuple(e.qubits)) for e in emissions(lowered)],
                     table.entries(),
@@ -638,10 +628,10 @@ class TestNesting(QiskitTestCase):
 
         (outer_hard,) = hard_boxes(lowered)
         inner_left, inner_right = collectors(outer_hard)
-        self.assertEqual(gate_names(inner_left[1]), ["h"])
-        self.assertEqual(gate_names(inner_right[1]), [])
+        self.assertEqual(real_gates(inner_left[1]), ["h"])
+        self.assertEqual(real_gates(inner_right[1]), [])
         (inner_hard,) = hard_boxes(outer_hard)
-        self.assertEqual(hard_gates(inner_hard), ["cx"])
+        self.assertEqual(real_gates(inner_hard), ["cx"])
 
     def test_outermost_box_still_absorbs(self):
         circuit = QuantumCircuit(2)
@@ -652,7 +642,7 @@ class TestNesting(QiskitTestCase):
         lowered, _ = lower_absorbed(circuit)
 
         left, _ = collectors(lowered)
-        self.assertEqual(gate_names(left[1]), ["h"])
+        self.assertEqual(real_gates(left[1]), ["h"])
 
     def test_nested_change_basis_only_box(self):
         circuit = QuantumCircuit(2)
@@ -672,7 +662,7 @@ class TestNesting(QiskitTestCase):
         lowered, _ = lower(circuit)
 
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(hard_gates(hard), ["cx"])
+        self.assertEqual(real_gates(hard), ["cx"])
 
 
 class TestRejections(QiskitTestCase):
@@ -760,4 +750,4 @@ class TestPropagatingEmissionPlacement(QiskitTestCase):
         left, _ = collectors(lowered)
         self.assertEqual(gate_names(left[1]), [])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(hard_gates(hard), ["s", "cx"])
+        self.assertEqual(real_gates(hard), ["s", "cx"])

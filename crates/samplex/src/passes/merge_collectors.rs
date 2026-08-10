@@ -60,7 +60,7 @@ use qiskit_circuit::{Clbit, Qubit};
 
 use super::utils::{IntoPyResult, collect_annotation, new_dag_body, params_of};
 use crate::annotated_circuit::SynthesizerType;
-use crate::emission_circuit::{Collect, CollectItem, CollectPart, CollectSpec};
+use crate::emission_circuit::{Collect, CollectPart, CollectSpec};
 use crate::partition::Partition;
 
 /// Collectors that will fuse into one, and the state deciding what else may join them.
@@ -84,10 +84,6 @@ struct Group {
     /// Every annotated box whose emissions the contracted collector may consume — the union over the
     /// members, since a merged collector answers for all of their boxes.
     owned: Vec<u32>,
-    /// Composition order, one contribution's run after another. A run's `Gates` counts refer to that
-    /// contribution's body, and [`merged_body`] concatenates bodies in the same order, so counts stay
-    /// valid without any offsetting — which is the whole reason they are counts.
-    items: Vec<CollectItem>,
 }
 
 impl Group {
@@ -130,10 +126,10 @@ fn merge_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
             match find_mergeable(&groups, &qubits, spec.synthesizer()) {
                 // Fuse into the open group: it keeps its position, and gains this collector's
                 // emissions, absorbed gates and qubits. Nothing is released — a merged contribution
-                // has no position of its own to get in anything's way. Items and bodies both append,
-                // and in the same order, so the two stay in step. The resulting sequence is right:
-                // A's outermost element ends up adjacent to B's outermost, which is how the two
-                // layers meet in circuit order.
+                // has no position of its own to get in anything's way. Bodies append in the same
+                // order the collectors were encountered, so the concatenated body's composition
+                // order is right: A's outermost element ends up adjacent to B's outermost, which is
+                // how the two layers meet in circuit order.
                 Some(index) => join(&mut groups[index], node, &spec, &qubits),
                 None => {
                     // Nothing compatible is open on these qubits, so this collector gets a position
@@ -147,7 +143,6 @@ fn merge_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
                         partition: spec.partition.clone(),
                         parts: spec.parts.clone(),
                         owned: spec.owned.clone(),
-                        items: spec.items.clone(),
                     });
                 }
             }
@@ -212,7 +207,6 @@ fn find_mergeable(
 /// Add a collector's contribution to an open group.
 fn join(group: &mut Group, node: NodeIndex, spec: &CollectSpec, qubits: &[Qubit]) {
     group.members.push(node);
-    group.items.extend_from_slice(&spec.items);
     group.span.extend(qubits.iter().copied());
     // The contracted collector stands in for both boxes, so it may consume either one's emissions.
     // Sorted and deduplicated, so the set does not depend on the order members were visited in.
@@ -295,15 +289,26 @@ fn merged_clbits(dag: &DAGCircuit, group: &Group) -> Vec<Clbit> {
 
 /// Concatenate the members' bodies into one, remapped from each member's frame into the merged frame.
 ///
-/// Members are visited in composition order, the same order their items were concatenated in, so the
-/// `Gates` counts keep pointing at the right instructions.
+/// Members are visited in composition order, so the concatenated body's own composition order —
+/// gates and local emissions alike — matches theirs.
 fn merged_body(
     dag: &DAGCircuit,
     group: &Group,
     frame: &[Qubit],
     num_clbits: usize,
 ) -> PyResult<DAGCircuit> {
-    let mut body = new_dag_body(frame.len(), num_clbits, group.items.len())?.into_builder();
+    let capacity: usize = group
+        .members
+        .iter()
+        .map(|node| {
+            let inst = dag.dag()[*node].unwrap_operation();
+            match *inst.blocks_view() {
+                [block] => dag.blocks()[block].op_nodes(true).count(),
+                _ => 0,
+            }
+        })
+        .sum();
+    let mut body = new_dag_body(frame.len(), num_clbits, capacity)?.into_builder();
 
     for node in &group.members {
         let inst = dag.dag()[*node].unwrap_operation();
@@ -314,10 +319,10 @@ fn merged_body(
         };
         let contribution = &dag.blocks()[block];
 
-        // In written order, not topological order: a collector body is a *sequence*, since the items'
-        // `Gates` counts index into it, and a topological read of a body of single-qubit gates would
-        // group them by wire instead. A body is built once and never edited, so its node indices are
-        // in the order they were appended.
+        // In written order, not topological order: a collector body is a *sequence*, and a
+        // topological read of a body of single-qubit gates and barrier-like local emissions would
+        // group disjoint-qubit nodes arbitrarily. A body is built once and never edited, so its node
+        // indices are already in the order they were appended.
         for (_, gate) in contribution.op_nodes(true) {
             let qargs: Vec<Qubit> = contribution
                 .qargs_interner()
@@ -347,7 +352,6 @@ fn merged_op(
     num_clbits: usize,
 ) -> PyResult<PackedOperation> {
     let spec = CollectSpec {
-        items: group.items.clone(),
         owned: group.owned.clone(),
         partition: group.partition.clone(),
         parts: group.parts.clone(),
