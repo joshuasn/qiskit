@@ -17,9 +17,16 @@
 //! it reaches:
 //!
 //! - A single-qubit standard gate → part of a `CollectItem::Gates` run
-//! - An emission facing this collector → a `CollectItem::Emission`
-//! - Anything else (propagating emission, multi-qubit gate, box, another collector) → that wire is
-//!   done, and only that wire
+//! - An emission of a box this collector owns, facing it → a `CollectItem::Emission`
+//! - Anything else (a foreign emission, a propagating one, a multi-qubit gate, a box, another
+//!   collector) → that wire is done, and only that wire
+//!
+//! **Ownership, not adjacency, decides what belongs to a collector.** An emission propagating out of an
+//! enclosing box passes the collectors of every box nested inside it, and those collectors face it.
+//! Taking one there would compose it as a local value and drop every conjugation it was owed — leaving
+//! the enclosing randomization applied and immediately undone, with none of its content in between. The
+//! circuit still evaluates to the same unitary, so nothing downstream complains; the randomization is
+//! simply gone. `EmitSpec::box_id` against `CollectSpec::owned` is what rules that out.
 //!
 //! **Absorption is per wire.** A collector reaches along each of its own qubits independently, so an
 //! entangler on q0 stops the walk on q0 and q1 without saying anything about q2. The wire is also
@@ -33,8 +40,10 @@
 //! would put a gate from the far side of it into the near run.
 //!
 //! The walk's order IS the composition order, so no `EmitSource`-based classification is needed.
-//! Cross-scope absorption — an emission whose collector is inside an adjacent box — is handled by
-//! injecting it at that box's near edge and letting the recursive descent absorb it there.
+//!
+//! **Nothing is moved between scopes.** A propagating emission is written inside the hard box it has to
+//! cross when the box is built, so it already sits where its walk has to start from; this pass only ever
+//! takes things over where it finds them.
 
 use hashbrown::{HashMap, HashSet};
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
@@ -50,7 +59,7 @@ use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use super::utils::{
     IntoPyResult, collect_annotation, emission_spec, new_dag_body, next_on_wire, params_of,
 };
-use crate::emission_circuit::{Collect, CollectItem, CollectSpec, EmitSpec, LocalEmission};
+use crate::emission_circuit::{Collect, CollectItem, CollectSpec, LocalEmission};
 use crate::virtual_flow_graph::Direction;
 
 /// Absorb dressing into every collector, in place.
@@ -92,9 +101,6 @@ fn absorb_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
         .iter()
         .flat_map(|plan| plan.consumed.iter().copied())
         .collect();
-    let claimed: HashSet<NodeIndex> = consumed.iter().copied().collect();
-    let descents = plan_descents(py, dag, &claimed);
-
     for plan in &plans {
         let body = build_body(dag, plan)?;
         let op = collect_op(py, dag, plan)?;
@@ -109,15 +115,6 @@ fn absorb_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
     }
     for node in &consumed {
         dag.remove_op_node(*node);
-    }
-
-    // An emission that descends moves out of this scope and into the box's body, where the recursion
-    // below finds it at the near edge and absorbs it like any local one.
-    for (box_node, injections) in &descents {
-        inject(dag, *box_node, injections)?;
-        for (node, _) in injections {
-            dag.remove_op_node(*node);
-        }
     }
 
     // Recurse into every box that is not itself a collector — a collector's body holds only the
@@ -173,10 +170,26 @@ fn plan_absorptions(py: Python, dag: &DAGCircuit) -> Vec<Absorption> {
 
         // Walking leftward visits the outermost content last, so both lists come back reversed.
         // Reversing the gates too keeps each run's body order matching its count.
-        let mut left = walk_absorb(py, dag, collector, Direction::Left, &qubits, &claimed);
+        let mut left = walk_absorb(
+            py,
+            dag,
+            collector,
+            Direction::Left,
+            &qubits,
+            &spec.owned,
+            &claimed,
+        );
         left.items.reverse();
         left.gates.reverse();
-        let right = walk_absorb(py, dag, collector, Direction::Right, &qubits, &claimed);
+        let right = walk_absorb(
+            py,
+            dag,
+            collector,
+            Direction::Right,
+            &qubits,
+            &spec.owned,
+            &claimed,
+        );
 
         let mut items = left.items;
         items.extend(right.items);
@@ -216,6 +229,7 @@ fn walk_absorb(
     collector: NodeIndex,
     direction: Direction,
     qubits: &[Qubit],
+    owned: &[u32],
     claimed: &HashSet<NodeIndex>,
 ) -> Walk {
     // The direction an emission must have to face this collector.
@@ -247,13 +261,20 @@ fn walk_absorb(
             }
         }
 
-        // Take one emission layer: an emission that faces this collector and is adjacent on every one
-        // of its wires. Requiring every wire also confines it to the collector's own qubits, since a
-        // wire outside them has no cursor to be adjacent on.
+        // Take one emission layer: an emission this collector owns, that faces it, and that is
+        // adjacent on every one of its wires. Requiring every wire also confines it to the collector's
+        // own qubits, since a wire outside them has no cursor to be adjacent on.
         let layer = qubits.iter().find_map(|qubit| {
             let node = adjacent(dag, &cursor, *qubit, direction, claimed)?;
             let inst = dag.dag()[node].unwrap_operation();
             let spec = emission_spec(py, inst)?;
+            // Facing is not enough. An emission propagating out of an *enclosing* box faces the
+            // collectors it passes on the way to its own, and absorbing it here would compose it as a
+            // local value — dropping every conjugation it was owed. Only its own box's collectors may
+            // take it; for everyone else it is a barrier, which is what returning `None` makes it.
+            if !owned.contains(&spec.box_id) {
+                return None;
+            }
             if spec.direction != facing {
                 return None;
             }
@@ -333,6 +354,8 @@ fn collect_op(py: Python, dag: &DAGCircuit, plan: &Absorption) -> PyResult<Packe
     let inst = dag.dag()[plan.collector].unwrap_operation();
     let spec = CollectSpec {
         items: plan.items.clone(),
+        // Absorption does not change which boxes a collector answers for — only what it composes.
+        owned: plan.spec.owned.clone(),
         partition: plan.spec.partition.clone(),
         parts: plan.spec.parts.clone(),
     };
@@ -352,177 +375,4 @@ fn collect_op(py: Python, dag: &DAGCircuit, plan: &Absorption) -> PyResult<Packe
             num_clbits: dag.cargs_interner().get(inst.clbits).len() as u32,
         },
     )))
-}
-
-// --- Cross-scope absorption ---------------------------------------------------------------------
-
-/// An emission moving into a box, and the direction it was travelling.
-type Injection = (NodeIndex, Direction);
-
-/// Find the emissions no collector in this scope absorbed that can descend into an adjacent box.
-fn plan_descents(
-    py: Python,
-    dag: &DAGCircuit,
-    claimed: &HashSet<NodeIndex>,
-) -> Vec<(NodeIndex, Vec<Injection>)> {
-    let mut descents: Vec<(NodeIndex, Vec<Injection>)> = Vec::new();
-    for node in dag.topological_op_nodes(false) {
-        if claimed.contains(&node) {
-            continue;
-        }
-        let Some(spec) = emission_spec(py, dag.dag()[node].unwrap_operation()) else {
-            continue;
-        };
-        let Some(target) = descent_target(py, dag, node, spec.direction) else {
-            continue;
-        };
-        match descents
-            .iter_mut()
-            .find(|(box_node, _)| *box_node == target)
-        {
-            Some((_, injections)) => injections.push((node, spec.direction)),
-            None => descents.push((target, vec![(node, spec.direction)])),
-        }
-    }
-    descents
-}
-
-/// The box this emission descends into, if any.
-///
-/// Scanning is along the emission's own wires, and unlike the absorption walk it passes *through*
-/// what it meets: a propagating emission crosses gates and other emissions by definition, including
-/// ones a collector has already claimed. Only two things end the scan — a collector at this level,
-/// meaning the emission belongs here rather than deeper, and a box, which it either enters or does
-/// not.
-fn descent_target(
-    py: Python,
-    dag: &DAGCircuit,
-    start: NodeIndex,
-    direction: Direction,
-) -> Option<NodeIndex> {
-    let inst = dag.dag()[start].unwrap_operation();
-    let spec = emission_spec(py, inst)?;
-    let qubits: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();
-    let mut cursor: HashMap<Qubit, NodeIndex> =
-        qubits.iter().map(|qubit| (*qubit, start)).collect();
-
-    loop {
-        // Advance whichever wire still has something on it; a wire that has run out just stops
-        // contributing, and when none is left the emission has nowhere to descend to.
-        let advance = qubits
-            .iter()
-            .find_map(|qubit| next_on_wire(dag, *cursor.get(qubit)?, *qubit, direction))?;
-        let inst = dag.dag()[advance].unwrap_operation();
-        if collect_annotation(py, inst).is_some() {
-            return None;
-        }
-        if is_box(inst) {
-            let [block] = *inst.blocks_view() else {
-                return None;
-            };
-            let covered = dag.qargs_interner().get(inst.qubits);
-            if !qubits.iter().all(|q| covered.contains(q)) {
-                // The box does not span the emission, so there is no frame to inject it into.
-                return None;
-            }
-            let body = dag.blocks().get(block)?;
-            return has_compatible_collector_at_edge(py, body, direction, &spec).then_some(advance);
-        }
-        for wire in dag.qargs_interner().get(inst.qubits) {
-            if cursor.contains_key(wire) {
-                cursor.insert(*wire, advance);
-            }
-        }
-    }
-}
-
-/// Whether a box body has a collector at its near edge that accepts this emission.
-///
-/// "Near edge" is the side the emission enters from: travelling right it enters at the body's left,
-/// so the first thing on each wire; travelling left, the last. Emissions already at that edge do not
-/// block it, and a nested box is descended into.
-fn has_compatible_collector_at_edge(
-    py: Python,
-    body: &DAGCircuit,
-    direction: Direction,
-    spec: &EmitSpec,
-) -> bool {
-    for node in body.topological_op_nodes(matches!(direction, Direction::Left)) {
-        let inst = body.dag()[node].unwrap_operation();
-        if emission_spec(py, inst).is_some() {
-            continue;
-        }
-        if let Some(collector) = collect_annotation(py, inst) {
-            return collector.accepts(spec.virtual_type());
-        }
-        if is_box(inst) {
-            return match inst.blocks_view() {
-                [block] => body.blocks().get(*block).is_some_and(|inner| {
-                    has_compatible_collector_at_edge(py, inner, direction, spec)
-                }),
-                _ => false,
-            };
-        }
-        return false;
-    }
-    false
-}
-
-/// Write descending emissions into a box's body at the edge they enter from.
-fn inject(dag: &mut DAGCircuit, box_node: NodeIndex, injections: &[Injection]) -> PyResult<()> {
-    let inst = dag.dag()[box_node].unwrap_operation();
-    let covered: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();
-    let [block] = *inst.blocks_view() else {
-        return Ok(());
-    };
-
-    // Each emission's operation and its qubits in the body's frame, resolved before the body is
-    // borrowed mutably.
-    let mut ops: Vec<(PackedOperation, Vec<Qubit>, Direction)> = Vec::new();
-    for (node, direction) in injections {
-        let emit = dag.dag()[*node].unwrap_operation();
-        let qargs: Vec<Qubit> = dag
-            .qargs_interner()
-            .get(emit.qubits)
-            .iter()
-            .map(|wire| {
-                // `descent_target` refuses a box that does not span the emission.
-                let local = covered
-                    .iter()
-                    .position(|q| q == wire)
-                    .expect("a descending emission lies within its box");
-                Qubit(local as u32)
-            })
-            .collect();
-        ops.push((emit.op.clone(), qargs, *direction));
-    }
-
-    let body = dag.view_block_mut(block);
-    // An emission travelling right enters at the body's left edge, so it goes to the front — in
-    // reverse, so that the first of several ends up outermost.
-    for (op, qargs, _) in ops.iter().filter(|(_, _, d)| *d == Direction::Right).rev() {
-        body.apply_operation_front(
-            op.clone(),
-            qargs,
-            &[],
-            None,
-            None,
-            #[cfg(feature = "cache_pygates")]
-            None,
-        )
-        .into_py_result()?;
-    }
-    for (op, qargs, _) in ops.iter().filter(|(_, _, d)| *d == Direction::Left) {
-        body.apply_operation_back(
-            op.clone(),
-            qargs,
-            &[],
-            None,
-            None,
-            #[cfg(feature = "cache_pygates")]
-            None,
-        )
-        .into_py_result()?;
-    }
-    Ok(())
 }

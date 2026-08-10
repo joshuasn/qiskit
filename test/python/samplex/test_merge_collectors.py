@@ -29,7 +29,13 @@ from qiskit._accelerate.samplex import (
 )
 
 from test import QiskitTestCase
-from test.python.samplex.test_build import collectors, emissions, gate_names, hard_boxes
+from test.python.samplex.test_build import (
+    collectors,
+    emissions,
+    gate_names,
+    hard_boxes,
+    hard_gates,
+)
 
 
 def build(circuit):
@@ -159,7 +165,6 @@ class TestSharedMiddleCollector(QiskitTestCase):
             [(i.operation.name, [body.find_bit(b).index for b in i.qubits]) for i in body.data],
             [("s", [0]), ("h", [3])],
         )
-
 
     def test_a_merged_collector_holds_one_run_per_contribution(self):
         # Items and bodies both append, in the same order, so the counts stay valid without any
@@ -314,7 +319,7 @@ class TestPreservation(QiskitTestCase):
         with circuit.box([Twirl()]):
             circuit.cx(1, 0)
         out, _ = merged(circuit)
-        self.assertEqual([gate_names(h) for h in hard_boxes(out)], [["cx"], ["cx"]])
+        self.assertEqual([hard_gates(h) for h in hard_boxes(out)], [["cx"], ["cx"]])
 
     def test_merge_is_deterministic(self):
         runs = []
@@ -338,8 +343,40 @@ class TestPreservation(QiskitTestCase):
 
         def shape(dag):
             circuit = dag_to_circuit(dag)
-            return [
-                (c.synthesizer, tuple(c.items), tuple(q)) for c, _, q in collectors(circuit)
-            ]
+            return [(c.synthesizer, tuple(c.items), tuple(q)) for c, _, q in collectors(circuit)]
 
         self.assertEqual(shape(once), shape(twice))
+
+
+class TestOwnership(QiskitTestCase):
+    """A merged collector answers for every box that contributed to it."""
+
+    def test_a_shared_middle_collector_owns_both_boxes(self):
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl()]):
+            circuit.cx(0, 1)
+        with circuit.box([Twirl()]):
+            circuit.cx(0, 1)
+        out, _ = merged(circuit)
+
+        owners = [list(annotation.owned) for annotation, _, _ in collectors(out)]
+        # Three collectors for two boxes: the middle one is shared, so it may take either box's
+        # emissions. Anything narrower would leave one of them unable to be collected.
+        self.assertEqual(len(owners), 3)
+        self.assertEqual([len(o) for o in owners], [1, 2, 1])
+        self.assertEqual(owners[1], sorted(set(owners[0] + owners[2])))
+
+    def test_merging_order_does_not_change_the_owned_set(self):
+        """Sorted and deduplicated, so two runs produce identical IR2."""
+        circuit = QuantumCircuit(4)
+        with circuit.box([Twirl()]):
+            circuit.cx(0, 1)
+        with circuit.box([Twirl()]):
+            circuit.cx(1, 2)
+        with circuit.box([Twirl()]):
+            circuit.cx(2, 3)
+        runs = [[tuple(a.owned) for a, _, _ in collectors(merged(circuit)[0])] for _ in range(3)]
+        self.assertEqual(runs[0], runs[1])
+        self.assertEqual(runs[0], runs[2])
+        for owned in runs[0]:
+            self.assertEqual(list(owned), sorted(set(owned)))

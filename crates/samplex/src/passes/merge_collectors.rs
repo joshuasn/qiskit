@@ -81,6 +81,9 @@ struct Group {
     /// Per-part descriptors accumulated from merged contributions.
     partition: Partition,
     parts: Vec<CollectPart>,
+    /// Every annotated box whose emissions the contracted collector may consume — the union over the
+    /// members, since a merged collector answers for all of their boxes.
+    owned: Vec<u32>,
     /// Composition order, one contribution's run after another. A run's `Gates` counts refer to that
     /// contribution's body, and [`merged_body`] concatenates bodies in the same order, so counts stay
     /// valid without any offsetting — which is the whole reason they are counts.
@@ -143,6 +146,7 @@ fn merge_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
                         span: qubits.iter().copied().collect(),
                         partition: spec.partition.clone(),
                         parts: spec.parts.clone(),
+                        owned: spec.owned.clone(),
                         items: spec.items.clone(),
                     });
                 }
@@ -210,6 +214,11 @@ fn join(group: &mut Group, node: NodeIndex, spec: &CollectSpec, qubits: &[Qubit]
     group.members.push(node);
     group.items.extend_from_slice(&spec.items);
     group.span.extend(qubits.iter().copied());
+    // The contracted collector stands in for both boxes, so it may consume either one's emissions.
+    // Sorted and deduplicated, so the set does not depend on the order members were visited in.
+    group.owned.extend_from_slice(&spec.owned);
+    group.owned.sort_unstable();
+    group.owned.dedup();
     // Widen the partition to cover both collectors' qubits.
     group.partition = Partition::union(&[&group.partition, &spec.partition])
         .unwrap_or_else(|_| spec.partition.clone());
@@ -339,6 +348,7 @@ fn merged_op(
 ) -> PyResult<PackedOperation> {
     let spec = CollectSpec {
         items: group.items.clone(),
+        owned: group.owned.clone(),
         partition: group.partition.clone(),
         parts: group.parts.clone(),
     };

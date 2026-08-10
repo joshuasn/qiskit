@@ -232,9 +232,7 @@ class TestOtherEmissionKinds(QiskitTestCase):
         # After absorption, basis changes and noise injections are local — they become steps on
         # their collector rather than independent VFG nodes.
         circuit = QuantumCircuit(2)
-        with circuit.box(
-            [Twirl(), ChangeBasis("b0", placement="start"), InjectNoise("n0", "after")]
-        ):
+        with circuit.box([Twirl(), ChangeBasis("b0", placement="start"), InjectNoise("n0", "after")]):
             circuit.cx(0, 1)
         graph = graph_of(circuit)
 
@@ -250,9 +248,7 @@ class TestOtherEmissionKinds(QiskitTestCase):
             for placement in ("start", "end"):
                 with self.subTest(dressing=dressing, placement=placement):
                     circuit = QuantumCircuit(2)
-                    with circuit.box(
-                        [Twirl(dressing=dressing), ChangeBasis("b", placement=placement)]
-                    ):
+                    with circuit.box([Twirl(dressing=dressing), ChangeBasis("b", placement=placement)]):
                         circuit.cx(0, 1)
                     graph = graph_of(circuit)
 
@@ -325,18 +321,14 @@ class TestUnoptimisedIsStillValid(QiskitTestCase):
         graph = graph_of(circuit, optimize=False)
         self.assertEqual(len(of_kind(graph, "emit:")), 4)
         sources = {a for a, _, _ in graph.edges()}
-        emit_positions = {
-            i for i, node in enumerate(graph.nodes()) if node[0].startswith("emit:")
-        }
+        emit_positions = {i for i, node in enumerate(graph.nodes()) if node[0].startswith("emit:")}
         self.assertTrue(emit_positions <= sources)
 
         # Optimized (with absorption): only incoming (far) halves remain as VFG nodes
         graph = graph_of(circuit, optimize=True)
         self.assertEqual(len(of_kind(graph, "emit:")), 2)
         sources = {a for a, _, _ in graph.edges()}
-        emit_positions = {
-            i for i, node in enumerate(graph.nodes()) if node[0].startswith("emit:")
-        }
+        emit_positions = {i for i, node in enumerate(graph.nodes()) if node[0].startswith("emit:")}
         self.assertTrue(emit_positions <= sources)
 
     def test_optimizing_shrinks_the_graph(self):
@@ -410,3 +402,63 @@ class TestVirtualTypePreservation(QiskitTestCase):
             circuit.rz(0.3, 0)
         graph = graph_of(circuit)
         self.assertEqual(gates(of_kind(graph, "collect:")[0]), [("rz", [0])])
+
+
+class TestNestedPropagation(QiskitTestCase):
+    """An enclosing emission is conjugated by the *whole* of its box's content, nested boxes included.
+
+    The asymmetry to keep straight: a box's own emissions split its body — easy gates multiply into the
+    near factor, hard gates propagate the far one — while an *enclosing* emission treats all of it as one
+    unit, because every part of the inner box sits inside the outer twirl point.
+
+    This is what ownership buys. Nearest-collector-wins routes the outer far half into the first nested
+    collector it passes, which composes it with no conjugation at all: the outer randomization is applied
+    and immediately undone with none of its content in between. The unitary is unchanged, so only the
+    randomization is lost — which is why it needs asserting directly rather than via a round trip.
+    """
+
+    def circuit(self):
+        """Left-dressed outer box over a left-dressed inner box plus a gate of its own."""
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl(dressing="left")]):
+            with circuit.box([Twirl(dressing="left")]):
+                circuit.cx(0, 1)  # inner content
+            circuit.cx(1, 0)  # outer content, after the nested box
+        return circuit
+
+    def test_both_far_halves_reach_a_collector(self):
+        graph = graph_of(self.circuit())
+
+        # One emission per box: each box's near half is a local table read on its own collector, so
+        # only the far halves become nodes.
+        self.assertEqual(len(of_kind(graph, "emit:")), 2)
+        # Two conjugations: the inner content, and the outer box's own gate. Before ownership the outer
+        # far half never travelled, so only one existed.
+        self.assertEqual(len(of_kind(graph, "propagate:")), 2)
+
+    def test_the_outer_box_right_collector_receives_a_value(self):
+        graph = graph_of(self.circuit())
+        nodes = graph.nodes()
+        collectors = [i for i, node in enumerate(nodes) if node[0].startswith("collect:")]
+        # Circuit order, so the last collector is the outer box's right-hand one.
+        outer_right = collectors[-1]
+
+        incoming = [(a, b) for a, b, _ in graph.edges() if b == outer_right]
+        self.assertTrue(
+            incoming,
+            "the outer box's right collector has nothing to synthesize: its far half was consumed "
+            "somewhere else, so the outer twirl randomizes nothing",
+        )
+        # What reaches it is a conjugation, not the raw emission — the far half crossed content.
+        self.assertTrue(all(nodes[a][0].startswith("propagate:") for a, _ in incoming))
+
+    def test_an_unnested_box_is_unchanged(self):
+        """The common case keeps exactly one conjugation per hard gate."""
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl(dressing="left")]):
+            circuit.cx(0, 1)
+        graph = graph_of(circuit)
+
+        self.assertEqual(len(of_kind(graph, "emit:")), 1)
+        self.assertEqual(len(of_kind(graph, "propagate:")), 1)
+        self.assertEqual(len(of_kind(graph, "collect:")), 2)

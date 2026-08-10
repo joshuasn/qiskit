@@ -99,6 +99,18 @@ pub struct EmitPart {
 /// The payload of an [`Emit`] instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmitSpec {
+    /// Which annotated box this emission came from.
+    ///
+    /// The collector that consumes it is one of *that box's* collectors, and no other. Adjacency
+    /// cannot express this: an emission propagating through a nested box passes a collector that
+    /// faces it, and without an owner to check against, that collector absorbs it as a local value
+    /// and the conjugation it was owed silently never happens.
+    ///
+    /// This is **not** the emission id that earlier designs used and dropped. That was a handle on a
+    /// graph node, invalidated by `merge_parallel_nodes` and `prune`; this names a *box*, is a
+    /// build-time constant, and nothing downstream can invalidate it. See
+    /// [`CollectSpec::owned`](CollectSpec::owned).
+    pub box_id: u32,
     /// Which annotation this emission stands in for.
     pub source: EmitSource,
     /// Which way the emitted virtual state flows.
@@ -160,7 +172,8 @@ impl Emit {
     /// The lowering builds these in Rust; this constructor exists so the instruction can be
     /// exercised from Python and from tests without running a full lowering.
     #[new]
-    #[pyo3(signature = (subsystems, source="twirl", distribution_key=0, direction="left", virtual_type="pauli", draw_start=0, adjoint=false))]
+    #[pyo3(signature = (subsystems, source="twirl", distribution_key=0, direction="left", virtual_type="pauli", draw_start=0, adjoint=false, box_id=0))]
+    #[allow(clippy::too_many_arguments)]
     fn py_new(
         py: Python,
         subsystems: Vec<Vec<usize>>,
@@ -170,6 +183,7 @@ impl Emit {
         virtual_type: &str,
         draw_start: u32,
         adjoint: bool,
+        box_id: u32,
     ) -> PyResult<Self> {
         ensure_registered(py)?;
         if subsystems.is_empty() {
@@ -193,6 +207,7 @@ impl Emit {
             .collect();
         Ok(Emit {
             inner: EmitSpec {
+                box_id,
                 source: parse_source(source)?,
                 direction: parse_direction(direction)?,
                 partition,
@@ -232,6 +247,12 @@ impl Emit {
     #[getter]
     fn distribution_key(&self) -> u32 {
         self.inner.dist().0
+    }
+
+    /// The annotated box this emission came from; only that box's collectors may consume it.
+    #[getter]
+    fn box_id(&self) -> u32 {
+        self.inner.box_id
     }
 
     #[getter]
@@ -337,6 +358,7 @@ impl Emit {
                 self.virtual_type(),
                 self.inner.parts[0].draw,
                 self.inner.parts[0].adjoint,
+                self.inner.box_id,
             ),
         )
             .into_py_any(py)
@@ -432,6 +454,16 @@ pub struct CollectSpec {
     /// references explicitly is what lets the graph reader avoid re-deriving the contextual collection
     /// rules (shared middle collectors, growing qubit sets) a second time.
     pub items: Vec<CollectItem>,
+    /// The annotated boxes whose emissions this collector may consume, ascending.
+    ///
+    /// Build gives each of a box's two collectors that box's own id. Merging unions them, so a shared
+    /// middle collector owns every box that contributed to it — which is exactly the set of emissions
+    /// it is allowed to take.
+    ///
+    /// A collector may own several boxes, and (with control flow) a box's id may appear on several
+    /// collectors, provided they lie on mutually exclusive paths. See the control-flow section of
+    /// `SAMPLEX_IR_DESIGN.md`.
+    pub owned: Vec<u32>,
     /// Subsystem grouping over the collector's qubits, in the *global* circuit frame.
     pub partition: Partition,
     /// Per-part descriptors, parallel with `partition.iter()`.
@@ -452,9 +484,10 @@ impl CollectSpec {
 
     /// Whether this collector consumes no local emissions.
     pub fn collects_nothing(&self) -> bool {
-        !self.items.iter().any(|item| {
-            matches!(item, CollectItem::Emission(_))
-        })
+        !self
+            .items
+            .iter()
+            .any(|item| matches!(item, CollectItem::Emission(_)))
     }
 
     /// The synthesizer of the first part. Convenience for the common uniform case where all parts
@@ -466,6 +499,21 @@ impl CollectSpec {
     /// Whether the given virtual type is accepted by all parts of this collector.
     pub fn accepts(&self, vt: VirtualType) -> bool {
         self.parts.iter().all(|part| part.synthesizer.accepts(vt))
+    }
+
+    /// Whether this collector may consume emissions from the box with this id.
+    pub fn owns(&self, box_id: u32) -> bool {
+        self.owned.contains(&box_id)
+    }
+
+    /// Take on another collector's ownership, keeping the set sorted and duplicate-free.
+    ///
+    /// Sorted so that a merged collector's set does not depend on the order the merge happened to
+    /// visit its members in; two runs must produce identical IR2.
+    pub fn absorb_ownership(&mut self, other: &[u32]) {
+        self.owned.extend_from_slice(other);
+        self.owned.sort_unstable();
+        self.owned.dedup();
     }
 }
 
@@ -497,6 +545,7 @@ impl Collect {
             PyClassInitializer::from(PyAnnotation).add_subclass(Collect {
                 inner: CollectSpec {
                     items: Vec::new(),
+                    owned: Vec::new(),
                     partition: Partition::new(),
                     parts: vec![CollectPart { synthesizer: synth }],
                 },
@@ -515,6 +564,12 @@ impl Collect {
             SynthesizerType::RzSx => "rzsx",
             SynthesizerType::RzRx => "rzrx",
         }
+    }
+
+    /// The annotated boxes whose emissions this collector may consume, ascending.
+    #[getter]
+    fn owned(&self) -> Vec<u32> {
+        self.inner.owned.clone()
     }
 
     /// Everything composed, in order: `("local", 0)` for a local emission, `("gates", n)` for

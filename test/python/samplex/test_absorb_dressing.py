@@ -43,25 +43,39 @@ def build(circuit):
     return dag_to_circuit(dag)
 
 
-def collectors(circuit):
-    """The (annotation, body, qubit indices) of each collect box, in circuit order."""
-    out = []
+def walk(circuit):
+    """Every (instruction, containing circuit) at any depth, outermost first.
+
+    Depth matters here: a nested box's collectors live inside the enclosing hard box, and a
+    propagating emission is written inside the hard box it has to cross. A top-level-only scan reports
+    both as absent, which makes "no emission is left standalone" true whether or not one was wrongly
+    absorbed — so these helpers recurse.
+    """
     for inst in circuit.data:
+        yield inst, circuit
+        for block in getattr(inst.operation, "blocks", None) or ():
+            yield from walk(block)
+
+
+def collectors(circuit):
+    """The (annotation, body, qubit indices) of each collect box, at any depth, in circuit order."""
+    out = []
+    for inst, owner in walk(circuit):
         annotations = getattr(inst.operation, "annotations", None)
         if annotations:
             out.append(
                 (
                     annotations[0],
                     inst.operation.blocks[0] if inst.operation.blocks else None,
-                    [circuit.find_bit(q).index for q in inst.qubits],
+                    [owner.find_bit(q).index for q in inst.qubits],
                 )
             )
     return out
 
 
 def emits(circuit):
-    """All standalone Emit instructions remaining in the circuit."""
-    return [inst for inst in circuit.data if inst.operation.name.startswith("samplex_emit_")]
+    """All standalone Emit instructions remaining in the circuit, at any depth."""
+    return [inst for inst, _ in walk(circuit) if inst.operation.name.startswith("samplex_emit_")]
 
 
 class TestLocalAbsorption(QiskitTestCase):
@@ -143,50 +157,66 @@ class TestLocalAbsorption(QiskitTestCase):
         self.assertEqual(remaining[0].operation.direction, "right")
 
 
-class TestCrossScopeAbsorption(QiskitTestCase):
-    """Emissions cross box boundaries to reach compatible collectors."""
+class TestOwnership(QiskitTestCase):
+    """A collector absorbs only the emissions of the boxes it owns.
 
-    def test_outer_far_half_absorbed_by_inner_collector(self):
-        """The motivating case: outer P_R sinks into the hard box and is absorbed by the
-        inner box's left collector."""
+    Facing is not sufficient. An emission propagating out of an enclosing box passes the collectors of
+    every box nested inside it, and those collectors face it. Absorbing one there would compose it as a
+    local value — dropping every conjugation it was owed, which leaves the enclosing box's
+    randomization applied and immediately undone with none of its content in between.
+    """
+
+    def test_outer_far_half_is_not_absorbed_by_an_inner_collector(self):
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left")]):
             with circuit.box([Twirl(dressing="left")]):
                 circuit.cx(0, 1)
         ir2 = build(circuit)
-        # No standalone emits — everything is absorbed
-        remaining = emits(ir2)
-        self.assertEqual(len(remaining), 0)
 
-    def test_inner_emission_escapes_to_outer_collector(self):
-        """An inner emission that can't find a collector inside its box escapes to the outer."""
+        # Two far halves, one per box, both still standalone: each must cross content to reach its
+        # own box's right collector.
+        remaining = emits(ir2)
+        self.assertEqual(len(remaining), 2)
+        self.assertEqual({e.operation.direction for e in remaining}, {"right"})
+        self.assertEqual(len({e.operation.box_id for e in remaining}), 2)
+
+    def test_each_box_owns_exactly_its_own_pair_of_collectors(self):
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left")]):
-            # Inner box emits a ChangeBasis on the right, but there's no compatible collector
-            # to its right inside the inner box — it escapes to the outer right collector.
-            with circuit.box([ChangeBasis("b", placement="end")]):
+            with circuit.box([Twirl(dressing="left")]):
                 circuit.cx(0, 1)
         ir2 = build(circuit)
-        # The ChangeBasis was placed at the right edge of the inner box.
-        # It should find the outer right collector.
-        remaining = emits(ir2)
-        # Far twirl half from outer box stays standalone (blocked by hard box)
-        # But the ChangeBasis from the inner box... let's verify
-        standalone_sources = [r.operation.source for r in remaining]
-        # The inner ChangeBasis should be absorbed (outer right collector is compatible)
-        self.assertNotIn("change_basis", standalone_sources)
 
-    def test_multi_level_descent(self):
-        """Emission descends through multiple nested boxes to find a collector."""
+        owners = [tuple(annotation.owned) for annotation, _, _ in collectors(ir2)]
+        self.assertEqual(len(owners), 4)
+        for owned in owners:
+            self.assertEqual(len(owned), 1)
+        # Two ids, each naming two collectors — one per side of its box.
+        self.assertEqual(len(set(owners)), 2)
+
+    def test_multi_level_nesting_keeps_every_far_half_standalone(self):
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left")]):
             with circuit.box([Twirl(dressing="left")]):
                 with circuit.box([Twirl(dressing="left")]):
                     circuit.cx(0, 1)
         ir2 = build(circuit)
-        # All emissions should be absorbed through nested descent
+
         remaining = emits(ir2)
-        self.assertEqual(len(remaining), 0)
+        self.assertEqual(len(remaining), 3)
+        self.assertEqual(len({e.operation.box_id for e in remaining}), 3)
+
+    def test_an_inner_local_emission_is_still_absorbed_locally(self):
+        """Ownership blocks foreign emissions, not a box's own adjacent ones."""
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl(dressing="left")]):
+            with circuit.box([ChangeBasis("b", placement="end")]):
+                circuit.cx(0, 1)
+        ir2 = build(circuit)
+
+        # The inner ChangeBasis sits at the inner box's right edge, adjacent to that box's own right
+        # collector, so it is absorbed there — no descent, no escaping.
+        self.assertNotIn("change_basis", [e.operation.source for e in emits(ir2)])
 
 
 class TestAbsorptionWithMerge(QiskitTestCase):

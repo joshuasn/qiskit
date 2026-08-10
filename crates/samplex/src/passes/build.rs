@@ -32,7 +32,7 @@ use smallvec::SmallVec;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use qiskit_circuit::annotation::PyAnnotation;
-use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder};
+use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder, NodeIndex};
 use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{
     ControlFlow, ControlFlowInstruction, ControlFlowView, Operation, OperationRef, Param,
@@ -147,6 +147,8 @@ impl Scope<'_> {
 struct Build {
     table: DistributionTable,
     draw_counts: HashMap<DistKey, u32>,
+    /// The next unused box id. Counts *emitting* boxes only, in the order they are lowered.
+    next_box_id: u32,
 }
 
 /// Build the emission circuit for an annotated circuit.
@@ -172,6 +174,7 @@ pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, Distribution
     let mut build = Build {
         table: DistributionTable::new(),
         draw_counts: HashMap::new(),
+        next_box_id: 0,
     };
     let scope = Scope {
         qubits: &identity_q,
@@ -186,6 +189,13 @@ pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, Distribution
 }
 
 impl Build {
+    /// Claim an id for one emitting box, naming the pairing between its emissions and its collectors.
+    fn alloc_box_id(&mut self) -> u32 {
+        let id = self.next_box_id;
+        self.next_box_id += 1;
+        id
+    }
+
     /// Allocate `count` consecutive draw slots for `dist`, returning the start index.
     fn alloc_draws(&mut self, dist: DistKey, count: u32) -> u32 {
         let next = self.draw_counts.entry(dist).or_insert(0);
@@ -261,8 +271,11 @@ impl Build {
             return self.walk(py, body, out, &inner);
         }
 
+        // One id for this box, stamped on every emission it produces and on both of its collectors.
+        // That pairing is what a later pass checks instead of trusting adjacency.
+        let box_id = self.alloc_box_id();
         let dressing = resolved.dressing.unwrap_or(Dressing::Left);
-        let emissions = self.build_emissions(&resolved, &global, dressing);
+        let emissions = self.build_emissions(&resolved, &global, dressing, box_id);
         let synthesizer = resolved.synthesizer.unwrap_or(DEFAULT_SYNTHESIZER);
         let partition = Partition::from_elements(global.iter().copied());
         let collect_parts: Vec<CollectPart> = (0..partition.len())
@@ -282,30 +295,33 @@ impl Build {
             clbits: &inner_identity_c,
         };
 
-        let mut easy_builder = new_body(width, body_clbits.len(), body.num_ops())?.into_builder();
-        let mut hard_builder = new_body(width, body_clbits.len(), body.num_ops())?.into_builder();
-        self.split_body(
-            py,
-            body,
-            resolved.dressing,
-            &mut Split {
-                easy: &mut easy_builder,
-                hard: &mut hard_builder,
-            },
-            &inner,
-        )?;
+        // Classified before anything is written, because whether there *is* hard content decides where
+        // the propagating emissions go, and they are written into the hard body ahead of its gates.
+        let (easy_nodes, hard_nodes) = classify_body(body, resolved.dressing);
+        let has_hard_content = !hard_nodes.is_empty();
+
+        let mut easy_builder = new_body(width, body_clbits.len(), easy_nodes.len())?.into_builder();
+        for node in easy_nodes {
+            copy_instruction(
+                body,
+                body.dag()[node].unwrap_operation(),
+                &mut easy_builder,
+                &inner,
+            )?;
+        }
         let easy = easy_builder.build();
-        let hard = hard_builder.build();
 
         // Collectors start empty — the absorb_dressing pass populates them by walking the spine.
         let empty_body = new_body(width, body_clbits.len(), 0)?;
         let left = CollectSpec {
             items: Vec::new(),
+            owned: vec![box_id],
             partition: partition.clone(),
             parts: collect_parts.clone(),
         };
         let right = CollectSpec {
             items: Vec::new(),
+            owned: vec![box_id],
             partition: partition.clone(),
             parts: collect_parts,
         };
@@ -340,8 +356,48 @@ impl Build {
             clbits: scope.clbits,
         };
 
+        let left_propagating = sorted(
+            &|p| p.edge == Direction::Left && !is_local(p, Direction::Left),
+            Direction::Left,
+        );
+        let right_propagating = sorted(
+            &|p| p.edge == Direction::Right && !is_local(p, Direction::Right),
+            Direction::Right,
+        );
+
+        // Build the hard body, with the propagating emissions *inside* it at the edge each starts
+        // from — front for the ones travelling right, back for the ones travelling left. That is where
+        // they belong: the hard content is exactly what they are conjugated by on the way to the far
+        // collector, so writing them outside it would put the box boundary between an emission and the
+        // gates it has to cross. It also means nothing has to move them later.
+        let mut hard_builder = new_body(width, body_clbits.len(), hard_nodes.len())?.into_builder();
+        if has_hard_content {
+            write_emissions(py, &mut hard_builder, &left_propagating, &inner)?;
+            for node in hard_nodes {
+                let inst = body.dag()[node].unwrap_operation();
+                match inst.op.view() {
+                    OperationRef::ControlFlow(cf) => {
+                        if !matches!(cf.control_flow, ControlFlow::Box { .. }) {
+                            return Err(PyValueError::new_err(format!(
+                                "Unsupported control flow in a samplex circuit: '{}'.",
+                                cf.name()
+                            )));
+                        }
+                        // A nested annotated box is lowered in place, so its collect boxes and
+                        // emissions land inside this hard box. An outer emission's walk crosses them
+                        // — including the gates the inner dressing absorbed, which are still real
+                        // gates in the inner collector's body at this stage.
+                        self.walk_box(py, body, inst, &mut hard_builder, &inner)?;
+                    }
+                    _ => copy_instruction(body, inst, &mut hard_builder, &inner)?,
+                }
+            }
+            write_emissions(py, &mut hard_builder, &right_propagating, &inner)?;
+        }
+        let hard = hard_builder.build();
+
         // Write left edge: collector, outer emissions, easy gates (if left-dressed), inner
-        // emissions, propagating emissions.
+        // emissions.
         write_collect(py, out, left, empty_body.clone(), &out_qargs, &out_cargs)?;
         let left_outer = sorted(
             &|p| p.edge == Direction::Left && is_outer(p),
@@ -356,22 +412,20 @@ impl Build {
             Direction::Left,
         );
         write_emissions(py, out, &left_inner, scope)?;
-        let left_propagating = sorted(
-            &|p| p.edge == Direction::Left && !is_local(p, Direction::Left),
-            Direction::Left,
-        );
-        write_emissions(py, out, &left_propagating, scope)?;
+        // With no hard content there is no hard box to sit inside, and nothing for the emission to be
+        // conjugated by either — so it stays on the spine, where its collector absorbs it as local.
+        if !has_hard_content {
+            write_emissions(py, out, &left_propagating, scope)?;
+        }
 
         // Hard box.
         write_hard_box(out, hard, &out_qargs, &out_cargs)?;
 
-        // Write right edge: propagating emissions, inner emissions, easy gates (if right-dressed),
-        // outer emissions, collector.
-        let right_propagating = sorted(
-            &|p| p.edge == Direction::Right && !is_local(p, Direction::Right),
-            Direction::Right,
-        );
-        write_emissions(py, out, &right_propagating, scope)?;
+        // Write right edge: inner emissions, easy gates (if right-dressed), outer emissions,
+        // collector.
+        if !has_hard_content {
+            write_emissions(py, out, &right_propagating, scope)?;
+        }
         let right_inner = sorted(
             &|p| p.edge == Direction::Right && !is_outer(p) && is_local(p, Direction::Right),
             Direction::Right,
@@ -411,6 +465,7 @@ impl Build {
         resolved: &ResolvedBox,
         qubits: &[usize],
         dressing: Dressing,
+        box_id: u32,
     ) -> Vec<Placed> {
         let partition = Partition::from_elements(qubits.iter().copied());
         let num_parts = partition.len();
@@ -438,6 +493,7 @@ impl Build {
                     .collect();
                 emissions.push(Placed {
                     spec: EmitSpec {
+                        box_id,
                         source: EmitSource::Twirl,
                         direction,
                         partition: partition.clone(),
@@ -466,6 +522,7 @@ impl Build {
                 .collect();
             emissions.push(Placed {
                 spec: EmitSpec {
+                    box_id,
                     source: EmitSource::ChangeBasis,
                     direction,
                     partition: partition.clone(),
@@ -496,6 +553,7 @@ impl Build {
                 .collect();
             emissions.push(Placed {
                 spec: EmitSpec {
+                    box_id,
                     source: EmitSource::InjectNoise,
                     direction,
                     partition: partition.clone(),
@@ -507,87 +565,57 @@ impl Build {
         }
         emissions
     }
-
-    /// Sweep a box body from the dressing edge, splitting absorbable gates from the rest.
-    ///
-    /// **Per qubit, not one latch for the whole body.** A single-qubit gate on a wire that no
-    /// multi-qubit gate has touched is still at the dressing edge *on its own wire*, so it commutes out
-    /// and folds into the dressing even when it sits after an entangler elsewhere in the body.
-    ///
-    /// Poisoning over a topological order is exactly DAG ancestry: a gate is absorbable iff every one
-    /// of its ancestors was absorbed, and since absorbed gates all move to the dressing edge keeping
-    /// their relative order, such a gate can move there too. Poison spreads transitively, so
-    /// `cx(0,1); cx(1,2); s(2)` correctly leaves the `s` as content.
-    fn split_body(
-        &mut self,
-        py: Python,
-        body: &DAGCircuit,
-        dressing: Option<Dressing>,
-        split: &mut Split,
-        scope: &Scope,
-    ) -> PyResult<()> {
-        let nodes: Vec<_> = body.topological_op_nodes(false).collect();
-        // Sweeping from the right means visiting in reverse, then restoring circuit order.
-        let right = matches!(dressing, Some(Dressing::Right));
-        let order: Vec<_> = if right {
-            nodes.iter().rev().copied().collect()
-        } else {
-            nodes.clone()
-        };
-
-        // No dressing at all means nothing is absorbable, which poisoning every wire expresses.
-        let dressed = dressing.is_some();
-        let mut poisoned: HashSet<usize> = HashSet::new();
-        let mut easy_nodes = Vec::new();
-        let mut hard_nodes = Vec::new();
-        for node in order {
-            let inst = body.dag()[node].unwrap_operation();
-            let qargs = body.qargs_interner().get(inst.qubits);
-            let absorbable =
-                dressed && is_absorbable(body, inst) && !poisoned.contains(&qargs[0].index());
-            if absorbable {
-                easy_nodes.push(node);
-            } else {
-                poisoned.extend(qargs.iter().map(|q| q.index()));
-                hard_nodes.push(node);
-            }
-        }
-        if right {
-            easy_nodes.reverse();
-            hard_nodes.reverse();
-        }
-
-        for node in easy_nodes {
-            copy_instruction(body, body.dag()[node].unwrap_operation(), split.easy, scope)?;
-        }
-        for node in hard_nodes {
-            let inst = body.dag()[node].unwrap_operation();
-            match inst.op.view() {
-                OperationRef::ControlFlow(cf) => {
-                    if !matches!(cf.control_flow, ControlFlow::Box { .. }) {
-                        return Err(PyValueError::new_err(format!(
-                            "Unsupported control flow in a samplex circuit: '{}'.",
-                            cf.name()
-                        )));
-                    }
-                    // A nested annotated box is lowered in place, so its collect boxes and
-                    // emissions land inside this hard box. An outer emission's walk descends into
-                    // boxes, so it crosses the inner box's gates — including the ones the inner
-                    // dressing absorbed, which are still real gates in the inner collector's body
-                    // at this stage.
-                    self.walk_box(py, body, inst, split.hard, scope)?;
-                }
-                _ => copy_instruction(body, inst, split.hard, scope)?,
-            }
-        }
-        Ok(())
-    }
 }
 
-/// Where a body sweep puts each instruction: absorbed into the dressing, or left as content.
-struct Split<'a> {
-    easy: &'a mut DAGCircuitBuilder,
-    hard: &'a mut DAGCircuitBuilder,
+/// Sweep a box body from the dressing edge, splitting absorbable gates from the rest.
+///
+/// Classification only — it decides *which* nodes are easy and which are hard, and writes nothing. The
+/// caller needs that answer before it starts writing, because whether the box has hard content at all
+/// decides where its propagating emissions go.
+///
+/// **Per qubit, not one latch for the whole body.** A single-qubit gate on a wire that no multi-qubit
+/// gate has touched is still at the dressing edge *on its own wire*, so it commutes out and folds into
+/// the dressing even when it sits after an entangler elsewhere in the body.
+///
+/// Poisoning over a topological order is exactly DAG ancestry: a gate is absorbable iff every one of
+/// its ancestors was absorbed, and since absorbed gates all move to the dressing edge keeping their
+/// relative order, such a gate can move there too. Poison spreads transitively, so
+/// `cx(0,1); cx(1,2); s(2)` correctly leaves the `s` as content.
+fn classify_body(
+    body: &DAGCircuit,
+    dressing: Option<Dressing>,
+) -> (Vec<NodeIndex>, Vec<NodeIndex>) {
+    let nodes: Vec<_> = body.topological_op_nodes(false).collect();
+    // Sweeping from the right means visiting in reverse, then restoring circuit order.
+    let right = matches!(dressing, Some(Dressing::Right));
+    let order: Vec<_> = if right {
+        nodes.iter().rev().copied().collect()
+    } else {
+        nodes.clone()
+    };
+
+    // No dressing at all means nothing is absorbable, which poisoning every wire expresses.
+    let dressed = dressing.is_some();
+    let mut poisoned: HashSet<usize> = HashSet::new();
+    let mut easy_nodes = Vec::new();
+    let mut hard_nodes = Vec::new();
+    for node in order {
+        let inst = body.dag()[node].unwrap_operation();
+        let qargs = body.qargs_interner().get(inst.qubits);
+        let absorbable =
+            dressed && is_absorbable(body, inst) && !poisoned.contains(&qargs[0].index());
+        if absorbable {
+            easy_nodes.push(node);
+        } else {
+            poisoned.extend(qargs.iter().map(|q| q.index()));
+            hard_nodes.push(node);
+        }
+    }
+    if right {
+        easy_nodes.reverse();
+        hard_nodes.reverse();
+    }
+    (easy_nodes, hard_nodes)
 }
 
 /// Whether the dressing can absorb this instruction: a single-qubit standard gate.

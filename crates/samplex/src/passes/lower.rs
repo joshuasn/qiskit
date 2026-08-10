@@ -319,6 +319,8 @@ struct CollectorInfo {
     qubits: Vec<usize>,
     synthesizer: SynthesizerType,
     param_indices: Vec<usize>,
+    /// The annotated boxes whose emissions this collector consumes.
+    owned: Vec<u32>,
     /// Everything this collector composes, in circuit order — local emissions and absorbed gates.
     steps: Vec<CollectStep>,
 }
@@ -438,10 +440,24 @@ pub fn build_sampling_graph(
             continue;
         };
         let source = emission_nodes[&position];
-        let target = scan_for_nearest_collector(&events, position, spec.direction, &infos);
-        let Some(target) = target else {
-            continue;
-        };
+        // Unreachable in well-formed IR2: build writes both of a box's collectors, so an emission
+        // always has an owner ahead of it. Reaching this means the pairing was broken between the two
+        // passes, which would otherwise show up as a randomization that is never undone — so it is
+        // reported rather than skipped.
+        let target = scan_for_owning_collector(
+            &events,
+            position,
+            spec.direction,
+            spec.box_id,
+            &infos,
+        )
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "emission from box {} travelling {:?} has no owning collector ahead of it; its \
+                     randomization could not be undone",
+                spec.box_id, spec.direction,
+            ))
+        })?;
         walk_emission(
             &mut vfg,
             &events,
@@ -457,21 +473,29 @@ pub fn build_sampling_graph(
     Ok(vfg)
 }
 
-/// Scan from position `start` in `direction` through the events list to find the nearest collector.
-/// Used as a fallback when absorb_dressing hasn't run (unoptimized path).
-fn scan_for_nearest_collector(
+/// Scan from `start` in `direction` for the collector that *owns* this emission's box.
+///
+/// Nearest-collector-wins is wrong, and silently so. An emission propagating out of an enclosing box
+/// passes the collectors of every nested box on its way — those collectors face it and are nearer than
+/// its own — so taking the first one found conjugates it by only part of the content it was meant to
+/// cross, or by none at all. Ownership is the pairing build recorded for exactly this reason; position
+/// only decides *which* of an owner's collectors, when a merge has left more than one.
+fn scan_for_owning_collector(
     events: &[Event],
     start: usize,
     direction: Direction,
-    _infos: &[CollectorInfo],
+    box_id: u32,
+    infos: &[CollectorInfo],
 ) -> Option<usize> {
     let range: Box<dyn Iterator<Item = usize>> = match direction {
         Direction::Right => Box::new((start + 1)..events.len()),
         Direction::Left => Box::new((0..start).rev()),
     };
     for i in range {
-        if let Event::Collector(idx) = &events[i] {
-            return Some(*idx);
+        if let Event::Collector(index) = &events[i]
+            && infos[*index].owned.contains(&box_id)
+        {
+            return Some(*index);
         }
     }
     None
@@ -550,6 +574,7 @@ fn flatten(
                 qubits,
                 synthesizer: spec.synthesizer(),
                 param_indices: Vec::new(),
+                owned: spec.owned.clone(),
                 steps,
             });
             continue;

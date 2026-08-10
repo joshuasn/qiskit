@@ -75,6 +75,11 @@ def emissions(circuit):
     return out
 
 
+def emissions_in_scope(circuit):
+    """The Emit operations of one scope, in order, without recursing."""
+    return [inst.operation for inst in circuit.data if inst.operation.name.startswith("samplex_emit")]
+
+
 def hard_boxes(circuit):
     """Boxes carrying no annotation — the ones holding propagating content."""
     return [
@@ -85,7 +90,18 @@ def hard_boxes(circuit):
 
 
 def gate_names(circuit):
+    """Every instruction name in one scope, in order — `Emit` markers included."""
     return [inst.operation.name for inst in circuit.data]
+
+
+def hard_gates(circuit):
+    """The real gates of a hard body, without the `Emit` markers written inside it.
+
+    A propagating emission lives *inside* the hard box, at the edge it starts from, because the hard
+    content is exactly what conjugates it on the way to the far collector. It is a marker rather than
+    something that executes, so it is not part of what the easy/hard split put here.
+    """
+    return [name for name in gate_names(circuit) if not name.startswith("samplex_emit")]
 
 
 class TestBuildShape(QiskitTestCase):
@@ -140,16 +156,17 @@ class TestBuildShape(QiskitTestCase):
         # Emissions are placed on the correct side of the hard box (positionally).
         # Verify via spine ordering: basis is before the hard box, noise is after.
         names = gate_names(lowered)
-        emit_names = [n for n in names if n.startswith("samplex_emit")]
         box_positions = [i for i, n in enumerate(names) if n == "box"]
         # The hard box is the non-annotated box in the middle
         hard_pos = box_positions[0] if len(box_positions) == 1 else box_positions[1]
         basis_pos = next(
-            i for i, inst in enumerate(lowered.data)
+            i
+            for i, inst in enumerate(lowered.data)
             if inst.operation.name.startswith("samplex_emit") and inst.operation.source == "change_basis"
         )
         noise_pos = next(
-            i for i, inst in enumerate(lowered.data)
+            i
+            for i, inst in enumerate(lowered.data)
             if inst.operation.name.startswith("samplex_emit") and inst.operation.source == "inject_noise"
         )
         self.assertLess(basis_pos, hard_pos)  # basis on left edge
@@ -178,20 +195,24 @@ class TestBuildShape(QiskitTestCase):
                         lowered, _ = lower(circuit)
 
                         names = gate_names(lowered)
-                        emits = [i for i, n in enumerate(names) if n.startswith("samplex_emit")]
                         # the hard box is the middle `box`; the collectors bracket everything
                         box_at = [i for i, n in enumerate(names) if n == "box"][1]
-                        all_emits = list(emissions(lowered))
-                        target_idx = next(
-                            idx
-                            for idx, e in enumerate(all_emits)
-                            if e.source in ("change_basis", "inject_noise")
+                        # Located on the spine, which is itself the claim: one of these on the spine at
+                        # all means it is outside the hard box. Only a *propagating* emission is
+                        # written inside it, and neither of these ever propagates.
+                        kind = (
+                            "change_basis" if "ChangeBasis" in type(annotation).__name__ else "inject_noise"
                         )
-                        at = emits[target_idx]
+                        at = next(
+                            i
+                            for i, inst in enumerate(lowered.data)
+                            if inst.operation.name.startswith("samplex_emit")
+                            and inst.operation.source == kind
+                        )
                         self.assertEqual(
                             at < box_at,
                             side == "left",
-                            f"{all_emits[target_idx].source} landed on the wrong side of the hard box",
+                            f"{kind} landed on the wrong side of the hard box",
                         )
 
     def test_emissions_nest_by_how_close_they_are_to_the_content(self):
@@ -374,7 +395,7 @@ class TestEasyHardSplit(QiskitTestCase):
         self.assertEqual(gate_names(left[1]), ["h"])
         self.assertEqual(gate_names(right[1]), [])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(gate_names(hard), ["cx"])
+        self.assertEqual(hard_gates(hard), ["cx"])
 
     def test_right_dressing_absorbs_from_the_right(self):
         circuit = QuantumCircuit(2)
@@ -389,7 +410,7 @@ class TestEasyHardSplit(QiskitTestCase):
         # absorbed gates keep circuit order even though the sweep runs backwards
         self.assertEqual(gate_names(right[1]), ["s", "h"])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(gate_names(hard), ["cx"])
+        self.assertEqual(hard_gates(hard), ["cx"])
 
     def test_emissions_sit_on_the_dressing_edge(self):
         # Placement is load-bearing: the factor the easy gates absorb must reach its collector
@@ -426,7 +447,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
         # q2 is untouched by the cx, so h(2) is at the dressing edge on its own wire
         self.assertEqual(gate_names(left[1]), ["h"])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(gate_names(hard), ["cx"])
+        self.assertEqual(hard_gates(hard), ["cx"])
 
     def test_a_run_on_a_clean_wire_is_absorbed(self):
         circuit = QuantumCircuit(3)
@@ -447,7 +468,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
 
         self.assertEqual(gate_names(collectors(lowered)[0][1]), [])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(gate_names(hard), ["cx", "h"])
+        self.assertEqual(hard_gates(hard), ["cx", "h"])
 
     def test_poison_spreads_transitively(self):
         # q2 is clean until cx(1,2), which is itself poisoned by cx(0,1) — so s(2) is content. This is
@@ -461,7 +482,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
 
         self.assertEqual(gate_names(collectors(lowered)[0][1]), [])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(gate_names(hard), ["cx", "cx", "s"])
+        self.assertEqual(hard_gates(hard), ["cx", "cx", "s"])
 
     def test_right_dressing_sweeps_from_the_other_end(self):
         circuit = QuantumCircuit(3)
@@ -475,7 +496,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
         # absorbed into the right collector, which is where a right dressing sits
         self.assertEqual(gate_names(right[1]), ["h"])
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(gate_names(hard), ["cx"])
+        self.assertEqual(hard_gates(hard), ["cx"])
 
     def test_a_fully_absorbed_box_has_no_hard_box(self):
         # An empty box carries no information once propagation is derived from placement.
@@ -498,7 +519,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
 
         (outer_hard,) = hard_boxes(lowered)
         self.assertEqual([gate_names(b) for _, b, _ in collectors(outer_hard)], [["h"], []])
-        self.assertEqual([gate_names(b) for b in hard_boxes(outer_hard)], [["cx"]])
+        self.assertEqual([hard_gates(b) for b in hard_boxes(outer_hard)], [["cx"]])
 
     def test_no_gate_is_lost_or_duplicated(self):
         circuit = QuantumCircuit(3)
@@ -510,7 +531,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
         lowered, _ = lower_absorbed(circuit)
 
         names = [n for _, body, _ in collectors(lowered) for n in gate_names(body)]
-        names += [n for body in hard_boxes(lowered) for n in gate_names(body)]
+        names += [n for body in hard_boxes(lowered) for n in hard_gates(body)]
         self.assertEqual(sorted(names), ["cx", "cx", "h", "s"])
 
     def test_an_absorbed_gate_keeps_its_qubit(self):
@@ -573,8 +594,6 @@ class TestFidelity(QiskitTestCase):
             circuit.noop(*range(4))
         with circuit.box([Twirl()]):
             circuit.noop(0, 1)
-        dag = circuit_to_dag(circuit)
-
         runs = []
         for _ in range(3):
             lowered, table = lower(circuit)
@@ -622,7 +641,7 @@ class TestNesting(QiskitTestCase):
         self.assertEqual(gate_names(inner_left[1]), ["h"])
         self.assertEqual(gate_names(inner_right[1]), [])
         (inner_hard,) = hard_boxes(outer_hard)
-        self.assertEqual(gate_names(inner_hard), ["cx"])
+        self.assertEqual(hard_gates(inner_hard), ["cx"])
 
     def test_outermost_box_still_absorbs(self):
         circuit = QuantumCircuit(2)
@@ -653,7 +672,7 @@ class TestNesting(QiskitTestCase):
         lowered, _ = lower(circuit)
 
         (hard,) = hard_boxes(lowered)
-        self.assertEqual(gate_names(hard), ["cx"])
+        self.assertEqual(hard_gates(hard), ["cx"])
 
 
 class TestRejections(QiskitTestCase):
@@ -679,3 +698,66 @@ class TestRejections(QiskitTestCase):
             circuit.h(0)
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             lower(circuit)
+
+
+class TestPropagatingEmissionPlacement(QiskitTestCase):
+    """A propagating emission is written inside the hard box; a local one is not.
+
+    The hard content is exactly what conjugates the far half on its way to the far collector, so putting
+    the emission outside the box would place a scope boundary between it and the gates it has to cross —
+    which is what made a later pass have to move it there. Writing it in the right place to begin with is
+    what makes that machinery unnecessary.
+    """
+
+    def test_the_far_half_is_written_inside_the_hard_box(self):
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl(dressing="left")]):
+            circuit.cx(0, 1)
+        lowered, _ = lower(circuit)
+
+        spine = [op.direction for op in emissions_in_scope(lowered)]
+        (hard,) = hard_boxes(lowered)
+        inside = [op.direction for op in emissions_in_scope(hard)]
+        # The near half stays on the spine, where its collector can absorb it; the far half goes inside.
+        self.assertEqual(spine, ["left"])
+        self.assertEqual(inside, ["right"])
+
+    def test_right_dressing_puts_it_at_the_other_end(self):
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl(dressing="right")]):
+            circuit.cx(0, 1)
+        lowered, _ = lower(circuit)
+
+        (hard,) = hard_boxes(lowered)
+        # Travelling left, so it starts at the hard content's right-hand edge: the back of the body.
+        self.assertEqual(gate_names(hard), ["cx", "samplex_emit_twirl"])
+        self.assertEqual([op.direction for op in emissions_in_scope(hard)], ["left"])
+
+    def test_a_box_with_no_hard_content_keeps_it_on_the_spine(self):
+        """With nothing to cross there is no hard box, and no conjugation is due."""
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl(dressing="left")]):
+            circuit.h(0)
+            circuit.s(1)
+        lowered, _ = lower(circuit)
+
+        self.assertEqual(hard_boxes(lowered), [])
+        self.assertEqual(sorted(op.direction for op in emissions_in_scope(lowered)), ["left", "right"])
+
+    def test_a_leading_hard_gate_is_not_absorbed_across_the_twirl_point(self):
+        """The hard box is still the barrier that keeps content out of the dressing.
+
+        Right dressing puts the twirl point at the *right* edge, so a single-qubit gate that the sweep
+        classified as hard must not fold into the left collector — the far half travels leftward through
+        it, and a target collector's own absorbed gates are not crossed on the way in.
+        """
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl(dressing="right")]):
+            circuit.s(0)  # hard: poisoned by the cx below it
+            circuit.cx(0, 1)
+        lowered, _ = lower_absorbed(circuit)
+
+        left, _ = collectors(lowered)
+        self.assertEqual(gate_names(left[1]), [])
+        (hard,) = hard_boxes(lowered)
+        self.assertEqual(hard_gates(hard), ["s", "cx"])
