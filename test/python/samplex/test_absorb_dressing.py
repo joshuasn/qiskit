@@ -12,9 +12,9 @@
 
 """Tests for the absorb_dressing pass: scope-agnostic emission absorption.
 
-After build, every emission is a standalone Emit instruction and every collector carries only Gates
-items. This pass scans from each emission in its travel direction, crossing box boundaries, and
-absorbs it into the first compatible collector.
+After build, every emission is a standalone Emit instruction and every collector's body is empty.
+This pass scans from each emission in its travel direction, crossing box boundaries, and absorbs it
+into the first compatible collector — as a real instruction inserted into that collector's body.
 
 Emissions that cannot reach a compatible collector (gate in the way, incompatible collector) remain
 standalone for the future walk_emissions pass.
@@ -64,6 +64,24 @@ def emits(circuit):
     return [inst for inst in circuit.data if inst.operation.name.startswith("samplex_emit_")]
 
 
+def body_locals(body):
+    """Absorbed local emissions in a collector body, in body order."""
+    return [
+        inst.operation
+        for inst in body.data
+        if inst.operation.name.startswith("samplex_emit_") and inst.operation.direction == "local"
+    ]
+
+
+def real_gates(body):
+    """Gate names in a collector body, excluding absorbed local emissions."""
+    return [
+        inst.operation.name
+        for inst in body.data
+        if not inst.operation.name.startswith("samplex_emit_")
+    ]
+
+
 class TestLocalAbsorption(QiskitTestCase):
     """Local emissions (adjacent to a compatible collector) are absorbed."""
 
@@ -75,7 +93,7 @@ class TestLocalAbsorption(QiskitTestCase):
         colls = collectors(ir2)
         # The left collector absorbs the left-directed twirl half (local)
         left = colls[0]
-        self.assertIn(("local", 0), left[0].items)
+        self.assertTrue(body_locals(left[1]))
 
     def test_twirl_left_dressed_far_half_stays_standalone(self):
         circuit = QuantumCircuit(2)
@@ -94,7 +112,7 @@ class TestLocalAbsorption(QiskitTestCase):
         ir2 = build(circuit)
         colls = collectors(ir2)
         right = colls[-1]
-        self.assertIn(("local", 0), right[0].items)
+        self.assertTrue(body_locals(right[1]))
         remaining = emits(ir2)
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0].operation.direction, "left")
@@ -109,7 +127,7 @@ class TestLocalAbsorption(QiskitTestCase):
         self.assertEqual(len(remaining), 0)
         colls = collectors(ir2)
         # The left collector should have absorbed it
-        self.assertIn(("local", 0), colls[0][0].items)
+        self.assertTrue(body_locals(colls[0][1]))
 
     def test_inject_noise_is_absorbed(self):
         circuit = QuantumCircuit(2)
@@ -245,7 +263,7 @@ class TestAbsorptionWithMerge(QiskitTestCase):
 
 
 class TestAbsorptionPreservesCompositionOrder(QiskitTestCase):
-    """The items ordering reflects absorption direction correctly."""
+    """The body ordering reflects absorption direction correctly."""
 
     def test_left_collector_order_preserved(self):
         circuit = QuantumCircuit(2)
@@ -255,9 +273,7 @@ class TestAbsorptionPreservesCompositionOrder(QiskitTestCase):
         ir2 = build(circuit)
         colls = collectors(ir2)
         left = colls[0]
-        items = left[0].items
-        # All emissions on the left collector are local (no incoming)
-        tags = [tag for tag, _ in items]
-        self.assertNotIn("incoming", tags)
-        # Gates are still present at their correct position
-        self.assertIn("gates", tags)
+        # The absorbed hard-content gate and the absorbed local emission both land in the left
+        # collector's body; nothing propagating (incoming) is absorbed here.
+        self.assertEqual(real_gates(left[1]), ["h"])
+        self.assertTrue(body_locals(left[1]))

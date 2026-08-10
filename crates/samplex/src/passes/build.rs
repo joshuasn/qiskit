@@ -300,12 +300,10 @@ impl Build {
         // Collectors start empty — the absorb_dressing pass populates them by walking the spine.
         let empty_body = new_body(width, body_clbits.len(), 0)?;
         let left = CollectSpec {
-            items: Vec::new(),
             partition: partition.clone(),
             parts: collect_parts.clone(),
         };
         let right = CollectSpec {
-            items: Vec::new(),
             partition: partition.clone(),
             parts: collect_parts,
         };
@@ -317,8 +315,8 @@ impl Build {
         let is_outer = |p: &&Placed| p.depth >= DEPTH_BASIS;
         let is_local = |p: &&Placed, side: Direction| {
             let faces_collector = match side {
-                Direction::Left => p.spec.direction == Direction::Left,
-                Direction::Right => p.spec.direction == Direction::Right,
+                Direction::Left => p.spec.direction == Some(Direction::Left),
+                Direction::Right => p.spec.direction == Some(Direction::Right),
             };
             faces_collector || p.depth >= DEPTH_BASIS
         };
@@ -439,7 +437,7 @@ impl Build {
                 emissions.push(Placed {
                     spec: EmitSpec {
                         source: EmitSource::Twirl,
-                        direction,
+                        direction: Some(direction),
                         partition: partition.clone(),
                         parts,
                     },
@@ -467,7 +465,7 @@ impl Build {
             emissions.push(Placed {
                 spec: EmitSpec {
                     source: EmitSource::ChangeBasis,
-                    direction,
+                    direction: Some(direction),
                     partition: partition.clone(),
                     parts,
                 },
@@ -497,7 +495,7 @@ impl Build {
             emissions.push(Placed {
                 spec: EmitSpec {
                     source: EmitSource::InjectNoise,
-                    direction,
+                    direction: Some(direction),
                     partition: partition.clone(),
                     parts,
                 },
@@ -706,11 +704,6 @@ fn write_collect(
     qargs: &[Qubit],
     cargs: &[Clbit],
 ) -> PyResult<()> {
-    debug_assert_eq!(
-        spec.gate_count(),
-        body.num_ops(),
-        "a collector's `Gates` items must account for exactly its body"
-    );
     let annotation = Py::new(py, (Collect::new_from_spec(spec), PyAnnotation))?;
     write_box(out, body, vec![annotation.into_any()], qargs, cargs)
 }

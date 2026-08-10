@@ -55,7 +55,7 @@ use qiskit_circuit::operations::StandardInstruction;
 use super::utils::{IntoPyResult, block_body, collect_annotation, emission_spec, is_emission};
 use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::{DistEntry, DistributionTable};
-use crate::emission_circuit::{CollectItem, EmitSource, EmitSpec};
+use crate::emission_circuit::{EmitSource, EmitSpec, LocalEmission};
 use crate::partition::Partition;
 use crate::virtual_flow_graph::{
     AbsorbedGate, Collect, CollectStep, Direction, Edge, Emission, Measure, Node, NodeKind,
@@ -438,7 +438,11 @@ pub fn build_sampling_graph(
             continue;
         };
         let source = emission_nodes[&position];
-        let target = scan_for_nearest_collector(&events, position, spec.direction, &infos);
+        let direction = spec.direction.expect(
+            "a local emission never surfaces as a top-level Event::Emission — it lives inside its \
+             collector's body",
+        );
+        let target = scan_for_nearest_collector(&events, position, direction, &infos);
         let Some(target) = target else {
             continue;
         };
@@ -497,18 +501,17 @@ fn flatten(
             .collect();
 
         if let Some(spec) = collect_annotation(py, inst) {
-            // A collector's body is its absorbed gates; they stay with it rather than becoming
-            // separate events, because the collector owns them.
-            let mut gates = Vec::new();
+            // A collector's body is its absorbed content — gates and local emissions alike — kept in
+            // the order the absorption walk composed them. A local emission is a real `Emit`
+            // instruction spanning every qubit it covers, so the only ambiguity a topological sort
+            // leaves is between nodes on disjoint qubits, which is exactly where relative order does
+            // not matter.
+            let mut steps = Vec::new();
             if let Some(body) = block_body(src, inst)? {
-                // In written order, not topological order. The annotation's `Gates` counts were minted
-                // by the absorption walk as it appended, so they describe the body as a *sequence*; a
-                // topological read would group a body of single-qubit gates by wire instead and put
-                // gates from two different runs into one. A body is built once and never edited, so
-                // its node indices are its append order.
-                for (_, gate) in body.op_nodes(true) {
+                for node in body.topological_op_nodes(false) {
+                    let gate = body.dag()[node].unwrap_operation();
                     if let OperationRef::StandardGate(standard) = gate.op.view() {
-                        gates.push(AbsorbedGate {
+                        steps.push(CollectStep::Gate(AbsorbedGate {
                             gate: standard,
                             qubits: body
                                 .qargs_interner()
@@ -516,33 +519,16 @@ fn flatten(
                                 .iter()
                                 .map(|q| qubits[q.index()])
                                 .collect(),
-                        });
+                        }));
+                        continue;
                     }
-                }
-            }
-            // The annotation's `Gates` counts say where the body sits among the emissions, so this is
-            // where the two halves are woven back together. A mismatch means the annotation and the
-            // body disagree, which no pass should be able to produce.
-            if gates.len() != spec.gate_count() {
-                return Err(PyValueError::new_err(format!(
-                    "a collector's annotation accounts for {} absorbed gates but its body holds {}",
-                    spec.gate_count(),
-                    gates.len()
-                )));
-            }
-            let mut cursor = 0usize;
-            let mut steps = Vec::with_capacity(spec.items.len());
-            for item in &spec.items {
-                match item {
-                    CollectItem::Emission(local) => {
-                        steps.push(CollectStep::Local(local.clone()));
-                    }
-                    CollectItem::Gates(count) => {
-                        for gate in &gates[cursor..cursor + count] {
-                            steps.push(CollectStep::Gate(gate.clone()));
-                        }
-                        cursor += count;
-                    }
+                    let local = emission_spec(py, gate).expect(
+                        "a collector body holds only absorbed gates and absorbed local emissions",
+                    );
+                    steps.push(CollectStep::Local(LocalEmission {
+                        partition: local.partition.clone(),
+                        parts: local.parts.clone(),
+                    }));
                 }
             }
             events.push(Event::Collector(infos.len()));
@@ -598,10 +584,14 @@ fn walk_emission(
 ) -> PyResult<()> {
     let qubits: HashSet<usize> = spec.partition.all_elements().iter().copied().collect();
     let mut frontier: HashMap<usize, NodeIndex> = qubits.iter().map(|q| (*q, source)).collect();
+    let direction = spec.direction.expect(
+        "a local emission never surfaces as a top-level Event::Emission — it lives inside its \
+         collector's body",
+    );
 
     // Walking in the emission's own direction is what makes propagation derivable rather than
     // recorded: everything crossed on the way to its collector conjugates it.
-    let indices: Vec<usize> = match spec.direction {
+    let indices: Vec<usize> = match direction {
         Direction::Right => (from + 1..events.len()).collect(),
         Direction::Left => (0..from).rev().collect(),
     };
@@ -614,7 +604,7 @@ fn walk_emission(
                 // path, so they conjugate it — even though that collector owns them for its own
                 // multiplication. The two roles are independent.
                 let absorbed: Vec<&AbsorbedGate> = infos[*collector].gates().collect();
-                let order: Vec<usize> = match spec.direction {
+                let order: Vec<usize> = match direction {
                     Direction::Right => (0..absorbed.len()).collect(),
                     Direction::Left => (0..absorbed.len()).rev().collect(),
                 };
@@ -624,7 +614,7 @@ fn walk_emission(
                         vfg,
                         &mut frontier,
                         &qubits,
-                        spec.direction,
+                        direction,
                         gate_nodes,
                         (index, offset),
                         gate.gate,
@@ -637,7 +627,7 @@ fn walk_emission(
                 vfg,
                 &mut frontier,
                 &qubits,
-                spec.direction,
+                direction,
                 gate_nodes,
                 (index, 0),
                 *gate,
@@ -733,7 +723,10 @@ fn emission_kind(spec: &EmitSpec, table: &DistributionTable) -> PyResult<NodeKin
     }
     Ok(NodeKind::Emission(Emission {
         entry: entry.clone(),
-        direction: spec.direction,
+        direction: spec.direction.expect(
+            "a local emission never surfaces as a top-level Event::Emission — it lives inside its \
+             collector's body",
+        ),
         virtual_type: spec.virtual_type(),
     }))
 }

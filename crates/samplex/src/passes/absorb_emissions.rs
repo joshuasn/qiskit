@@ -13,11 +13,13 @@
 //! Absorb dressing into collectors: emission circuit (IR2) → emission circuit (IR2), in place.
 //!
 //! After the build pass, every emission and every easy gate sits on the spine and every collector
-//! starts empty (no items, no body). This pass walks outward from each collector and takes over what
-//! it reaches:
+//! starts empty (no body). This pass walks outward from each collector and takes over what it
+//! reaches, writing each thing it absorbs directly into the collector's body, in the order the walk
+//! finds it:
 //!
-//! - A single-qubit standard gate → part of a `CollectItem::Gates` run
-//! - An emission facing this collector → a `CollectItem::Emission`
+//! - A single-qubit standard gate → copied into the body as-is
+//! - An emission facing this collector → rewritten into a local `Emit` (`direction: None`) and placed
+//!   into the body
 //! - Anything else (propagating emission, multi-qubit gate, box, another collector) → that wire is
 //!   done, and only that wire
 //!
@@ -27,10 +29,12 @@
 //! it maps into the collector body at `q`'s position, with nothing to guess.
 //!
 //! **Emissions come off in layers.** An emission is absorbed only when it is the next node on *every*
-//! one of its wires at once. That is what keeps the item order meaningful: `Gates(n)` says the next
-//! `n` body instructions compose on one side of the emission that follows, which is only true if the
-//! emission is a barrier across all of them. Absorbing one wire's half of an emission layer early
-//! would put a gate from the far side of it into the near run.
+//! one of its wires at once — it has to be a barrier across all of them, or it would take content
+//! from the far side of it into the body ahead of where it belongs. Because a local emission is
+//! written into the body as a real instruction spanning every wire it covers, a plain
+//! `topological_op_nodes` read of the finished body reproduces the same composition order the walk
+//! found it in: the only ordering a topological sort leaves ambiguous is between nodes on disjoint
+//! qubits, which compose into independent subsystems and so have no order to get wrong.
 //!
 //! The walk's order IS the composition order, so no `EmitSource`-based classification is needed.
 //! Cross-scope absorption — an emission whose collector is inside an adjacent box — is handled by
@@ -44,13 +48,15 @@ use qiskit_circuit::Qubit;
 use qiskit_circuit::annotation::PyAnnotation;
 use qiskit_circuit::dag_circuit::DAGCircuit;
 use qiskit_circuit::instruction::Parameters;
-use qiskit_circuit::operations::{ControlFlow, ControlFlowInstruction, OperationRef};
+use qiskit_circuit::operations::{
+    ControlFlow, ControlFlowInstruction, OperationRef, PyInstruction, PyOpKind,
+};
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 
 use super::utils::{
     IntoPyResult, collect_annotation, emission_spec, new_dag_body, next_on_wire, params_of,
 };
-use crate::emission_circuit::{Collect, CollectItem, CollectSpec, EmitSpec, LocalEmission};
+use crate::emission_circuit::{Collect, CollectSpec, Emit, EmitSpec};
 use crate::virtual_flow_graph::Direction;
 
 /// Absorb dressing into every collector, in place.
@@ -65,16 +71,22 @@ pub fn absorb_dressing(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
     absorb_scope(py, dag)
 }
 
+/// One thing a collector absorbed, in the order it will sit in the collector's body.
+enum BodyOp {
+    /// An absorbed gate, referenced by its node in the source scope.
+    Gate(NodeIndex),
+    /// A local emission, already rewritten to `direction: None`, and the wires it spans in the
+    /// source scope's frame (needed to remap its qargs into the body's frame).
+    Local(PackedOperation, Vec<Qubit>),
+}
+
 /// What one collector takes over from the spine.
 struct Absorption {
     collector: NodeIndex,
     /// The collector's existing descriptors, which absorption does not change.
     spec: CollectSpec,
-    /// Composition order: gate runs interleaved with the emissions between them.
-    items: Vec<CollectItem>,
-    /// Absorbed gate nodes in the order the `Gates` counts assume, so the body can be built by
-    /// walking this list.
-    gates: Vec<NodeIndex>,
+    /// Everything absorbed, in composition order — becomes the collector's body verbatim.
+    content: Vec<BodyOp>,
     /// Every node this collector took over, gates and emissions alike, to be deleted from the spine.
     consumed: Vec<NodeIndex>,
 }
@@ -85,7 +97,7 @@ struct Absorption {
 /// between them is node indices, not circuits — `StableDiGraph` keeps indices valid across the
 /// removals and substitutions below.
 fn absorb_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
-    let plans = plan_absorptions(py, dag);
+    let plans = plan_absorptions(py, dag)?;
     // Kept as a sequence as well as a set, so that removal order is fixed rather than whatever the
     // set happens to iterate in.
     let consumed: Vec<NodeIndex> = plans
@@ -160,7 +172,7 @@ fn is_absorbable_gate(dag: &DAGCircuit, inst: &PackedInstruction) -> bool {
 ///
 /// Collectors are handled first-come-first-served: a node one collector has claimed is a barrier to
 /// the next, so nothing is absorbed twice. Topological order makes which one wins deterministic.
-fn plan_absorptions(py: Python, dag: &DAGCircuit) -> Vec<Absorption> {
+fn plan_absorptions(py: Python, dag: &DAGCircuit) -> PyResult<Vec<Absorption>> {
     let mut plans: Vec<Absorption> = Vec::new();
     let mut claimed: HashSet<NodeIndex> = HashSet::new();
 
@@ -171,17 +183,13 @@ fn plan_absorptions(py: Python, dag: &DAGCircuit) -> Vec<Absorption> {
         };
         let qubits: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();
 
-        // Walking leftward visits the outermost content last, so both lists come back reversed.
-        // Reversing the gates too keeps each run's body order matching its count.
-        let mut left = walk_absorb(py, dag, collector, Direction::Left, &qubits, &claimed);
-        left.items.reverse();
-        left.gates.reverse();
-        let right = walk_absorb(py, dag, collector, Direction::Right, &qubits, &claimed);
+        // Walking leftward visits the outermost content last, so it comes back reversed.
+        let mut left = walk_absorb(py, dag, collector, Direction::Left, &qubits, &claimed)?;
+        left.content.reverse();
+        let right = walk_absorb(py, dag, collector, Direction::Right, &qubits, &claimed)?;
 
-        let mut items = left.items;
-        items.extend(right.items);
-        let mut gates = left.gates;
-        gates.extend(right.gates);
+        let mut content = left.content;
+        content.extend(right.content);
         let mut consumed = left.consumed;
         consumed.extend(right.consumed);
 
@@ -189,18 +197,16 @@ fn plan_absorptions(py: Python, dag: &DAGCircuit) -> Vec<Absorption> {
         plans.push(Absorption {
             collector,
             spec,
-            items,
-            gates,
+            content,
             consumed,
         });
     }
-    plans
+    Ok(plans)
 }
 
 /// What one direction of one collector's walk found.
 struct Walk {
-    items: Vec<CollectItem>,
-    gates: Vec<NodeIndex>,
+    content: Vec<BodyOp>,
     consumed: Vec<NodeIndex>,
 }
 
@@ -217,7 +223,7 @@ fn walk_absorb(
     direction: Direction,
     qubits: &[Qubit],
     claimed: &HashSet<NodeIndex>,
-) -> Walk {
+) -> PyResult<Walk> {
     // The direction an emission must have to face this collector.
     let facing = match direction {
         Direction::Right => Direction::Left,
@@ -226,11 +232,9 @@ fn walk_absorb(
     let mut cursor: HashMap<Qubit, NodeIndex> =
         qubits.iter().map(|qubit| (*qubit, collector)).collect();
     let mut walk = Walk {
-        items: Vec::new(),
-        gates: Vec::new(),
+        content: Vec::new(),
         consumed: Vec::new(),
     };
-    let mut run: usize = 0;
 
     loop {
         // Drain the single-qubit gates now adjacent. A run on one wire comes off one at a time, and
@@ -240,8 +244,7 @@ fn walk_absorb(
                 if !is_absorbable_gate(dag, dag.dag()[next].unwrap_operation()) {
                     break;
                 }
-                run += 1;
-                walk.gates.push(next);
+                walk.content.push(BodyOp::Gate(next));
                 walk.consumed.push(next);
                 cursor.insert(*qubit, next);
             }
@@ -254,7 +257,7 @@ fn walk_absorb(
             let node = adjacent(dag, &cursor, *qubit, direction, claimed)?;
             let inst = dag.dag()[node].unwrap_operation();
             let spec = emission_spec(py, inst)?;
-            if spec.direction != facing {
+            if spec.direction != Some(facing) {
                 return None;
             }
             dag.qargs_interner()
@@ -266,25 +269,41 @@ fn walk_absorb(
         let Some((node, spec)) = layer else {
             break;
         };
-        if run > 0 {
-            walk.items.push(CollectItem::Gates(run));
-            run = 0;
-        }
-        walk.items.push(CollectItem::Emission(LocalEmission {
+        let inst = dag.dag()[node].unwrap_operation();
+        let local_wires: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();
+        let local_spec = EmitSpec {
+            source: spec.source,
+            direction: None,
             partition: spec.partition.clone(),
             parts: spec.parts.clone(),
-        }));
+        };
+        let op = local_emit_op(py, local_spec)?;
+        walk.content.push(BodyOp::Local(op, local_wires));
         walk.consumed.push(node);
-        let inst = dag.dag()[node].unwrap_operation();
         for wire in dag.qargs_interner().get(inst.qubits) {
             cursor.insert(*wire, node);
         }
     }
 
-    if run > 0 {
-        walk.items.push(CollectItem::Gates(run));
-    }
-    walk
+    Ok(walk)
+}
+
+/// Build the `PackedOperation` for a local emission, resolved in place rather than propagating.
+///
+/// Mirrors `build.rs::write_emissions`'s construction of a spine `Emit`, minus the qargs (those are
+/// resolved later, when the emission is placed into its collector's body).
+fn local_emit_op(py: Python, spec: EmitSpec) -> PyResult<PackedOperation> {
+    let num_qubits = spec.partition.all_elements().len() as u32;
+    let op_name = spec.source.name().to_string();
+    let emit = Py::new(py, Emit::new(spec))?;
+    Ok(PackedOperation::from(PyInstruction {
+        kind: PyOpKind::Operation,
+        qubits: num_qubits,
+        clbits: 0,
+        params: 0,
+        op_name,
+        ob: emit.into_any(),
+    }))
 }
 
 /// The node this wire sees next, or `None` if the wire is not the collector's, has ended, or runs
@@ -301,46 +320,50 @@ fn adjacent(
     (!claimed.contains(&next)).then_some(next)
 }
 
-/// Build a collector's body from the gates it absorbed, remapped into its own frame.
+/// Build a collector's body from what it absorbed, remapped into its own frame.
 fn build_body(dag: &DAGCircuit, plan: &Absorption) -> PyResult<DAGCircuit> {
     let inst = dag.dag()[plan.collector].unwrap_operation();
     let frame: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();
     let num_clbits = dag.cargs_interner().get(inst.clbits).len();
-    let mut body = new_dag_body(frame.len(), num_clbits, plan.gates.len())?.into_builder();
+    let mut body = new_dag_body(frame.len(), num_clbits, plan.content.len())?.into_builder();
 
-    for node in &plan.gates {
-        let gate = dag.dag()[*node].unwrap_operation();
-        let qargs: Vec<Qubit> = dag
-            .qargs_interner()
-            .get(gate.qubits)
+    // The walk only ever offers content on the collector's own wires, so this always resolves.
+    let remap = |wires: &[Qubit]| -> Vec<Qubit> {
+        wires
             .iter()
             .map(|wire| {
-                // The walk only offers gates on the collector's own wires, so this always resolves.
                 let local = frame
                     .iter()
                     .position(|q| q == wire)
-                    .expect("an absorbed gate is on one of its collector's wires");
+                    .expect("absorbed content is on one of its collector's wires");
                 Qubit(local as u32)
             })
-            .collect();
-        super::utils::append(&mut body, gate.op.clone(), params_of(gate), &qargs, &[])?;
+            .collect()
+    };
+
+    for op in &plan.content {
+        match op {
+            BodyOp::Gate(node) => {
+                let gate = dag.dag()[*node].unwrap_operation();
+                let qargs = remap(dag.qargs_interner().get(gate.qubits));
+                super::utils::append(&mut body, gate.op.clone(), params_of(gate), &qargs, &[])?;
+            }
+            BodyOp::Local(local_op, wires) => {
+                let qargs = remap(wires);
+                super::utils::append(&mut body, local_op.clone(), None, &qargs, &[])?;
+            }
+        }
     }
     Ok(body.build())
 }
 
-/// The collector operation carrying the newly absorbed items.
+/// The collector operation carrying the newly absorbed body.
 fn collect_op(py: Python, dag: &DAGCircuit, plan: &Absorption) -> PyResult<PackedOperation> {
     let inst = dag.dag()[plan.collector].unwrap_operation();
     let spec = CollectSpec {
-        items: plan.items.clone(),
         partition: plan.spec.partition.clone(),
         parts: plan.spec.parts.clone(),
     };
-    debug_assert_eq!(
-        spec.gate_count(),
-        plan.gates.len(),
-        "absorbed gates must match the items' `Gates` counts"
-    );
     let annotation = Py::new(py, (Collect::new_from_spec(spec), PyAnnotation))?;
     Ok(PackedOperation::from_control_flow(Box::new(
         ControlFlowInstruction {
@@ -373,15 +396,21 @@ fn plan_descents(
         let Some(spec) = emission_spec(py, dag.dag()[node].unwrap_operation()) else {
             continue;
         };
-        let Some(target) = descent_target(py, dag, node, spec.direction) else {
+        // A local emission never sits on the spine — it is written straight into its collector's
+        // body, never left standalone — so a spine-level emission this scan finds always has a
+        // direction to propagate in.
+        let direction = spec
+            .direction
+            .expect("a spine-level emission always has a direction");
+        let Some(target) = descent_target(py, dag, node, direction) else {
             continue;
         };
         match descents
             .iter_mut()
             .find(|(box_node, _)| *box_node == target)
         {
-            Some((_, injections)) => injections.push((node, spec.direction)),
-            None => descents.push((target, vec![(node, spec.direction)])),
+            Some((_, injections)) => injections.push((node, direction)),
+            None => descents.push((target, vec![(node, direction)])),
         }
     }
     descents
