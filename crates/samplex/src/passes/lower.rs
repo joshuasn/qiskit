@@ -31,9 +31,13 @@
 //! template is a terminal artifact handed to `QuantumCircuit._from_circuit_data` rather than a pass
 //! input, so it stays `CircuitData` and nothing here mutates its input. Both readers — the template
 //! writer and the graph's `flatten` — traverse in `topological_op_nodes` order, which is what lets
-//! [`build_sampling_graph`] pair its collectors with the template's parameter ranges by position. The
-//! one place that order is *wrong* is inside a collector body, which is a sequence rather than a graph;
-//! see the note in [`flatten`].
+//! [`build_sampling_graph`] pair its collectors with the template's parameter ranges by position.
+//!
+//! Inside a collector body that order is *arbitrary rather than wrong*: it is one linear extension of
+//! the body among several, differing from the walk's own order wherever two steps sit on disjoint
+//! wires. Nothing downstream depends on which one it is, but nothing may report it as circuit order
+//! either; see the note in `flatten` and
+//! [`Collect::steps`](crate::virtual_flow_graph::Collect::steps).
 
 use std::sync::Arc;
 
@@ -45,7 +49,7 @@ use qiskit_circuit::dag_circuit::DAGCircuit;
 use qiskit_circuit::operations::{Operation, OperationRef, Param, StandardGate};
 use qiskit_circuit::packed_instruction::PackedInstruction;
 use qiskit_circuit::parameter::parameter_expression::ParameterExpression;
-use qiskit_circuit::parameter::symbol_expr::Symbol;
+use qiskit_circuit::parameter::symbol_expr::{Symbol, Value};
 
 use hashbrown::{HashMap, HashSet};
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
@@ -56,10 +60,11 @@ use super::utils::{IntoPyResult, block_body, collect_annotation, emission_spec, 
 use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::{DistEntry, DistributionTable};
 use crate::emission_circuit::{EmitSource, EmitSpec};
+use crate::parameters::ParameterTable;
 use crate::partition::Partition;
 use crate::virtual_flow_graph::{
-    AbsorbedGate, Collect, CollectStep, Direction, Edge, Emission, LocalEmission, Measure, Node,
-    NodeKind, Propagate, VirtualFlowGraph,
+    AbsorbedGate, AbsorbedParam, Collect, CollectStep, Direction, Edge, Emission, LocalEmission,
+    Measure, Node, NodeKind, Propagate, VirtualFlowGraph,
 };
 use crate::virtual_type::{VirtualType, propagates};
 
@@ -132,20 +137,22 @@ pub fn py_build_template(
     Ok((PyCircuitData { inner: template }, summary))
 }
 
-/// Lower an emission circuit into its executable pair: template circuit and sampling graph.
+/// Lower an emission circuit into the three artifacts that execute it: template circuit, sampling
+/// graph, and parameter table.
 ///
-/// Both are read off the same IR2 circuit, so the graph's parameter ranges are exactly the ones the
-/// template minted.
+/// All three are read off the same IR2 circuit, so the graph's parameter ranges are exactly the ones
+/// the template minted, and the keys its absorbed gates carry are exactly the ones the table interned.
+/// The table is empty unless some absorbed gate had a symbolic angle.
 #[pyfunction]
 #[pyo3(name = "lower")]
 pub fn py_lower(
     py: Python,
     dag: &DAGCircuit,
     table: &DistributionTable,
-) -> PyResult<(PyCircuitData, VirtualFlowGraph)> {
+) -> PyResult<(PyCircuitData, VirtualFlowGraph, ParameterTable)> {
     let (template, collectors) = build_template(py, dag)?;
-    let graph = build_sampling_graph(py, dag, table, &collectors)?;
-    Ok((PyCircuitData { inner: template }, graph))
+    let (graph, parameters) = build_sampling_graph(py, dag, table, &collectors)?;
+    Ok((PyCircuitData { inner: template }, graph, parameters))
 }
 
 /// Emit one scope's worth of template content. `frame` maps scope-local qubits to circuit qubits.
@@ -321,13 +328,19 @@ struct CollectorInfo {
     param_indices: Vec<usize>,
     /// The annotated boxes whose emissions this collector consumes.
     owned: Vec<u32>,
-    /// Everything this collector composes, in circuit order — local emissions and absorbed gates.
+    /// Everything this collector composes — local emissions and absorbed gates — in the order
+    /// [`flatten`] read them out of the body. Per-wire order is what that guarantees; see
+    /// [`Collect::steps`].
     steps: Vec<CollectStep>,
 }
 
 impl CollectorInfo {
-    /// The absorbed gates alone, in circuit order. Used by an *enclosing* emission crossing this
+    /// The absorbed gates alone, in the same order. Used by an *enclosing* emission crossing this
     /// collector, which conjugates by the gates and ignores what the collector consumes.
+    ///
+    /// Reading them in a different linear extension would be harmless here: [`chain`] advances the
+    /// frontier per qubit, so gates on disjoint wires build independent `Propagate` nodes whatever
+    /// order they are visited in, and gates sharing a wire keep their relative order in any extension.
     fn gates(&self) -> impl Iterator<Item = &AbsorbedGate> {
         crate::virtual_flow_graph::collect_step_gates(&self.steps)
     }
@@ -351,20 +364,24 @@ enum Event {
 /// absorbed run — zero for a gate that stands on its own.
 type GateKey = (usize, usize, Direction, VirtualType);
 
-/// Build the sampling graph for an emission circuit.
+/// Build the sampling graph for an emission circuit, and the parameter table it refers into.
 ///
 /// `collectors` comes from [`build_template`], so the graph's `Collect` nodes carry exactly the
 /// parameter ranges the template minted.
+///
+/// The table is built here rather than passed in because this is where absorbed gates are read: it is
+/// an *output* of lowering, unlike the distribution table, which the build pass produced.
 pub fn build_sampling_graph(
     py: Python,
     dag: &DAGCircuit,
     table: &DistributionTable,
     collectors: &[CollectorParams],
-) -> PyResult<VirtualFlowGraph> {
+) -> PyResult<(VirtualFlowGraph, ParameterTable)> {
     let mut events = Vec::new();
     let mut infos = Vec::new();
+    let mut parameters = ParameterTable::new();
     let identity: Vec<usize> = (0..dag.num_qubits()).collect();
-    flatten(py, dag, &identity, &mut events, &mut infos)?;
+    flatten(py, dag, &identity, &mut events, &mut infos, &mut parameters)?;
 
     if infos.len() != collectors.len() {
         return Err(PyValueError::new_err(format!(
@@ -470,7 +487,7 @@ pub fn build_sampling_graph(
             &mut gate_nodes,
         )?;
     }
-    Ok(vfg)
+    Ok((vfg, parameters))
 }
 
 /// Scan from `start` in `direction` for the collector that *owns* this emission's box.
@@ -501,6 +518,37 @@ fn scan_for_owning_collector(
     None
 }
 
+/// Read one absorbed gate parameter, interning it only if it is genuinely symbolic.
+///
+/// A fully bound expression folds to [`AbsorbedParam::Bound`] rather than being interned, which is what
+/// leaves [`ParameterTable::free`] meaning exactly "what the caller still has to supply" — an entry
+/// there is never something already determined.
+///
+/// [`Param::Obj`] is refused rather than stored: it holds a `Py<PyAny>`, and the sampling graph is read
+/// without the GIL, so carrying one would turn cloning a graph off-thread into a panic. No standard
+/// gate produces one today, so this is a guard rather than a limitation.
+fn absorbed_param(table: &mut ParameterTable, param: &Param) -> PyResult<AbsorbedParam> {
+    match param {
+        Param::Float(value) => Ok(AbsorbedParam::Bound(*value)),
+        Param::ParameterExpression(expr) if expr.num_symbols() == 0 => {
+            match expr.try_to_value(true).into_py_result()? {
+                Value::Real(value) => Ok(AbsorbedParam::Bound(value)),
+                Value::Int(value) => Ok(AbsorbedParam::Bound(value as f64)),
+                // Reported rather than silently projected onto the real axis: a complex angle is not
+                // something a rotation can be given, so it means the circuit was already wrong.
+                Value::Complex(value) => Err(PyValueError::new_err(format!(
+                    "cannot absorb a gate whose angle evaluates to the complex value {value}"
+                ))),
+            }
+        }
+        Param::ParameterExpression(expr) => Ok(AbsorbedParam::Symbolic(table.intern(expr.clone()))),
+        Param::Obj(_) => Err(PyValueError::new_err(
+            "cannot absorb a gate whose parameter is an opaque Python object: the sampling graph is \
+             read without the GIL, so it cannot carry one",
+        )),
+    }
+}
+
 /// Flatten a scope into events, inlining hard boxes and reducing each collector to one event.
 fn flatten(
     py: Python,
@@ -508,6 +556,7 @@ fn flatten(
     frame: &[usize],
     events: &mut Vec<Event>,
     infos: &mut Vec<CollectorInfo>,
+    parameters: &mut ParameterTable,
 ) -> PyResult<()> {
     // The same order [`write_scope`] uses, so the collectors this produces line up positionally with
     // the parameter ranges the template minted.
@@ -521,16 +570,26 @@ fn flatten(
             .collect();
 
         if let Some(spec) = collect_annotation(py, inst) {
-            // A collector's body is its absorbed content — gates and local emissions alike — kept in
-            // the order the absorption walk composed them. A local emission is a real `Emit`
-            // instruction spanning every qubit it covers, so the only ambiguity a topological sort
-            // leaves is between nodes on disjoint qubits, which is exactly where relative order does
-            // not matter.
+            // A collector's body is its absorbed content — gates and local emissions alike. This read
+            // yields *a* linear extension of it, not the order the absorption walk appended in:
+            // `topological_op_nodes` breaks ties lexicographically on `(qargs, cargs)`, so nodes on
+            // disjoint qubits come back lowest-qubit-first. That is exactly where relative order does
+            // not matter, and a local emission is a real `Emit` instruction spanning every qubit it
+            // covers, so it stays a barrier that no extension can move content across. What this must
+            // not be reported as is circuit order — see `Collect::steps`.
             let mut steps = Vec::new();
             if let Some(body) = block_body(src, inst)? {
                 for node in body.topological_op_nodes(false) {
                     let gate = body.dag()[node].unwrap_operation();
                     if let OperationRef::StandardGate(standard) = gate.op.view() {
+                        // The angles have to come along: the collector folds them into what it
+                        // synthesizes, so they reach neither the template nor anything else if they
+                        // are not read here.
+                        let params = gate
+                            .params_view()
+                            .iter()
+                            .map(|param| absorbed_param(parameters, param))
+                            .collect::<PyResult<Vec<_>>>()?;
                         steps.push(CollectStep::Gate(AbsorbedGate {
                             gate: standard,
                             qubits: body
@@ -539,6 +598,7 @@ fn flatten(
                                 .iter()
                                 .map(|q| qubits[q.index()])
                                 .collect(),
+                            params,
                         }));
                         continue;
                     }
@@ -569,7 +629,7 @@ fn flatten(
 
         // A hard box is a grouping: inline it so its gates sit on the same spine.
         if let Some(body) = plain_box_body(src, inst)? {
-            flatten(py, body, &qubits, events, infos)?;
+            flatten(py, body, &qubits, events, infos, parameters)?;
             continue;
         }
 

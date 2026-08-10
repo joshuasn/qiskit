@@ -23,23 +23,30 @@ from .build import DISTRIBUTION_TABLE
 TEMPLATE = "samplex_template"
 #: Property set key for the sampling graph that computes the template's angles.
 FLOW_GRAPH = "samplex_flow_graph"
+#: Property set key for the table of symbolic angles absorbed into collectors.
+PARAMETERS = "samplex_parameters"
 
 
 class SamplexLower(AnalysisPass):
     """Produce the template circuit and sampling graph from an emission circuit.
 
     Each collector becomes a *synth template*: the fixed parametric fragment whose angles the sampling
-    graph will fill in. The gates absorbed into its body are discarded rather than executed, because
-    they fold into those angles -- which is the whole point of having absorbed them. ``Emit`` markers
-    are markers only and disappear, and hard boxes were a grouping so their content flattens out.
+    graph will fill in. The gates absorbed into its body are not executed separately, because they fold
+    into those angles -- which is the whole point of having absorbed them -- but their angles travel on
+    the graph, since whatever computes those angles needs them. ``Emit`` markers are markers only and
+    disappear, and hard boxes were a grouping so their content flattens out.
 
-    Both outputs are read off the same IR2 circuit, so the graph's parameter ranges are exactly the ones
-    the template minted rather than two things that have to be kept in agreement.
+    All three outputs are read off the same IR2 circuit, so the graph's parameter ranges are exactly the
+    ones the template minted rather than two things that have to be kept in agreement.
 
-    This is an analysis pass: the emission circuit is left untouched and the two artifacts go into the
-    property set, as ``"samplex_template"`` and ``"samplex_flow_graph"``. The template is a terminal
-    product -- a flat parametric circuit for execution, not something further passes transform -- which
-    is why it does not replace the DAG in the pipeline.
+    This is an analysis pass: the emission circuit is left untouched and the three artifacts go into the
+    property set, as ``"samplex_template"``, ``"samplex_flow_graph"`` and ``"samplex_parameters"``. The
+    template is a terminal product -- a flat parametric circuit for execution, not something further
+    passes transform -- which is why it does not replace the DAG in the pipeline.
+
+    The parameter table is empty unless some absorbed gate carried a symbolic angle. When it is not, its
+    ``free_parameters`` are a *required input to sampling*: a collector's angles are a function of them,
+    so they must be bound before drawing.
 
     Requires the distribution table :class:`.SamplexBuild` leaves in the property set. Because
     parameters are minted here, every pass that changes the number or width of collectors must have run
@@ -64,6 +71,7 @@ class SamplexLower(AnalysisPass):
                 "SamplexLower requires the distribution table that SamplexBuild puts in the property "
                 f"set under {DISTRIBUTION_TABLE!r}; run SamplexBuild first."
             )
-        template, graph = lower(dag, table)
+        template, graph, parameters = lower(dag, table)
         self.property_set[TEMPLATE] = QuantumCircuit._from_circuit_data(template)
         self.property_set[FLOW_GRAPH] = graph
+        self.property_set[PARAMETERS] = parameters

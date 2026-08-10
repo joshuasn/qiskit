@@ -81,8 +81,11 @@ class TestSamplexPasses(QiskitTestCase):
                 manager.run(notebook_circuit())
                 template = manager.property_set["samplex_template"]
                 graph = manager.property_set["samplex_flow_graph"]
+                parameters = manager.property_set["samplex_parameters"]
 
-                expected_template, expected_graph = directly(notebook_circuit(), merge)
+                expected_template, expected_graph, expected_parameters = directly(
+                    notebook_circuit(), merge
+                )
                 self.assertEqual(
                     [inst.operation.name for inst in template.data],
                     [
@@ -94,6 +97,9 @@ class TestSamplexPasses(QiskitTestCase):
                     [node[0] for node in graph.nodes()],
                     [node[0] for node in expected_graph.nodes()],
                 )
+                # the third artifact reaches the property set too, and says the same thing
+                self.assertEqual(parameters.entries(), expected_parameters.entries())
+                self.assertEqual(parameters.free_parameters, expected_parameters.free_parameters)
 
     def test_merging_reduces_collectors_and_parameters(self):
         # The point of the optional merge pass, visible through the pass manager: fewer, wider dressing

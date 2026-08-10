@@ -39,12 +39,20 @@
 //! **Emissions come off in layers.** An emission is absorbed only when it is the next node on *every*
 //! one of its wires at once — it has to be a barrier across all of them, or it would take content
 //! from the far side of it into the body ahead of where it belongs. Because a local emission is
-//! written into the body as a real instruction spanning every wire it covers, a plain
-//! `topological_op_nodes` read of the finished body reproduces the same composition order the walk
-//! found it in: the only ordering a topological sort leaves ambiguous is between nodes on disjoint
-//! qubits, which compose into independent subsystems and so have no order to get wrong.
+//! written into the body as a real instruction spanning every wire it covers, it is a barrier there
+//! too, so no later read can move content across it.
 //!
-//! The walk's order IS the composition order, so no `EmitSource`-based classification is needed.
+//! What survives a re-read of the body is therefore **per-wire order, not the walk's exact sequence**.
+//! A `topological_op_nodes` read yields *a* linear extension of the body, which is generally not the
+//! order the walk appended in: `DAGCircuit`'s topological sort breaks ties lexicographically on
+//! `(qargs, cargs)`, so two nodes on disjoint wires come back lowest-qubit-first regardless of when
+//! they were written. That is harmless — disjoint single-qubit gates commute, and each wire's own
+//! subsequence is preserved, which is the whole of what composition depends on — but it is the reason
+//! nothing downstream may claim the sequence is circuit order. See [`Collect::steps`].
+//!
+//! The walk's order IS *a* composition order, so no `EmitSource`-based classification is needed.
+//!
+//! [`Collect::steps`]: crate::virtual_flow_graph::Collect::steps
 //!
 //! **Nothing is moved between scopes.** A propagating emission is written inside the hard box it has to
 //! cross when the box is built, so it already sits where its walk has to start from; this pass only ever

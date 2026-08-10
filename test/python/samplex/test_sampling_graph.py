@@ -22,6 +22,7 @@ segment structure.
 """
 
 from qiskit import QuantumCircuit
+from qiskit.circuit import Parameter, ParameterVector
 from qiskit.converters import circuit_to_dag
 from qiskit._accelerate.samplex import (
     ChangeBasis,
@@ -42,8 +43,17 @@ def graph_of(circuit, optimize=True):
     if optimize:
         merge_collectors(dag)
         absorb_dressing(dag)
-    _, graph = lower(dag, table)
+    _, graph, _ = lower(dag, table)
     return graph
+
+
+def artifacts(circuit, optimize=True):
+    """All three lowering outputs, for the tests that need the parameter table too."""
+    dag, table = build_lowered(circuit_to_dag(circuit))
+    if optimize:
+        merge_collectors(dag)
+        absorb_dressing(dag)
+    return lower(dag, table)
 
 
 def kinds(graph):
@@ -65,12 +75,23 @@ def gates(node):
     return [step for step in node[3] if step[0] != "emit"]
 
 
+def on_wire(node, qubit):
+    """A collector's steps projected onto one qubit, as ``(name, angles)`` pairs.
+
+    This is the projection that ``steps`` actually guarantees. The flat sequence is one linear
+    extension of the body among several -- steps on disjoint wires come back lowest-qubit-first
+    whatever order they were written in -- so a wire's own subsequence is what a consumer may rely on.
+    """
+    return [(name, angles) for name, qubits, angles in node[3] if qubit in qubits]
+
+
 class TestCollectorOwnsAbsorbedGates(QiskitTestCase):
     """Absorbed gates are steps on the Collect node, not nodes of their own.
 
-    A collector's `steps` are one *ordered* sequence mixing the emissions it consumes with the gates it
-    absorbed, because where a gate sits in the layer matters — a `ChangeBasis` wraps the absorbed gates
-    while a twirl composes inside them.
+    A collector's `steps` are one sequence mixing the emissions it consumes with the gates it absorbed,
+    because where a gate sits *relative to the same wire* matters — a `ChangeBasis` wraps the absorbed
+    gates while a twirl composes inside them. Order between disjoint wires carries no meaning; see
+    TestStepsOrderIsPerWire.
     """
 
     def test_absorbed_gate_is_recorded_on_its_collector(self):
@@ -85,7 +106,7 @@ class TestCollectorOwnsAbsorbedGates(QiskitTestCase):
         left, right = collects
         # the h was absorbed into the left dressing, on qubit 0, and composes before the twirl factor
         # the local near twirl half shows its partition qubits [0, 1]
-        self.assertEqual(left[3], [("h", [0]), ("emit", [0, 1])])
+        self.assertEqual(left[3], [("h", [0], []), ("emit", [0, 1], [])])
         self.assertEqual(gates(right), [])
 
     def test_a_basis_change_composes_outside_the_absorbed_gates(self):
@@ -99,7 +120,7 @@ class TestCollectorOwnsAbsorbedGates(QiskitTestCase):
         graph = graph_of(circuit)
 
         left = of_kind(graph, "collect:")[0]
-        self.assertEqual(left[3], [("emit", [0, 1]), ("h", [0]), ("emit", [0, 1])])
+        self.assertEqual(left[3], [("emit", [0, 1], []), ("h", [0], []), ("emit", [0, 1], [])])
 
     def test_absorbed_gates_are_not_propagate_nodes(self):
         circuit = QuantumCircuit(2)
@@ -119,7 +140,7 @@ class TestCollectorOwnsAbsorbedGates(QiskitTestCase):
             circuit.cx(0, 1)
         graph = graph_of(circuit)
         left = of_kind(graph, "collect:")[0]
-        self.assertEqual(gates(left), [("h", [0]), ("s", [0])])
+        self.assertEqual(gates(left), [("h", [0], []), ("s", [0], [])])
 
     def test_a_merged_collector_owns_every_contribution(self):
         # This is the case that has no per-emission attribution: after merging, the collector holds
@@ -134,12 +155,200 @@ class TestCollectorOwnsAbsorbedGates(QiskitTestCase):
         graph = graph_of(circuit)
 
         middle = next(c for c in of_kind(graph, "collect:") if len(gates(c)) > 1)
-        # each box's own run, first box then second — so the two layers meet outermost-to-outermost
-        # local emissions show their partition qubits after absorption
+        # both contributions are there, and on each wire the absorbed gate sits between the two local
+        # emissions — the two layers meeting outermost-to-outermost. Asserted per wire rather than as a
+        # flat list: `s` and `h` are on disjoint qubits, so their relative position in the sequence is
+        # an artifact of the topological read. See TestStepsOrderIsPerWire.
+        self.assertEqual(on_wire(middle, 0), [("emit", []), ("s", []), ("emit", [])])
+        self.assertEqual(on_wire(middle, 1), [("emit", []), ("h", []), ("emit", [])])
+
+
+class TestStepsOrderIsPerWire(QiskitTestCase):
+    """`steps` is a linear extension of the body's per-qubit order, not circuit order.
+
+    Lowering reads a collector body with ``topological_op_nodes``, whose tie-break is lexicographic on
+    ``(qargs, cargs)`` -- so two steps on disjoint wires come back lowest-qubit-first however they were
+    written. The field used to be documented as circuit order, which is false, and an assertion on the
+    flat sequence pins an arbitrary choice rather than a guarantee.
+
+    Nothing is broken by this: a collector synthesizes three angles *per qubit*, every absorbed gate is
+    single-qubit, and single-qubit gates on distinct qubits commute, so every linear extension of one
+    body evaluates identically. These tests pin what is guaranteed, and pin the divergence itself so it
+    stays a known property rather than a surprise.
+    """
+
+    @staticmethod
+    def diverging():
+        """A merged collector whose reported order is provably not circuit order.
+
+        The first box contributes ``s`` on the *higher* wire and the second ``h`` on the lower one, so
+        circuit order is ``s`` then ``h`` and the lexicographic tie-break reverses them.
+        """
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl(dressing="right")]):
+            circuit.cx(0, 1)
+            circuit.s(1)
+        with circuit.box([Twirl(dressing="left")]):
+            circuit.h(0)
+            circuit.cx(0, 1)
+        return circuit
+
+    def merged(self):
+        graph = graph_of(self.diverging())
+        return next(c for c in of_kind(graph, "collect:") if len(gates(c)) > 1)
+
+    def test_the_flat_sequence_is_not_circuit_order(self):
+        # `s` is from the first box and `h` from the second, so circuit order is s, h -- and this is
+        # the reverse. Pinned deliberately: it is the thing a consumer must not depend on.
+        self.assertEqual([step[0] for step in gates(self.merged())], ["h", "s"])
+
+    def test_each_wire_keeps_its_own_order(self):
+        # What is guaranteed. Each wire sees its absorbed gate between the two local emissions, which
+        # is what makes "the twirl factor composes inside the easy gates" well defined.
+        middle = self.merged()
+        self.assertEqual([name for name, _ in on_wire(middle, 0)], ["emit", "h", "emit"])
+        self.assertEqual([name for name, _ in on_wire(middle, 1)], ["emit", "s", "emit"])
+
+    def test_a_local_emission_is_a_barrier_on_every_wire_it_covers(self):
+        # A local emission spans all its qubits, so no linear extension can move an absorbed gate
+        # across it. That is what survives the re-read, and what the per-wire guarantee rests on.
+        middle = self.merged()
+        for qubit in (0, 1):
+            names = [name for name, _ in on_wire(middle, qubit)]
+            self.assertEqual(names[0], "emit")
+            self.assertEqual(names[-1], "emit")
+            self.assertEqual(names.count("emit"), 2)
+
+    def test_order_is_stable_across_runs(self):
+        # Arbitrary between wires, but not *random*: the same circuit lowers to the same sequence, so
+        # the choice is reproducible even though it is not meaningful.
+        runs = [[c[3] for c in of_kind(graph_of(self.diverging()), "collect:")] for _ in range(3)]
+        self.assertEqual(runs, [runs[0]] * 3)
+
+
+class TestAbsorbedAngles(QiskitTestCase):
+    """An absorbed gate's angle travels with the graph.
+
+    A collector folds its absorbed gates into the angles it synthesizes, so those gates are deliberately
+    *not* written into the template. That makes the graph the only place their angles can live: dropping
+    them left an absorbed ``rz(0.3)`` in neither artifact, so no binding of the template could reproduce
+    the circuit. Bound angles ride inline on the step; symbolic ones are keys into the parameter table,
+    whose ``free_parameters`` are what a caller still has to supply.
+    """
+
+    def test_a_bound_angle_rides_inline(self):
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl()]):
+            circuit.rz(0.3, 0)
+            circuit.cx(0, 1)
+        _, graph, params = artifacts(circuit)
+
+        absorbed = [step for c in of_kind(graph, "collect:") for step in gates(c)]
+        self.assertEqual(absorbed, [("rz", [0], ["0.3"])])
+        # nothing symbolic, so nothing for the caller to bind
+        self.assertEqual(len(params), 0)
+        self.assertEqual(params.free_parameters, [])
+
+    def test_a_symbolic_angle_becomes_a_key_the_caller_must_bind(self):
+        theta = Parameter("t")
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl()]):
+            circuit.rz(theta, 0)
+            circuit.cx(0, 1)
+        _, graph, params = artifacts(circuit)
+
+        absorbed = [step for c in of_kind(graph, "collect:") for step in gates(c)]
+        self.assertEqual(absorbed, [("rz", [0], ["#0"])])
+        self.assertEqual(params.entries(), ["t"])
+        self.assertEqual(params.free_parameters, ["t"])
+
+    def test_angles_absorbed_from_the_spine_survive_too(self):
+        # The case with the widest reach: `absorb_dressing` pulls in single-qubit gates from *outside*
+        # the box, so a rotation the user never put in a box still loses its angle if it is not read.
+        theta = Parameter("t")
+        circuit = QuantumCircuit(2)
+        circuit.rz(theta, 0)
+        with circuit.box([Twirl()]):
+            circuit.cx(0, 1)
+        circuit.rz(0.5, 1)
+        _, graph, params = artifacts(circuit)
+
+        absorbed = [step for c in of_kind(graph, "collect:") for step in gates(c)]
+        self.assertEqual(sorted(absorbed), [("rz", [0], ["#0"]), ("rz", [1], ["0.5"])])
+        self.assertEqual(params.free_parameters, ["t"])
+
+    def test_a_merged_collector_keeps_both_contributions_angles(self):
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl(dressing="right")]):
+            circuit.cx(0, 1)
+            circuit.rz(0.25, 0)
+        with circuit.box([Twirl(dressing="left")]):
+            circuit.rz(0.75, 1)
+            circuit.cx(0, 1)
+        _, graph, _ = artifacts(circuit)
+
+        middle = next(c for c in of_kind(graph, "collect:") if len(gates(c)) > 1)
+        self.assertEqual(sorted(gates(middle)), [("rz", [0], ["0.25"]), ("rz", [1], ["0.75"])])
+
+    def test_one_symbol_on_two_gates_is_one_entry(self):
+        theta = Parameter("t")
+        circuit = QuantumCircuit(2)
+        circuit.rz(theta, 0)
+        circuit.rz(theta, 1)
+        with circuit.box([Twirl()]):
+            circuit.cx(0, 1)
+        _, graph, params = artifacts(circuit)
+
+        absorbed = [step for c in of_kind(graph, "collect:") for step in gates(c)]
+        self.assertEqual(sorted(absorbed), [("rz", [0], ["#0"]), ("rz", [1], ["#0"])])
+        self.assertEqual(len(params), 1)
+        self.assertEqual(params.free_parameters, ["t"])
+
+    def test_a_fully_bound_expression_is_not_a_free_parameter(self):
+        # `2 * t` bound to a value is arithmetic, not something to supply, so it folds to a plain angle
+        # and the table stays empty. That is what keeps `free_parameters` meaning "still needed".
+        theta = Parameter("t")
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl()]):
+            circuit.rz(2 * theta, 0)
+            circuit.cx(0, 1)
+        circuit = circuit.assign_parameters({theta: 0.5})
+        _, graph, params = artifacts(circuit)
+
+        absorbed = [step for c in of_kind(graph, "collect:") for step in gates(c)]
+        self.assertEqual(absorbed, [("rz", [0], ["1"])])
+        self.assertEqual(len(params), 0)
+        self.assertEqual(params.free_parameters, [])
+
+    def test_parameter_vector_elements_are_named_individually(self):
+        # A vector element's bare `name` is the shared vector name, so listing by it would collapse the
+        # elements into one. The caller binds `v[0]` and `v[1]` separately.
+        vector = ParameterVector("v", 2)
+        circuit = QuantumCircuit(2)
+        circuit.rz(vector[0], 0)
+        circuit.rz(vector[1], 1)
+        with circuit.box([Twirl()]):
+            circuit.cx(0, 1)
+        _, _, params = artifacts(circuit)
+
+        self.assertEqual(params.free_parameters, ["v[0]", "v[1]"])
+
+    def test_the_table_is_deterministic(self):
+        # `iter_symbols` walks a HashMap, so an unsorted free list would differ run to run.
+        vector = ParameterVector("w", 4)
+        circuit = QuantumCircuit(4)
+        for index in range(4):
+            circuit.rz(vector[index], index)
+        with circuit.box([Twirl()]):
+            circuit.cx(0, 1)
+            circuit.cx(2, 3)
+
+        runs = [artifacts(circuit)[2] for _ in range(3)]
         self.assertEqual(
-            middle[3],
-            [("emit", [0, 1]), ("s", [0]), ("h", [1]), ("emit", [0, 1])],
+            [run.free_parameters for run in runs],
+            [["w[0]", "w[1]", "w[2]", "w[3]"]] * 3,
         )
+        self.assertEqual([run.entries() for run in runs], [runs[0].entries()] * 3)
 
 
 class TestPropagation(QiskitTestCase):
@@ -293,7 +502,7 @@ class TestAgreementWithTheTemplate(QiskitTestCase):
         dag, table = build_lowered(circuit_to_dag(circuit))
         absorb_dressing(dag)
         merge_collectors(dag)
-        template, graph = lower(dag, table)
+        template, graph, _ = lower(dag, table)
 
         allocated = sorted(i for node in graph.nodes() for i in node[2])
         self.assertEqual(allocated, list(range(len(allocated))))
@@ -401,7 +610,8 @@ class TestVirtualTypePreservation(QiskitTestCase):
         with circuit.box([Twirl()]):
             circuit.rz(0.3, 0)
         graph = graph_of(circuit)
-        self.assertEqual(gates(of_kind(graph, "collect:")[0]), [("rz", [0])])
+        # and its angle comes along, because the collector folds it into what it synthesizes
+        self.assertEqual(gates(of_kind(graph, "collect:")[0]), [("rz", [0], ["0.3"])])
 
 
 class TestNestedPropagation(QiskitTestCase):

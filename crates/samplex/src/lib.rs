@@ -30,6 +30,7 @@ pub mod annotated_circuit;
 pub mod distributions;
 pub mod error;
 pub mod emission_circuit;
+pub mod parameters;
 pub mod partition;
 pub mod passes;
 pub mod virtual_flow_graph;
@@ -43,6 +44,7 @@ pub fn samplex_mod(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<annotated_circuit::Tag>()?;
     m.add_class::<emission_circuit::Collect>()?;
     m.add_class::<distributions::DistributionTable>()?;
+    m.add_class::<parameters::ParameterTable>()?;
     m.add_class::<emission_circuit::Emit>()?;
     m.add_class::<virtual_flow_graph::VirtualFlowGraph>()?;
     m.add_wrapped(wrap_pyfunction!(passes::build::py_build))?;

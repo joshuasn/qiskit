@@ -18,6 +18,7 @@ use rustworkx_core::petgraph::stable_graph::{NodeIndex, StableDiGraph};
 
 use crate::distributions::DistEntry;
 use crate::emission_circuit::EmitPart;
+use crate::parameters::ParamKey;
 use crate::partition::Partition;
 pub use crate::virtual_type::VirtualType;
 
@@ -28,9 +29,18 @@ pub use crate::annotated_circuit::{
 
 /// One node as seen from Python: `(kind, qubits, param_indices, steps)`.
 ///
-/// `steps` is a `Collect`'s composition order — `("emit", [id])` or `(gate name, qubits)` — and empty
-/// for every other kind.
-pub type NodeSummary = (String, Vec<usize>, Vec<usize>, Vec<(String, Vec<usize>)>);
+/// `steps` is a `Collect`'s composition sequence — `("emit", qubits, [])` or
+/// `(gate name, qubits, angles)` — and empty for every other kind. An angle renders as its value if
+/// bound and as `#key` if it is symbolic, in which case the key indexes the run's
+/// [`ParameterTable`](crate::parameters::ParameterTable).
+///
+/// Only per-qubit order within `steps` is meaningful; see [`Collect::steps`].
+pub type NodeSummary = (
+    String,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<(String, Vec<usize>, Vec<String>)>,
+);
 
 // --- Enums ---
 
@@ -131,12 +141,38 @@ pub struct Emission {
     pub virtual_type: VirtualType,
 }
 
+/// One parameter of an absorbed gate.
+///
+/// Split rather than uniformly keyed because the two cases differ for whoever evaluates the graph: a
+/// `Bound` angle folds straight into the collector's sampled angles, while a `Symbolic` one cannot be
+/// used until the caller has bound it. Only the latter needs the table, so only the latter is indirect
+/// — which is what leaves [`ParameterTable::free`](crate::parameters::ParameterTable::free) meaning
+/// exactly "what the caller must supply".
+#[derive(Debug, Clone, PartialEq)]
+pub enum AbsorbedParam {
+    /// A literal angle.
+    Bound(f64),
+    /// A symbolic angle; resolve it through the run's
+    /// [`ParameterTable`](crate::parameters::ParameterTable).
+    Symbolic(ParamKey),
+}
+
 /// A gate folded into a collector's synthesized layer rather than executed separately.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`, because a bound angle is an `f64`. Nothing uses these as a hash key or sorts them, so
+/// `PartialEq` is all that was ever needed.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AbsorbedGate {
     pub gate: StandardGate,
     /// Circuit qubits, ascending.
     pub qubits: Vec<usize>,
+    /// The gate's angles, parallel with its own parameter list.
+    ///
+    /// A collector folds its absorbed gates into the angles it synthesizes, so these never reach the
+    /// template — they are an input to whatever computes those angles. Dropping them was a silent
+    /// correctness bug: an absorbed `rz(0.3)` appeared in neither artifact, so no binding of the
+    /// template could reproduce the circuit.
+    pub params: Vec<AbsorbedParam>,
 }
 
 /// An emission owned directly by its collector — adjacent to it, never propagating through gates.
@@ -156,12 +192,13 @@ pub struct LocalEmission {
     pub parts: Vec<EmitPart>,
 }
 
-/// One step in what a collector composes, in circuit order.
+/// One step in what a collector composes. See [`Collect::steps`] for what the sequence guarantees.
 ///
 /// Only what the collector *owns*: local emissions (table reads) and absorbed gates. Incoming
 /// emissions (far twirl halves arriving via graph edges) are NOT recorded here — their composition
 /// position is derived from graph topology (direction + generation distance) at evaluation time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Not `Eq`, because an absorbed gate's bound angle is an `f64`; see [`AbsorbedGate`].
+#[derive(Debug, Clone, PartialEq)]
 pub enum CollectStep {
     /// A local emission: read a value from the distribution table and compose it here.
     /// No VFG Emission node — the collector owns this directly.
@@ -174,23 +211,37 @@ pub enum CollectStep {
 pub struct Collect {
     pub synthesizer: SynthesizerType,
     pub param_indices: Vec<usize>,
-    /// Everything this collector composes, in circuit order.
+    /// Everything this collector composes, as **a linear extension of its per-qubit dependency
+    /// order**. Only each qubit's own subsequence is meaningful.
+    ///
+    /// It is deliberately *not* circuit order, and must not be read as such. Lowering reads the
+    /// collector body with `topological_op_nodes`, whose tie-break is lexicographic on
+    /// `(qargs, cargs)`, so steps on disjoint wires come out lowest-qubit-first however they were
+    /// written. Two boxes contributing `s` on q1 and then `h` on q0 report `h` before `s`.
+    ///
+    /// That costs nothing, because per-qubit order is the whole of what composition depends on: a
+    /// collector synthesizes three angles *per qubit*, every absorbed gate is single-qubit, and
+    /// single-qubit gates on distinct qubits commute. Every linear extension of one body therefore
+    /// evaluates identically. What it does mean is that a consumer must project onto a wire before
+    /// relying on relative order, and that a test asserting the flat list pins an arbitrary choice.
     ///
     /// The collector *owns* its absorbed gates rather than them being separate `Multiply` nodes on some
     /// emission's chain. That is deliberate: after merging, a collector holds absorbed gates from
     /// several boxes and there is no way to attribute each to the emission it multiplies into.
     ///
     /// It is one ordered sequence rather than a set of collected emissions plus a list of gates,
-    /// because position in the layer is meaningful: a `ChangeBasis` wraps the whole box and so composes
-    /// *outside* the absorbed easy gates, whereas an injection or twirl attaches to the hard content
-    /// and composes *inside* them.
+    /// because position relative to the *same* wire is meaningful: a `ChangeBasis` wraps the whole box
+    /// and so composes *outside* the absorbed easy gates, whereas an injection or twirl attaches to the
+    /// hard content and composes *inside* them. A local emission spans every wire it covers, so it is a
+    /// barrier no linear extension can move content across — which is what keeps that distinction
+    /// intact under any re-read.
     ///
     /// An enclosing emission that merely *crosses* this collector still gets ordinary `Propagate` nodes
     /// for these gates, derived positionally. The two roles are independent.
     pub steps: Vec<CollectStep>,
 }
 
-/// Filter a slice of collect steps to just the absorbed gates, in order.
+/// Filter a slice of collect steps to just the absorbed gates, keeping the sequence's order.
 pub fn collect_step_gates(steps: &[CollectStep]) -> impl Iterator<Item = &AbsorbedGate> {
     steps.iter().filter_map(|step| match step {
         CollectStep::Gate(gate) => Some(gate),
@@ -199,7 +250,8 @@ pub fn collect_step_gates(steps: &[CollectStep]) -> impl Iterator<Item = &Absorb
 }
 
 impl Collect {
-    /// The absorbed gates, in circuit order, ignoring the emissions interleaved between them.
+    /// The absorbed gates, ignoring the emissions interleaved between them, in whatever order
+    /// [`steps`](Self::steps) is in — per-wire, not circuit-wide.
     pub fn gates(&self) -> impl Iterator<Item = &AbsorbedGate> {
         collect_step_gates(&self.steps)
     }
@@ -260,9 +312,15 @@ impl VirtualFlowGraph {
     /// Per-node summary for inspection and testing: `(kind, qubits, param_indices, steps)`.
     ///
     /// Nodes come in index order, and [`edges`](Self::edges) refers to positions in this list.
-    /// `steps` is only non-empty for `Collect`, and gives its composition order: `("emit", [id])` for
-    /// a consumed emission, `(gate name, qubits)` for a gate folded into the layer. Both appear in one
-    /// list because their relative order is meaningful.
+    /// `steps` is only non-empty for `Collect`, and gives its composition sequence:
+    /// `("emit", qubits, [])` for a consumed emission, `(gate name, qubits, angles)` for a gate folded
+    /// into the layer. Both appear in one list because their order *on a shared wire* is meaningful.
+    /// Across disjoint wires it is not — [`Collect::steps`] says why, and an assertion on the flat list
+    /// is pinning an arbitrary choice.
+    ///
+    /// An angle renders as its value if bound and as `#key` if symbolic — see [`param_label`]. A local
+    /// emission's angles are empty because its payload belongs to the distribution table, not the
+    /// parameter one.
     fn nodes(&self) -> Vec<NodeSummary> {
         self.graph
             .node_indices()
@@ -285,11 +343,13 @@ impl VirtualFlowGraph {
                                     let mut qs: Vec<usize> =
                                         local.partition.all_elements().iter().copied().collect();
                                     qs.sort_unstable();
-                                    ("emit".to_string(), qs)
+                                    ("emit".to_string(), qs, Vec::new())
                                 }
-                                CollectStep::Gate(gate) => {
-                                    (gate.gate.name().to_string(), gate.qubits.clone())
-                                }
+                                CollectStep::Gate(gate) => (
+                                    gate.gate.name().to_string(),
+                                    gate.qubits.clone(),
+                                    gate.params.iter().map(param_label).collect(),
+                                ),
                             })
                             .collect(),
                     ),
@@ -394,6 +454,18 @@ fn format_partition(partition: &Partition) -> String {
         format!("{:?}", flat)
     } else {
         format!("{:?}", parts)
+    }
+}
+
+/// How one absorbed angle reads in a node summary.
+///
+/// A bound angle shows its value; a symbolic one shows `#key`, which indexes the run's
+/// [`ParameterTable`](crate::parameters::ParameterTable) — the graph does not carry the table, so the
+/// key is the honest thing to surface.
+fn param_label(param: &AbsorbedParam) -> String {
+    match param {
+        AbsorbedParam::Bound(value) => format!("{value}"),
+        AbsorbedParam::Symbolic(key) => format!("#{}", key.0),
     }
 }
 
