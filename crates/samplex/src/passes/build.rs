@@ -12,19 +12,16 @@
 
 //! Build pass: annotated circuit (IR1) → emission circuit (IR2).
 //!
-//! Turns each annotated box into `Emit` instructions plus the collect boxes that consume them, and a
-//! box holding the gates virtual state is conjugated by. Also produces the [`DistributionTable`] those
-//! emissions reference.
+//! Turns each annotated box into `Emit` instructions, the two collect boxes that consume them, and
+//! a box holding the gates virtual state is conjugated by. Also produces the [`DistributionTable`]
+//! those emissions reference.
 //!
-//! **This pass is purely local.** Every annotated box yields exactly two collect boxes, one per side,
-//! consuming only its own emissions and absorbing only its own easy gates. There is no cross-box
-//! state: no qubit-to-collector map, no detach logic, no shared collectors. Widening those collectors
-//! and fusing adjacent ones is `merge_collectors`' job. The consequence here is that a collect box is
-//! *complete* the moment it is emitted, so this is a single forward sweep with no deferred buffer,
-//! appending to a [`DAGCircuitBuilder`] rather than revisiting anything it has written.
+//! **This pass is purely local.** Every annotated box yields exactly two collect boxes, one per
+//! side, with no cross-box state; widening them and fusing adjacent ones is `merge_collectors`'
+//! job. So this is a single forward sweep appending to a [`DAGCircuitBuilder`], never revisiting
+//! what it has written.
 //!
-//! Parameters are deliberately absent: merging changes how many collectors exist and how wide they
-//! are, so labelling happens in the IR2 → IR3 lowering. See `SAMPLEX_IR_DESIGN.md`.
+//! Parameters are deliberately absent; they are minted during lowering.
 
 use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
@@ -55,27 +52,14 @@ use crate::virtual_type::VirtualType;
 
 use super::utils::{IntoPyResult, append, new_dag_body};
 
-/// The synthesizer assumed when a box's annotations do not name one.
-///
-/// Only `InjectLocalClifford` leaves this open — it has no `decomposition` field. Every other
-/// annotation defaults to `rzsx`, so that is the assumption here too.
+/// The synthesizer assumed when a box's annotations do not name one, which only
+/// `InjectLocalClifford` leaves open. Matches every other annotation's own default.
 const DEFAULT_SYNTHESIZER: SynthesizerType = SynthesizerType::RzSx;
 
 /// How deeply an emission nests inside its box, `0` being immediately against the hard content.
 ///
-/// This is the ordering the annotation vocabulary implies, and it is what fixes both the spine order and
-/// each collector's composition order:
-///
-/// - A **twirl** *is* the easy/hard boundary, so its pair is innermost.
-/// - An **injection** — noise, or a local Clifford — happens *to the hard content*, so it sits just
-///   outside the twirl point. `InjectLocalClifford` belongs here rather than with `ChangeBasis` despite
-///   resolving to the same `ResolvedBasis`; that is what [`BasisOrigin`] records.
-/// - A **basis change** applies to the box as a whole, so it is outermost — outside even the easy gates
-///   the dressing absorbed.
-///
-/// For a left-dressed box with all of them, the spine reads
-/// `collector, basis start, [easy gates], injections before + twirl, hard, injections after, basis end,
-/// collector`.
+/// Fixes both the spine order and each collector's composition order. `InjectLocalClifford` counts
+/// as an injection despite resolving to a `ResolvedBasis`, which is what [`BasisOrigin`] records.
 const DEPTH_TWIRL: u8 = 0;
 const DEPTH_INJECTION: u8 = 1;
 const DEPTH_BASIS: u8 = 2;
@@ -89,11 +73,7 @@ struct Placed {
     depth: u8,
 }
 
-/// How a walked scope's qubits map outward.
-///
-/// A scope is always walked alongside an output circuit of the same width, so a scope-local index is
-/// also an index into that output. `global` is what the emissions record, since the sampling graph
-/// works in the circuit's own frame rather than any box's.
+/// How a walked scope's qubits map outward. Emissions record `global`.
 struct Scope<'a> {
     /// Scope-local qubit → index in the output being written.
     qubits: &'a [usize],
@@ -189,7 +169,8 @@ pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, Distribution
 }
 
 impl Build {
-    /// Claim an id for one emitting box, naming the pairing between its emissions and its collectors.
+    /// Claim an id for one emitting box, naming the pairing between its emissions and its
+    /// collectors.
     fn alloc_box_id(&mut self) -> u32 {
         let id = self.next_box_id;
         self.next_box_id += 1;
@@ -219,7 +200,7 @@ impl Build {
                     if !matches!(cf.control_flow, ControlFlow::Box { .. }) {
                         return Err(PyValueError::new_err(format!(
                             "Unsupported control flow in a samplex circuit: '{}'. Only `box` is \
-                             supported; see the control-flow section of SAMPLEX_IR_DESIGN.md.",
+                             supported.",
                             cf.name()
                         )));
                     }
@@ -258,8 +239,8 @@ impl Build {
             .collect();
         let out_cargs = scope.out_clbits(dag.cargs_interner().get(inst.clbits))?;
 
-        // A box that emits nothing — unannotated, or `Tag` only — is a transparent wrapper. Flatten
-        // it: walk its body straight into the current output, remapped through this box's qargs.
+        // A box that emits nothing — unannotated, or `Tag` only — is a transparent wrapper, so walk
+        // its body straight into the current output.
         if !resolved.is_emitting() {
             let flat_q: Vec<usize> = out_qargs.iter().map(|q| q.index()).collect();
             let flat_c: Vec<usize> = out_cargs.iter().map(|c| c.index()).collect();
@@ -271,8 +252,8 @@ impl Build {
             return self.walk(py, body, out, &inner);
         }
 
-        // One id for this box, stamped on every emission it produces and on both of its collectors.
-        // That pairing is what a later pass checks instead of trusting adjacency.
+        // One id for this box, stamped on every emission it produces and on both of its collectors;
+        // the pairing later passes check instead of trusting adjacency.
         let box_id = self.alloc_box_id();
         let dressing = resolved.dressing.unwrap_or(Dressing::Left);
         let emissions = self.build_emissions(&resolved, &global, dressing, box_id);
@@ -282,9 +263,9 @@ impl Build {
             .map(|_| CollectPart { synthesizer })
             .collect();
 
-        // The body splits into gates the dressing can absorb and everything else. Nested annotated
-        // boxes are always "everything else", and are lowered recursively into the hard box so that
-        // an outer emission crossing them sees their real gates.
+        // The body splits into gates the dressing can absorb and everything else. A nested
+        // annotated box is always "everything else", lowered recursively into the hard box so an
+        // outer emission crossing it sees its real gates.
         let width = locals.len();
         let inner_global = global.clone();
         let inner_identity_q: Vec<usize> = (0..width).collect();
@@ -295,8 +276,9 @@ impl Build {
             clbits: &inner_identity_c,
         };
 
-        // Classified before anything is written, because whether there *is* hard content decides where
-        // the propagating emissions go, and they are written into the hard body ahead of its gates.
+        // Classified before anything is written, because whether there *is* hard content decides
+        // where the propagating emissions go, and they are written into the hard body ahead of its
+        // gates.
         let (easy_nodes, hard_nodes) = classify_body(body, resolved.dressing);
         let has_hard_content = !hard_nodes.is_empty();
 
@@ -364,10 +346,10 @@ impl Build {
         );
 
         // Build the hard body, with the propagating emissions *inside* it at the edge each starts
-        // from — front for the ones travelling right, back for the ones travelling left. That is where
-        // they belong: the hard content is exactly what they are conjugated by on the way to the far
-        // collector, so writing them outside it would put the box boundary between an emission and the
-        // gates it has to cross. It also means nothing has to move them later.
+        // from — front for the ones travelling right, back for the ones travelling left. The hard
+        // content is exactly what conjugates them, so writing them outside would put the box
+        // boundary between an emission and the gates it has to cross, and something would have to
+        // move them later.
         let mut hard_builder = new_body(width, body_clbits.len(), hard_nodes.len())?.into_builder();
         if has_hard_content {
             write_emissions(py, &mut hard_builder, &left_propagating, &inner)?;
@@ -382,9 +364,9 @@ impl Build {
                             )));
                         }
                         // A nested annotated box is lowered in place, so its collect boxes and
-                        // emissions land inside this hard box. An outer emission's walk crosses them
-                        // — including the gates the inner dressing absorbed, which are still real
-                        // gates in the inner collector's body at this stage.
+                        // emissions land inside this hard box, where an outer emission's walk
+                        // crosses them — including the gates the inner dressing absorbed, which are
+                        // still real gates in the inner collector's body at this stage.
                         self.walk_box(py, body, inst, &mut hard_builder, &inner)?;
                     }
                     _ => copy_instruction(body, inst, &mut hard_builder, &inner)?,
@@ -410,8 +392,9 @@ impl Build {
             Direction::Left,
         );
         write_emissions(py, out, &left_inner, scope)?;
-        // With no hard content there is no hard box to sit inside, and nothing for the emission to be
-        // conjugated by either — so it stays on the spine, where its collector absorbs it as local.
+        // With no hard content there is no hard box to sit inside, and nothing for the emission to
+        // be conjugated by either — so it stays on the spine, where its collector absorbs it as
+        // local.
         if !has_hard_content {
             write_emissions(py, out, &left_propagating, scope)?;
         }
@@ -450,14 +433,9 @@ impl Build {
 
     /// Turn a resolved box into its emissions, each tagged with where on the spine it belongs.
     ///
-    /// A `Twirl` yields **two** — the inverse pair — sharing one table key with opposite directions;
-    /// the inversion is implied by the direction rather than recorded. Its pair goes on the *dressing*
-    /// edge, because that edge is the twirl point and the easy/hard split is defined relative to it.
-    ///
-    /// A basis change or noise injection yields one, on the edge its own `placement` / `site` names —
-    /// **not** the dressing edge. When the two differ the hard box would otherwise sit between the
-    /// emission and the collector consuming it, so the propagation walk would conjugate it by content it
-    /// is meant to sit outside of. None of these ever propagate through hard content.
+    /// A `Twirl` yields two — the inverse pair, sharing one table key and its draw slots, with
+    /// opposite directions — on the *dressing* edge. A basis change or noise injection yields one,
+    /// on the edge its own `placement` / `site` names and **not** the dressing edge.
     fn build_emissions(
         &mut self,
         resolved: &ResolvedBox,
@@ -567,22 +545,17 @@ impl Build {
 
 /// Sweep a box body from the dressing edge, splitting absorbable gates from the rest.
 ///
-/// Classification only — it decides *which* nodes are easy and which are hard, and writes nothing. The
-/// caller needs that answer before it starts writing, because whether the box has hard content at all
-/// decides where its propagating emissions go.
-///
-/// **Per qubit, not one latch for the whole body.** A single-qubit gate on a wire that no multi-qubit
-/// gate has touched is still at the dressing edge *on its own wire*, so it commutes out and folds into
-/// the dressing even when it sits after an entangler elsewhere in the body.
-///
-/// Poisoning over a topological order is exactly DAG ancestry: a gate is absorbable iff every one of
-/// its ancestors was absorbed, and since absorbed gates all move to the dressing edge keeping their
-/// relative order, such a gate can move there too. Poison spreads transitively, so
-/// `cx(0,1); cx(1,2); s(2)` correctly leaves the `s` as content.
+/// Classification only, writing nothing: the caller needs the answer before it starts writing.
+/// Absorbability is **per qubit**, not one latch for the whole body.
 fn classify_body(
     body: &DAGCircuit,
     dressing: Option<Dressing>,
 ) -> (Vec<NodeIndex>, Vec<NodeIndex>) {
+    // Poisoning over a topological order is DAG ancestry: a gate is absorbable iff all of its
+    // ancestors were, and since absorbed gates all move to the dressing edge keeping their relative
+    // order, such a gate can move there too. So a single-qubit gate on an untouched wire folds into
+    // the dressing even if an entangler sits before it elsewhere in the body, while poison
+    // spreading transitively leaves the `s` in `cx(0,1); cx(1,2); s(2)` as content.
     let nodes: Vec<_> = body.topological_op_nodes(false).collect();
     // Sweeping from the right means visiting in reverse, then restoring circuit order.
     let right = matches!(dressing, Some(Dressing::Right));
@@ -696,12 +669,10 @@ fn write_emissions(
     Ok(())
 }
 
-/// Write the easy (absorbed) gates directly onto the spine.
-///
-/// Each gate is copied from `easy` (a body-local DAG) into `out`, remapping its qubits through
-/// `scope` so they land on the correct output wires. Every absorbable gate is single-qubit, so
-/// topological order preserves each wire's run, which is the only order that carries meaning.
+/// Write the easy (absorbed) gates from a body-local DAG onto the spine, remapped through `scope`.
 fn write_easy_gates(out: &mut DAGCircuitBuilder, easy: &DAGCircuit, scope: &Scope) -> PyResult<()> {
+    // Every absorbable gate is single-qubit, so topological order preserves each wire's run, which
+    // is the only order that carries meaning.
     for node in easy.topological_op_nodes(false) {
         let inst = easy.dag()[node].unwrap_operation();
         let qargs: Vec<Qubit> = easy
@@ -723,7 +694,7 @@ fn write_easy_gates(out: &mut DAGCircuitBuilder, easy: &DAGCircuit, scope: &Scop
     Ok(())
 }
 
-/// Write a collect box. Skipped entirely when it would collect nothing and absorb nothing.
+/// Write a collect box, with an empty body for `absorb_dressing` to fill in.
 fn write_collect(
     py: Python,
     out: &mut DAGCircuitBuilder,
@@ -736,8 +707,10 @@ fn write_collect(
     write_box(out, body, vec![annotation.into_any()], qargs, cargs)
 }
 
-/// Write the box holding the gates virtual state is conjugated by. Skipped when empty — with
-/// propagation derived from placement, a gateless box carries no information.
+/// Write the box holding the gates virtual state is conjugated by.
+///
+/// Skipped when empty: with propagation derived from placement, a gateless box carries no
+/// information.
 fn write_hard_box(
     out: &mut DAGCircuitBuilder,
     body: DAGCircuit,

@@ -10,6 +10,12 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+//! IR1 vocabulary: the annotations a user puts on a box, and what they resolve to.
+//!
+//! `Twirl`, `ChangeBasis`, `InjectLocalClifford`, `InjectNoise` and `Tag` are the Python-facing
+//! annotations; `resolve_annotations` folds a box's set of them into one `ResolvedBox`. The shared
+//! enums the later IRs borrow live here too, so nothing downstream imports vocabulary from a pass.
+
 use hashbrown::HashSet;
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -88,8 +94,8 @@ pub enum Placement {
 
 /// Which annotation a [`ResolvedBasis`] came from.
 ///
-/// `ChangeBasis` and `InjectLocalClifford` resolve to the same thing except for where the emission is
-/// placed.
+/// `ChangeBasis` and `InjectLocalClifford` resolve to the same thing except for where the emission
+/// is placed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BasisOrigin {
     /// A frame change for the box as a whole. Sits at the box's outer boundary.

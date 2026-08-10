@@ -10,6 +10,10 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+//! Infer virtual types: sampling graph (IR3) → sampling graph (IR3), in place.
+//!
+//! Forward-propagates each source's own type along its outgoing edges.
+
 use rustworkx_core::petgraph::visit::EdgeRef;
 use rustworkx_core::petgraph::Direction as PetDirection;
 
@@ -19,9 +23,9 @@ use super::utils::topological_generations;
 
 /// The type a source node puts onto its outgoing edges.
 ///
-/// For an emission this is read straight off the node rather than re-derived from its distribution or
-/// basis mode: IR2 resolved the type from the annotation when the emission was created, and that is the
-/// authoritative value. Deriving it a second time here is how the two could disagree.
+/// For an emission this is read straight off the node rather than re-derived from its distribution
+/// or basis mode: IR2 resolved the type from the annotation when the emission was created, and that
+/// is the authoritative value. Deriving it a second time here is how the two could disagree.
 fn source_virtual_type(kind: &NodeKind) -> Option<VirtualType> {
     match kind {
         NodeKind::Emission(emission) => Some(emission.virtual_type),
@@ -160,9 +164,9 @@ mod tests {
 
     #[test]
     fn test_basis_changes_keep_their_own_types() {
-        // Two basis-change emissions into one collector, declaring different types. What the pass owes
-        // is that each edge gets its own source's type — the mode-to-type mapping itself is the build
-        // pass's business now that the type travels on the emission.
+        // Two basis-change emissions into one collector, declaring different types. What the pass
+        // owes is that each edge gets its own source's type — the mode-to-type mapping itself is
+        // the build pass's business now that the type travels on the emission.
         let mut vfg = VirtualFlowGraph::new();
         let cb_pauli = vfg.graph.add_node(basis_node(
             &[0, 1],

@@ -221,7 +221,7 @@ class TestScopes(QiskitTestCase):
     def test_nested_collector_is_not_promoted_out_of_its_box(self):
         # Cross-boundary merging is deliberately out of scope: it would take the inner box's
         # absorbed gates off the spine, so the outer factor's propagation through them would have
-        # to be recorded. See the nesting section of SAMPLEX_IR_DESIGN.md.
+        # to be recorded.
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl()]):
             with circuit.box([Twirl()]):

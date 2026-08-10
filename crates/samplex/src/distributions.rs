@@ -10,6 +10,11 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+//! IR2's side object: the deduplicated distributions its `Emit` instructions draw from.
+//!
+//! Produced by the build pass and immutable thereafter, so it is an *input* to lowering.
+//! `draw_counts` sizes each entry's sample array.
+
 use hashbrown::{HashMap, HashSet};
 use pyo3::prelude::*;
 

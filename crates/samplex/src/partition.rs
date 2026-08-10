@@ -10,6 +10,11 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+//! Grouping of qubits into non-overlapping subsystems, shared by every IR.
+//!
+//! Order-preserving: `from_elements` keeps its iterator's order, so building one from a hash
+//! container makes downstream node and parameter indices vary run to run.
+
 use std::fmt;
 
 use hashbrown::HashSet;

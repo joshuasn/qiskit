@@ -10,6 +10,8 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+//! Prune unreachable nodes: sampling graph (IR3) → sampling graph (IR3), in place.
+
 use hashbrown::HashSet;
 use rustworkx_core::petgraph::stable_graph::{NodeIndex, StableDiGraph};
 use rustworkx_core::traversal::{ancestors, descendants};
@@ -43,7 +45,7 @@ fn prune_unreachable(
     }
 }
 
-/// Remove nodes not reachable from any source (Emit, Reset, ChangeBasis, InjectNoise).
+/// Remove nodes not reachable from any source: an `Emission` or a `Reset`.
 pub fn prune_unreachable_from_sources(vfg: &mut VirtualFlowGraph) {
     prune_unreachable(
         vfg,
@@ -52,7 +54,7 @@ pub fn prune_unreachable_from_sources(vfg: &mut VirtualFlowGraph) {
     );
 }
 
-/// Remove nodes that cannot reach any sink (Collect, Measure).
+/// Remove nodes that cannot reach any sink: a `Collect` or a `Measure`.
 pub fn prune_unreachable_from_sinks(vfg: &mut VirtualFlowGraph) {
     prune_unreachable(
         vfg,

@@ -10,6 +10,11 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+//! Merge parallel nodes: sampling graph (IR3) → sampling graph (IR3), in place.
+//!
+//! Fuses same-generation nodes that share a predecessor, agree on their merge key and cover
+//! disjoint qubits, into one wider node.
+
 use hashbrown::{HashMap, HashSet};
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
 use rustworkx_core::petgraph::visit::EdgeRef;
@@ -46,8 +51,7 @@ fn merge_key(kind: &NodeKind) -> Option<MergeKey> {
     }
 }
 
-/// Merge parallel nodes in the same topological generation that share a predecessor,
-/// have the same merge key, and operate on disjoint qubits.
+/// Merge parallel nodes throughout a sampling graph, in place.
 pub fn merge_parallel_nodes(vfg: &mut VirtualFlowGraph) {
     let generations = topological_generations(&vfg.graph);
 

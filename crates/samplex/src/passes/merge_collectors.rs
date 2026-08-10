@@ -12,40 +12,13 @@
 
 //! Merge collectors: emission circuit (IR2) → emission circuit (IR2), in place.
 //!
-//! The build pass is local, so every annotated box gets its own two collectors. This pass applies the
-//! contextual collection model of `.notebooks/design/contextual_collection.md`: adjacent boxes sharing a
-//! synthesizer share a *middle* collector, so N boxes in a row need N+1 dressing layers rather than 2N.
+//! Adjacent boxes that share a synthesizer come to share a *middle* collector, so N boxes in a row
+//! need N+1 dressing layers rather than 2N. One [`DAGCircuit::replace_block`] contraction per
+//! group, which takes the union of its members' qargs and derives its position from their edges.
 //!
-//! **Merging is one contraction per group.** [`DAGCircuit::replace_block`] contracts a set of nodes
-//! into a single node whose qargs is the *union* of theirs, so a merged collector is wider than any of
-//! its members without anything being rebuilt — the widening this pass exists to do is a primitive of
-//! the representation. Contraction also derives the merged node's *position* from the members' edges,
-//! which is why the group can go on growing after the point it will end up occupying: there is no
-//! placement decision to make early, so there is no buffer to make it into.
-//!
-//! **Everything is per qubit.** Each group carries a *frontier* — the wires on which nothing has
-//! happened since its position, so a later collector on them can still commute back and fuse. Real
-//! content, emissions and independently-positioned collectors all do the same thing to it: release the
-//! qubits they touch. Nothing latches the whole scope. That is what lets box A's right collector stay
-//! available on q2-3 after box B has claimed q0-1, so box C's left factor still merges into it — worth
-//! stating because the earlier version cleared the whole frontier on real content and silently dropped
-//! that merge whenever a box was right-dressed (a right dressing puts the hard box *before* the
-//! emissions, so it arrived while the frontier was still whole).
-//!
-//! The frontier is a stronger condition than "the contraction is legal", and deliberately so.
-//! Contraction is refused only when something is forced *between* two members, which says nothing about
-//! a wire that merely one of them covers: an unrelated gate on q2 is concurrent with a collector on
-//! q0-1, so contracting the two would be perfectly legal. It is still refused, because widening a
-//! dressing layer onto a wire that something has already crossed would make an emission's walk pick up
-//! a conjugation by that gate. `cycle_check` is therefore passed as a consistency check on the frontier
-//! rule rather than as the rule itself.
-//!
-//! **Siblings only.** Merging across a box boundary — promoting an inner collector out of its box to
-//! fuse with an outer one — is deliberately declined. It is sound as a manoeuvre but it takes the
-//! promoted gates off the circuit spine, so an enclosing emission's propagation through them would have
-//! to be recorded, which needs segment structure on `CollectSpec`. See the nesting section of
-//! `SAMPLEX_IR_DESIGN.md`. Each scope is walked with its own state, so nothing merges across a boundary
-//! by accident.
+//! Two rules govern what may fuse, both per qubit: a candidate must overlap a group's `span`, and
+//! every one of its qubits must still be at that group's `frontier`. **Siblings only** — promoting
+//! a collector out of its box is declined, and each scope is walked with its own state.
 
 use hashbrown::{HashMap, HashSet};
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
@@ -66,31 +39,28 @@ use crate::partition::Partition;
 /// Collectors that will fuse into one, and the state deciding what else may join them.
 struct Group {
     /// The collector nodes to contract, in the order their contributions compose. A group of one is
-    /// left alone: there is nothing to fuse, and re-emitting it would only replace it with a copy.
+    /// left alone.
     members: Vec<NodeIndex>,
-    /// Qubits on which nothing has happened since this group's position, so a later collector on them
-    /// can still commute back here and fuse.
+    /// Qubits on which nothing has happened since this group's position, so a later collector on
+    /// them can still commute back here and fuse.
     ///
-    /// Initialised to *every* qubit in the scope rather than to `span`, because a merge may widen onto
-    /// qubits no member ever covered and those wires need tracking too. A group is dead once
-    /// `frontier` and `span` no longer intersect, which [`find_mergeable`] tests for implicitly.
+    /// Initialised to every qubit in the scope, not to `span`, because a merge may widen onto
+    /// qubits no member covered. A group is dead once this no longer intersects `span`.
     frontier: HashSet<Qubit>,
-    /// Every qubit this group covers. Monotonic — it is the width the contracted box will have, and a
-    /// group whose wires have all been released must still be wide enough for everything it collected.
+    /// Every qubit this group covers, monotonically: the width the contracted box will have.
     span: HashSet<Qubit>,
     /// Per-part descriptors accumulated from merged contributions.
     partition: Partition,
     parts: Vec<CollectPart>,
-    /// Every annotated box whose emissions the contracted collector may consume — the union over the
-    /// members, since a merged collector answers for all of their boxes.
+    /// Every annotated box whose emissions the contracted collector may consume: the union over the
+    /// members.
     owned: Vec<u32>,
 }
 
 impl Group {
     /// The group's qubits in the frame the contracted node will use.
     ///
-    /// Sorted, because [`DAGCircuit::replace_block`] orders the contracted node's qargs by the
-    /// position map it is given, and this pass maps each qubit to its own index.
+    /// Sorted, to agree with the position map [`fuse`] hands [`DAGCircuit::replace_block`].
     fn frame(&self) -> Vec<Qubit> {
         let mut qubits: Vec<Qubit> = self.span.iter().copied().collect();
         qubits.sort_unstable();
@@ -117,24 +87,22 @@ fn merge_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
     let mut bodies: Vec<qiskit_circuit::Block> = Vec::new();
 
     // Grouping reads the DAG and contracting mutates it, so the sweep records node indices and the
-    // rewriting happens afterwards. `StableDiGraph` keeps the indices valid in between.
+    // rewriting happens afterwards; `StableDiGraph` keeps them valid in between.
     for node in dag.topological_op_nodes(false).collect::<Vec<_>>() {
         let inst = dag.dag()[node].unwrap_operation();
         let qubits: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();
 
         if let Some(spec) = collect_annotation(py, inst) {
             match find_mergeable(&groups, &qubits, spec.synthesizer()) {
-                // Fuse into the open group: it keeps its position, and gains this collector's
-                // emissions, absorbed gates and qubits. Nothing is released — a merged contribution
-                // has no position of its own to get in anything's way. Bodies append in the same
-                // order the collectors were encountered, so the concatenated body's composition
-                // order is right: A's outermost element ends up adjacent to B's outermost, which is
-                // how the two layers meet in circuit order.
+                // Fuse into the open group, which keeps its position and gains this collector's
+                // content and qubits. Nothing is released: a merged contribution has no position of
+                // its own. Bodies append in encounter order, which is what makes A's outermost
+                // element end up adjacent to B's outermost.
                 Some(index) => join(&mut groups[index], node, &spec, &qubits),
                 None => {
                     // Nothing compatible is open on these qubits, so this collector gets a position
-                    // of its own — and becomes a synth layer, i.e. real gates in the template. That
-                    // blocks any later collector from reaching back past it on these wires.
+                    // of its own and becomes a synth layer, blocking later collectors on these
+                    // wires.
                     release(&mut groups, &qubits);
                     groups.push(Group {
                         members: vec![node],
@@ -149,8 +117,8 @@ fn merge_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
             continue;
         }
 
-        // An emission is a twirl point, and real content ends absorption. Either way these wires stop
-        // being at any open group's frontier, so there is no distinction left to draw here.
+        // An emission is a twirl point and real content ends absorption; either way these wires
+        // leave every open group's frontier, so there is no distinction left to draw here.
         release(&mut groups, &qubits);
         if let [block] = *inst.blocks_view()
             && is_box(inst)
@@ -187,19 +155,13 @@ fn find_mergeable(
 ) -> Option<usize> {
     groups.iter().position(|candidate| {
         candidate.parts.iter().all(|p| p.synthesizer == synthesizer)
-            // A shared qubit is what gives the two collectors a temporal order to follow. Two
-            // collectors on disjoint qubits are *concurrent*: their relative position in this circuit
-            // is an artifact of whichever topological order the walk happened to take, so fusing them
-            // would make the output depend on an arbitrary choice. An overlap fixes the order in every
-            // topological order, which is why it is required rather than merely usual.
+            // A shared qubit is required, not merely usual: two collectors on disjoint qubits are
+            // concurrent, so their relative position is an artifact of the topological order the
+            // walk took, and fusing them would make the output depend on an arbitrary choice.
             && qubits.iter().any(|q| candidate.span.contains(q))
-            // Every qubit has to still be at the frontier, not just the shared one. A wire something
-            // has already touched cannot commute back to this group's position for free — the
-            // emission's walk would pick up a conjugation by whatever that was, which at best costs a
-            // propagation step and at worst has no rule and gets refused.
-            //
-            // This also excludes a dead group without a flag: a shared qubit must be in both `span`
-            // and `frontier`, so if they no longer intersect nothing can match.
+            // *Every* qubit must still be at the frontier, not just the shared one. This also
+            // excludes a dead group without a flag, since a match needs a qubit in both `span` and
+            // `frontier`.
             && qubits.iter().all(|q| candidate.frontier.contains(q))
     })
 }
@@ -208,27 +170,24 @@ fn find_mergeable(
 fn join(group: &mut Group, node: NodeIndex, spec: &CollectSpec, qubits: &[Qubit]) {
     group.members.push(node);
     group.span.extend(qubits.iter().copied());
-    // The contracted collector stands in for both boxes, so it may consume either one's emissions.
     // Sorted and deduplicated, so the set does not depend on the order members were visited in.
     group.owned.extend_from_slice(&spec.owned);
     group.owned.sort_unstable();
     group.owned.dedup();
-    // Widen the partition to cover both collectors' qubits.
     group.partition = Partition::union(&[&group.partition, &spec.partition])
         .unwrap_or_else(|_| spec.partition.clone());
-    // Rebuild parts to match the widened partition. `find_mergeable` ensures all parts share the same
-    // synthesizer, so we replicate uniformly.
+    // `find_mergeable` has established that every part shares a synthesizer, so replicate uniformly
+    // across the widened partition.
     let synthesizer = group.parts[0].synthesizer;
     group.parts = (0..group.partition.len())
         .map(|_| CollectPart { synthesizer })
         .collect();
 }
 
-/// Take `qubits` off every open group's frontier.
+/// Take `qubits` off every open group's frontier, so a later collector on them can no longer fuse.
 ///
-/// Something now sits between those wires and every open group's position, so a later collector on them
-/// can no longer commute back to fuse. This is the *only* closing rule — real content, emissions and
-/// independently-positioned collectors all do exactly this, per qubit.
+/// The only closing rule: real content, emissions and independently-positioned collectors all do
+/// this.
 fn release(groups: &mut [Group], qubits: &[Qubit]) {
     for group in groups.iter_mut() {
         for qubit in qubits {
@@ -244,8 +203,8 @@ fn fuse(py: Python, dag: &mut DAGCircuit, group: &Group) -> PyResult<()> {
     let body = merged_body(dag, group, &frame, clbits.len())?;
     let op = merged_op(py, group, frame.len(), clbits.len())?;
 
-    // `replace_block` derives the contracted node's qargs from the members and orders it by these
-    // maps, so mapping every wire to its own index makes it agree with `frame` by construction.
+    // `replace_block` orders the contracted node's qargs by these maps, so mapping every wire to
+    // its own index makes it agree with `frame` by construction.
     let qubit_pos: HashMap<Qubit, usize> = (0..dag.num_qubits())
         .map(|index| (Qubit(index as u32), index))
         .collect();
@@ -254,8 +213,8 @@ fn fuse(py: Python, dag: &mut DAGCircuit, group: &Group) -> PyResult<()> {
         .collect();
 
     let block = dag.add_block(body);
-    // `cycle_check` asserts what the frontier rule already established — that nothing lies between the
-    // members — so a refusal here is an inconsistency rather than a merge to skip, and is reported.
+    // `cycle_check` asserts what the frontier rule already established, so a refusal here is an
+    // inconsistency rather than a merge to skip, and is reported.
     dag.replace_block(
         &group.members,
         op,
@@ -271,8 +230,8 @@ fn fuse(py: Python, dag: &mut DAGCircuit, group: &Group) -> PyResult<()> {
 
 /// The clbits the contracted node will cover, in its frame.
 ///
-/// Collectors carry no classical wires today, so this is empty in practice; it is derived rather than
-/// assumed so that the body's width keeps matching the node's if they ever do.
+/// Empty in practice — collectors carry no classical wires — but derived rather than assumed, so
+/// the body's width keeps matching the node's if they ever do.
 fn merged_clbits(dag: &DAGCircuit, group: &Group) -> Vec<Clbit> {
     let mut clbits: Vec<Clbit> = group
         .members
@@ -287,10 +246,10 @@ fn merged_clbits(dag: &DAGCircuit, group: &Group) -> Vec<Clbit> {
     clbits
 }
 
-/// Concatenate the members' bodies into one, remapped from each member's frame into the merged frame.
+/// Concatenate the members' bodies into one, remapped from each member's frame into the merged
+/// frame.
 ///
-/// Members are visited in composition order, so the concatenated body's own composition order —
-/// gates and local emissions alike — matches theirs.
+/// Members are visited in composition order, so the result's composition order matches theirs.
 fn merged_body(
     dag: &DAGCircuit,
     group: &Group,
@@ -319,17 +278,15 @@ fn merged_body(
         };
         let contribution = &dag.blocks()[block];
 
-        // In written order, not topological order: a collector body is a *sequence*, and a
-        // topological read of a body of single-qubit gates and barrier-like local emissions would
-        // group disjoint-qubit nodes arbitrarily. A body is built once and never edited, so its node
-        // indices are already in the order they were appended.
+        // In written order, not topological order: a collector body is a *sequence*. A body is
+        // built once and never edited, so its node indices are already in the order they were
+        // appended.
         for (_, gate) in contribution.op_nodes(true) {
             let qargs: Vec<Qubit> = contribution
                 .qargs_interner()
                 .get(gate.qubits)
                 .iter()
                 .map(|local| {
-                    // The member's span is part of the group's, so its wires are all in the frame.
                     let global = member[local.index()];
                     let merged = frame
                         .iter()

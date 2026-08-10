@@ -29,12 +29,9 @@ pub use crate::annotated_circuit::{
 
 /// One node as seen from Python: `(kind, qubits, param_indices, steps)`.
 ///
-/// `steps` is a `Collect`'s composition sequence — `("emit", qubits, [])` or
-/// `(gate name, qubits, angles)` — and empty for every other kind. An angle renders as its value if
-/// bound and as `#key` if it is symbolic, in which case the key indexes the run's
-/// [`ParameterTable`](crate::parameters::ParameterTable).
-///
-/// Only per-qubit order within `steps` is meaningful; see [`Collect::steps`].
+/// `steps` is a [`Collect`]'s composition sequence — `("emit", qubits, [])` or `(gate name, qubits,
+/// angles)` — and empty for every other kind. Only per-qubit order within it is meaningful; see
+/// [`Collect::steps`].
 pub type NodeSummary = (
     String,
     Vec<usize>,
@@ -65,10 +62,8 @@ impl Direction {
 
 /// A flow of virtual state from one node to the next.
 ///
-/// Deliberately carries no direction. Direction is fixed when an emission is created and never
-/// changes along a path, so it belongs to the node the flow passes *through* rather than to each
-/// edge — see [`NodeKind::direction`]. Having it in both places is what let the right-dressing
-/// propagation bug hide.
+/// Carries no direction; that lives on the node the flow passes through. See
+/// [`NodeKind::direction`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Edge {
     pub virtual_type: Option<VirtualType>,
@@ -108,8 +103,8 @@ impl NodeKind {
 
     /// Which way virtual state flows out of this node, for the kinds that carry a flow at all.
     ///
-    /// This is where direction lives now that edges do not carry it. A `Propagate` node is created
-    /// per handedness, so a node is never on paths of both directions at once.
+    /// A `Propagate` node is created per handedness, so a node is never on paths of both
+    /// directions.
     pub fn direction(&self) -> Option<Direction> {
         match self {
             Self::Emission(emission) => Some(emission.direction),
@@ -119,89 +114,64 @@ impl NodeKind {
     }
 }
 
-/// A source of virtual gates: one node per `Emit` instruction in the emission circuit.
+/// A source of virtual gates: one node per still-travelling `Emit` instruction in the emission
+/// circuit.
 ///
-/// Twirls, basis changes and noise injections are **one** node kind rather than three, mirroring IR2
-/// where they are already one instruction with a source tag. The tag here is the [`DistEntry`]
-/// discriminant — `Distribution` for a twirl, `Basis` for a basis change or local-Clifford
-/// injection, `Noise` for an injected Pauli-Lindblad map — so nothing separate needs storing.
-///
-/// The entry is cloned out of the [`DistributionTable`](crate::distributions::DistributionTable)
-/// rather than referenced by key, so a graph is readable without its table alongside.
+/// Twirls, basis changes and noise injections share this one kind; the [`DistEntry`] discriminant
+/// is the source tag. The entry is cloned out of the table rather than keyed into it, so a graph is
+/// readable without its [`DistributionTable`](crate::distributions::DistributionTable) alongside.
 #[derive(Debug, Clone)]
 pub struct Emission {
     /// What this emission draws from; its discriminant is the source tag.
     pub entry: DistEntry,
     /// Which way the emitted state flows towards the collector that consumes it.
     pub direction: Direction,
-    /// The algebraic type of the emitted virtual gate.
-    ///
-    /// Taken from the emission rather than re-derived from `entry`: IR2 already resolved it from the
-    /// annotation, and that is the authoritative value.
+    /// The algebraic type of the emitted virtual gate, as IR2 resolved it from the annotation.
     pub virtual_type: VirtualType,
 }
 
-/// One parameter of an absorbed gate.
-///
-/// Split rather than uniformly keyed because the two cases differ for whoever evaluates the graph: a
-/// `Bound` angle folds straight into the collector's sampled angles, while a `Symbolic` one cannot be
-/// used until the caller has bound it. Only the latter needs the table, so only the latter is indirect
-/// — which is what leaves [`ParameterTable::free`](crate::parameters::ParameterTable::free) meaning
-/// exactly "what the caller must supply".
+/// One angle of an absorbed gate: ready to use, or awaiting a binding.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AbsorbedParam {
     /// A literal angle.
     Bound(f64),
-    /// A symbolic angle; resolve it through the run's
+    /// A symbolic angle, keyed into the run's
     /// [`ParameterTable`](crate::parameters::ParameterTable).
     Symbolic(ParamKey),
 }
 
 /// A gate folded into a collector's synthesized layer rather than executed separately.
 ///
-/// Not `Eq`, because a bound angle is an `f64`. Nothing uses these as a hash key or sorts them, so
-/// `PartialEq` is all that was ever needed.
+/// Not `Eq`: a bound angle is an `f64`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AbsorbedGate {
     pub gate: StandardGate,
     /// Circuit qubits, ascending.
     pub qubits: Vec<usize>,
-    /// The gate's angles, parallel with its own parameter list.
-    ///
-    /// A collector folds its absorbed gates into the angles it synthesizes, so these never reach the
-    /// template — they are an input to whatever computes those angles. Dropping them was a silent
-    /// correctness bug: an absorbed `rz(0.3)` appeared in neither artifact, so no binding of the
-    /// template could reproduce the circuit.
+    /// Angles, parallel with the gate's own parameter list. They never reach the template — the
+    /// collector folds them into the angles it synthesizes.
     pub params: Vec<AbsorbedParam>,
 }
 
-/// An emission owned directly by its collector — adjacent to it, never propagating through gates.
+/// An emission its collector owns outright, resolved in place rather than propagating.
 ///
-/// At sampling time the collector reads the sampled value from the distribution table and composes
-/// it at the position its local `Emit` instruction (`direction: None`) sits at in the collector body.
-/// No VFG `Emission` node — the local emission is folded straight into the collector's own step
-/// list.
-///
-/// Neither direction nor source is stored: position in the collector body IS the composition order,
-/// and the distribution table entry (reachable through [`EmitPart::dist`]) already encodes the
-/// emission kind.
+/// Read straight from the distribution table at sampling time and composed at this step's position.
+/// It gets no [`Emission`] node, since there is no chain to model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalEmission {
+    /// Circuit qubits, grouped into subsystems.
     pub partition: Partition,
     /// Per-part descriptors, parallel with `partition.iter()`.
     pub parts: Vec<EmitPart>,
 }
 
-/// One step in what a collector composes. See [`Collect::steps`] for what the sequence guarantees.
+/// One step in what a collector composes, in the order given by [`Collect::steps`].
 ///
-/// Only what the collector *owns*: local emissions (table reads) and absorbed gates. Incoming
-/// emissions (far twirl halves arriving via graph edges) are NOT recorded here — their composition
-/// position is derived from graph topology (direction + generation distance) at evaluation time.
-/// Not `Eq`, because an absorbed gate's bound angle is an `f64`; see [`AbsorbedGate`].
+/// Only what the collector *owns*. A still-travelling emission arrives over a graph edge instead,
+/// and is not recorded here. Not `Eq`; see [`AbsorbedGate`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum CollectStep {
     /// A local emission: read a value from the distribution table and compose it here.
-    /// No VFG Emission node — the collector owns this directly.
     Local(LocalEmission),
     /// A gate folded into this layer rather than executed separately.
     Gate(AbsorbedGate),
@@ -214,30 +184,9 @@ pub struct Collect {
     /// Everything this collector composes, as **a linear extension of its per-qubit dependency
     /// order**. Only each qubit's own subsequence is meaningful.
     ///
-    /// It is deliberately *not* circuit order, and must not be read as such. Lowering reads the
-    /// collector body with `topological_op_nodes`, whose tie-break is lexicographic on
-    /// `(qargs, cargs)`, so steps on disjoint wires come out lowest-qubit-first however they were
-    /// written. Two boxes contributing `s` on q1 and then `h` on q0 report `h` before `s`.
-    ///
-    /// That costs nothing, because per-qubit order is the whole of what composition depends on: a
-    /// collector synthesizes three angles *per qubit*, every absorbed gate is single-qubit, and
-    /// single-qubit gates on distinct qubits commute. Every linear extension of one body therefore
-    /// evaluates identically. What it does mean is that a consumer must project onto a wire before
-    /// relying on relative order, and that a test asserting the flat list pins an arbitrary choice.
-    ///
-    /// The collector *owns* its absorbed gates rather than them being separate `Multiply` nodes on some
-    /// emission's chain. That is deliberate: after merging, a collector holds absorbed gates from
-    /// several boxes and there is no way to attribute each to the emission it multiplies into.
-    ///
-    /// It is one ordered sequence rather than a set of collected emissions plus a list of gates,
-    /// because position relative to the *same* wire is meaningful: a `ChangeBasis` wraps the whole box
-    /// and so composes *outside* the absorbed easy gates, whereas an injection or twirl attaches to the
-    /// hard content and composes *inside* them. A local emission spans every wire it covers, so it is a
-    /// barrier no linear extension can move content across — which is what keeps that distinction
-    /// intact under any re-read.
-    ///
-    /// An enclosing emission that merely *crosses* this collector still gets ordinary `Propagate` nodes
-    /// for these gates, derived positionally. The two roles are independent.
+    /// It is **not** circuit order and must not be read as such: steps on disjoint wires come out
+    /// lowest-qubit-first however they were written. Project onto a wire before relying on relative
+    /// order — an assertion on the flat list pins an arbitrary choice.
     pub steps: Vec<CollectStep>,
 }
 
@@ -250,18 +199,13 @@ pub fn collect_step_gates(steps: &[CollectStep]) -> impl Iterator<Item = &Absorb
 }
 
 impl Collect {
-    /// The absorbed gates, ignoring the emissions interleaved between them, in whatever order
-    /// [`steps`](Self::steps) is in — per-wire, not circuit-wide.
+    /// The absorbed gates alone, in [`steps`](Self::steps) order.
     pub fn gates(&self) -> impl Iterator<Item = &AbsorbedGate> {
         collect_step_gates(&self.steps)
     }
 }
 
 /// One conjugation of virtual state by a real gate.
-///
-/// There is no longer a mode: the "multiply" case existed only because the old walker made a node per
-/// absorbed single-qubit gate. Absorbed gates are now data on the [`Collect`] that owns them, so every
-/// `Propagate` node is a genuine conjugation.
 #[derive(Debug, Clone)]
 pub struct Propagate {
     pub gate: StandardGate,
@@ -312,15 +256,9 @@ impl VirtualFlowGraph {
     /// Per-node summary for inspection and testing: `(kind, qubits, param_indices, steps)`.
     ///
     /// Nodes come in index order, and [`edges`](Self::edges) refers to positions in this list.
-    /// `steps` is only non-empty for `Collect`, and gives its composition sequence:
-    /// `("emit", qubits, [])` for a consumed emission, `(gate name, qubits, angles)` for a gate folded
-    /// into the layer. Both appear in one list because their order *on a shared wire* is meaningful.
-    /// Across disjoint wires it is not — [`Collect::steps`] says why, and an assertion on the flat list
-    /// is pinning an arbitrary choice.
-    ///
-    /// An angle renders as its value if bound and as `#key` if symbolic — see [`param_label`]. A local
-    /// emission's angles are empty because its payload belongs to the distribution table, not the
-    /// parameter one.
+    /// `steps` is non-empty only for `Collect`; only its per-wire order is meaningful, per
+    /// [`Collect::steps`]. A local emission's angles are empty — its payload is in the distribution
+    /// table.
     fn nodes(&self) -> Vec<NodeSummary> {
         self.graph
             .node_indices()
@@ -368,9 +306,7 @@ impl VirtualFlowGraph {
 
     /// Edges as `(source, target, direction)`, indexing into [`nodes`](Self::nodes).
     ///
-    /// The direction is read off the source node rather than the edge, which is where it lives now.
-    /// It is `"none"` for the nodes that carry no flow of their own — today only a `Reset`, which the
-    /// lowering emits as an isolated node.
+    /// The direction is the source node's, and `"none"` for a node that carries no flow of its own.
     fn edges(&self) -> Vec<(usize, usize, String)> {
         use rustworkx_core::petgraph::visit::{EdgeRef, IntoEdgeReferences};
         let order: HashMap<NodeIndex, usize> = self
@@ -457,11 +393,7 @@ fn format_partition(partition: &Partition) -> String {
     }
 }
 
-/// How one absorbed angle reads in a node summary.
-///
-/// A bound angle shows its value; a symbolic one shows `#key`, which indexes the run's
-/// [`ParameterTable`](crate::parameters::ParameterTable) — the graph does not carry the table, so the
-/// key is the honest thing to surface.
+/// How one absorbed angle reads in a node summary: its value if bound, else `#key`.
 fn param_label(param: &AbsorbedParam) -> String {
     match param {
         AbsorbedParam::Bound(value) => format!("{value}"),
@@ -469,10 +401,7 @@ fn param_label(param: &AbsorbedParam) -> String {
     }
 }
 
-/// The `kind` string for an emission node.
-///
-/// The prefix names which annotation the emission stands in for, taken from the table entry's
-/// discriminant. Callers (including the Python tests) select nodes by these prefixes.
+/// The `kind` string for an emission node. Callers select nodes by these prefixes.
 fn emission_label(entry: &DistEntry) -> String {
     match entry {
         DistEntry::Distribution(distribution) => format!("emit:{distribution:?}"),
@@ -484,8 +413,8 @@ fn emission_label(entry: &DistEntry) -> String {
 fn node_label_color(kind: &NodeKind, partition: &Partition) -> (String, &'static str) {
     let qubits = format_partition(partition);
     match kind {
-        // Emissions are one node kind but keep distinct colours, since which annotation produced one
-        // is the first thing you look for in a rendered graph.
+        // One node kind, but distinct colours: which annotation produced an emission is the first
+        // thing you look for in a rendered graph.
         NodeKind::Emission(e) => {
             let (label, color) = match &e.entry {
                 DistEntry::Distribution(distribution) => {

@@ -12,51 +12,22 @@
 
 //! Absorb dressing into collectors: emission circuit (IR2) → emission circuit (IR2), in place.
 //!
-//! After the build pass, every emission and every easy gate sits on the spine and every collector
-//! starts empty (no body). This pass walks outward from each collector and takes over what it
-//! reaches, writing each thing it absorbs directly into the collector's body, in the order the walk
-//! finds it:
+//! Build leaves every emission and every easy gate on the spine, and every collector empty. This
+//! pass walks outward from each collector along each of its own wires independently, writing what
+//! it takes over into the collector's body:
 //!
-//! - A single-qubit standard gate → copied into the body as-is
-//! - An emission of a box this collector *owns*, facing it → rewritten into a local `Emit`
-//!   (`direction: None`) and placed into the body
-//! - Anything else (a foreign emission, a propagating one, a multi-qubit gate, a box, another
-//!   collector) → that wire is done, and only that wire
+//! - A single-qubit standard gate → copied in as-is.
+//! - An emission of a box this collector *owns*, facing it, and adjacent on *every* wire it
+//!   covers → rewritten to `direction: None` and placed in the body.
+//! - Anything else → that wire is done, and only that wire.
 //!
-//! **Ownership, not adjacency, decides what belongs to a collector.** An emission propagating out of an
-//! enclosing box passes the collectors of every box nested inside it, and those collectors face it.
-//! Taking one there would rewrite it to `direction: None` and compose it in place, dropping every
-//! conjugation it was owed — leaving the enclosing randomization applied and immediately undone, with
-//! none of its content in between. The circuit still evaluates to the same unitary, so nothing
-//! downstream complains; the randomization is simply gone. `EmitSpec::box_id` against
-//! `CollectSpec::owned` is what rules that out.
+//! All three conditions on an emission are load-bearing. What the resulting sequence guarantees is
+//! per-wire order, not circuit order; see [`Collect::steps`].
 //!
-//! **Absorption is per wire.** A collector reaches along each of its own qubits independently, so an
-//! entangler on q0 stops the walk on q0 and q1 without saying anything about q2. The wire is also
-//! what makes the gate's frame unambiguous: a single-qubit gate reached along wire `q` is *on* `q`, so
-//! it maps into the collector body at `q`'s position, with nothing to guess.
-//!
-//! **Emissions come off in layers.** An emission is absorbed only when it is the next node on *every*
-//! one of its wires at once — it has to be a barrier across all of them, or it would take content
-//! from the far side of it into the body ahead of where it belongs. Because a local emission is
-//! written into the body as a real instruction spanning every wire it covers, it is a barrier there
-//! too, so no later read can move content across it.
-//!
-//! What survives a re-read of the body is therefore **per-wire order, not the walk's exact sequence**.
-//! A `topological_op_nodes` read yields *a* linear extension of the body, which is generally not the
-//! order the walk appended in: `DAGCircuit`'s topological sort breaks ties lexicographically on
-//! `(qargs, cargs)`, so two nodes on disjoint wires come back lowest-qubit-first regardless of when
-//! they were written. That is harmless — disjoint single-qubit gates commute, and each wire's own
-//! subsequence is preserved, which is the whole of what composition depends on — but it is the reason
-//! nothing downstream may claim the sequence is circuit order. See [`Collect::steps`].
-//!
-//! The walk's order IS *a* composition order, so no `EmitSource`-based classification is needed.
+//! Nothing moves between scopes: a propagating emission is written inside the hard box when the box
+//! is built, so it already sits where it belongs.
 //!
 //! [`Collect::steps`]: crate::virtual_flow_graph::Collect::steps
-//!
-//! **Nothing is moved between scopes.** A propagating emission is written inside the hard box it has to
-//! cross when the box is built, so it already sits where its walk has to start from; this pass only ever
-//! takes things over where it finds them.
 
 use hashbrown::{HashMap, HashSet};
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
@@ -93,8 +64,8 @@ pub fn absorb_dressing(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
 enum BodyOp {
     /// An absorbed gate, referenced by its node in the source scope.
     Gate(NodeIndex),
-    /// A local emission, already rewritten to `direction: None`, and the wires it spans in the
-    /// source scope's frame (needed to remap its qargs into the body's frame).
+    /// A local emission, already rewritten to `direction: None`, with the wires it spans in the
+    /// source scope's frame.
     Local(PackedOperation, Vec<Qubit>),
 }
 
@@ -105,15 +76,14 @@ struct Absorption {
     spec: CollectSpec,
     /// Everything absorbed, in composition order — becomes the collector's body verbatim.
     content: Vec<BodyOp>,
-    /// Every node this collector took over, gates and emissions alike, to be deleted from the spine.
+    /// Every node this collector took over, to be deleted from the spine.
     consumed: Vec<NodeIndex>,
 }
 
 /// Absorb one scope in place, then recurse into its boxes.
 ///
-/// Planning reads the DAG and rewriting mutates it, so the two are separate sweeps. What is carried
-/// between them is node indices, not circuits — `StableDiGraph` keeps indices valid across the
-/// removals and substitutions below.
+/// Planning reads the DAG and rewriting mutates it, so the two are separate sweeps; `StableDiGraph`
+/// keeps the node indices carried between them valid.
 fn absorb_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
     let plans = plan_absorptions(py, dag)?;
     // Kept as a sequence as well as a set, so that removal order is fixed rather than whatever the
@@ -166,9 +136,9 @@ fn is_box(inst: &PackedInstruction) -> bool {
 
 /// Whether a collector can absorb this instruction: a single-qubit standard gate.
 ///
-/// Nothing here checks *which* wire it is on. It does not have to: the walk only ever offers a node
-/// that is adjacent along one of the collector's own qubits, and a single-qubit gate reached that way
-/// is on that qubit by construction.
+/// Which wire it is on need not be checked — the walk only offers nodes adjacent along one of the
+/// collector's own qubits, so a single-qubit gate reached that way is on that qubit by
+/// construction.
 fn is_absorbable_gate(dag: &DAGCircuit, inst: &PackedInstruction) -> bool {
     matches!(inst.op.view(), OperationRef::StandardGate(_))
         && dag.qargs_interner().get(inst.qubits).len() == 1
@@ -176,8 +146,8 @@ fn is_absorbable_gate(dag: &DAGCircuit, inst: &PackedInstruction) -> bool {
 
 /// Plan every collector's absorption, in topological order.
 ///
-/// Collectors are handled first-come-first-served: a node one collector has claimed is a barrier to
-/// the next, so nothing is absorbed twice. Topological order makes which one wins deterministic.
+/// First come, first served: a claimed node is a barrier to the next collector, so nothing is
+/// absorbed twice, and topological order makes which one wins deterministic.
 fn plan_absorptions(py: Python, dag: &DAGCircuit) -> PyResult<Vec<Absorption>> {
     let mut plans: Vec<Absorption> = Vec::new();
     let mut claimed: HashSet<NodeIndex> = HashSet::new();
@@ -235,10 +205,9 @@ struct Walk {
 
 /// Walk outward from a collector along its own wires, absorbing what it reaches.
 ///
-/// Each wire carries a cursor, the last node absorbed on it, so wires advance independently and a
-/// blocked one simply stops moving rather than ending the walk. Each round drains the adjacent
-/// single-qubit gates, then takes at most one emission layer; when no layer is available nothing can
-/// change and the walk is over.
+/// Each wire carries a cursor — the last node absorbed on it — so a blocked wire stops moving
+/// rather than ending the walk. Each round drains the adjacent single-qubit gates then takes at
+/// most one emission layer; the walk ends when no layer is available.
 fn walk_absorb(
     py: Python,
     dag: &DAGCircuit,
@@ -261,8 +230,8 @@ fn walk_absorb(
     };
 
     loop {
-        // Drain the single-qubit gates now adjacent. A run on one wire comes off one at a time, and
-        // absorbing one can only ever expose another on that same wire, so one pass per wire is enough.
+        // Drain the single-qubit gates now adjacent. Absorbing one can only expose another on that
+        // same wire, so one pass per wire is enough.
         for qubit in qubits {
             while let Some(next) = adjacent(dag, &cursor, *qubit, direction, claimed) {
                 if !is_absorbable_gate(dag, dag.dag()[next].unwrap_operation()) {
@@ -274,17 +243,15 @@ fn walk_absorb(
             }
         }
 
-        // Take one emission layer: an emission this collector owns, that faces it, and that is
-        // adjacent on every one of its wires. Requiring every wire also confines it to the collector's
-        // own qubits, since a wire outside them has no cursor to be adjacent on.
+        // Take one emission layer. Requiring every wire also confines it to the collector's own
+        // qubits, since a wire outside them has no cursor to be adjacent on.
         let layer = qubits.iter().find_map(|qubit| {
             let node = adjacent(dag, &cursor, *qubit, direction, claimed)?;
             let inst = dag.dag()[node].unwrap_operation();
             let spec = emission_spec(py, inst)?;
-            // Facing is not enough. An emission propagating out of an *enclosing* box faces the
-            // collectors it passes on the way to its own, and absorbing it here would compose it in
-            // place — dropping every conjugation it was owed. Only its own box's collectors may take
-            // it; for everyone else it is a barrier, which is what returning `None` makes it.
+            // Facing is not enough: an emission out of an enclosing box also faces the collectors
+            // it passes. For anyone but its owner it is a barrier, which is what returning `None`
+            // makes it.
             if !owned.contains(&spec.box_id) {
                 return None;
             }
@@ -323,8 +290,8 @@ fn walk_absorb(
 
 /// Build the `PackedOperation` for a local emission, resolved in place rather than propagating.
 ///
-/// Mirrors `build.rs::write_emissions`'s construction of a spine `Emit`, minus the qargs (those are
-/// resolved later, when the emission is placed into its collector's body).
+/// Mirrors `build::write_emissions`, minus the qargs — those are resolved when the emission is
+/// placed into its collector's body.
 fn local_emit_op(py: Python, spec: EmitSpec) -> PyResult<PackedOperation> {
     let num_qubits = spec.partition.all_elements().len() as u32;
     let op_name = spec.source.name().to_string();
@@ -353,7 +320,7 @@ fn adjacent(
     (!claimed.contains(&next)).then_some(next)
 }
 
-/// Build a collector's body from what it absorbed, remapped into its own frame.
+/// Build a collector's body from what it absorbed, remapped from the scope's frame into its own.
 fn build_body(dag: &DAGCircuit, plan: &Absorption) -> PyResult<DAGCircuit> {
     let inst = dag.dag()[plan.collector].unwrap_operation();
     let frame: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();

@@ -10,20 +10,15 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
-//! The `Emit` instruction: a stand-in, in a lowered circuit, for a source of virtual gates.
+//! IR2 vocabulary: the `Emit` instruction and the `Collect` annotation.
 //!
-//! One `Emit` stands in for one emission. A `Twirl` produces *two* of them — the inverse pair — which
-//! share a single [`DistKey`] and carry opposite [`Direction`]s; the inversion is implied by the
-//! direction rather than being recorded separately. `InjectNoise` and `ChangeBasis` /
-//! `InjectLocalClifford` each produce exactly one.
+//! One `Emit` stands in for one emission. A `Twirl` produces two — the inverse pair, sharing a
+//! [`DistKey`] and its draw slots, with opposite [`Direction`]s; `InjectNoise` and `ChangeBasis` /
+//! `InjectLocalClifford` produce one each.
 //!
 //! `Emit` is a plain `#[pyclass]` registered as an `abc` virtual subclass of
-//! `qiskit.circuit.Operation` (see [`register_operation`]). That is enough for Qiskit to accept it
-//! into a circuit: `PyOpKind::from_type` classifies via `issubclass`, which honours virtual
-//! registration, and `OperationFromPython` then reads only `name`, `num_qubits` and `num_clbits`
-//! (plus an optional `params`). It therefore lands in a `CircuitData` as a `PyInstruction`, which
-//! means Python can see and draw it, while Rust reads the payload back with a typed `cast::<Emit>()`
-//! rather than attribute lookups.
+//! `qiskit.circuit.Operation` (see [`ensure_registered`]), so it lands in a circuit as a
+//! `PyInstruction` and Rust reads its payload back with a typed `cast::<Emit>()`.
 
 use pyo3::IntoPyObjectExt;
 use pyo3::intern;
@@ -87,8 +82,7 @@ parse_enum!(parse_virtual_type, VirtualType, "virtual type", {
     "z2" => Z2,
 });
 
-/// Per-part descriptor for an emission: what distribution is drawn on this subsystem, what
-/// algebraic type results, and which slot in the distribution's sample array it reads from.
+/// Per-part descriptor for an emission, parallel with its partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmitPart {
     /// The distribution this part draws from.
@@ -97,28 +91,16 @@ pub struct EmitPart {
     pub virtual_type: VirtualType,
     /// Index into this part's `dist` key's sample array.
     pub draw: u32,
-    /// Whether to take the adjoint of the sampled value before composing/propagating.
-    ///
-    /// For a twirl pair the near half is `false` (uses the drawn element directly) while the far
-    /// half is `true` (starts from the adjoint, then propagation conjugates it through gates).
-    /// Non-twirl emissions are always `false`.
+    /// Whether to take the adjoint of the sampled value before composing or propagating. True for
+    /// the far half of a twirl pair, false everywhere else.
     pub adjoint: bool,
 }
 
 /// The payload of an [`Emit`] instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmitSpec {
-    /// Which annotated box this emission came from.
-    ///
-    /// The collector that consumes it is one of *that box's* collectors, and no other. Adjacency
-    /// cannot express this: an emission propagating through a nested box passes a collector that
-    /// faces it, and without an owner to check against, that collector absorbs it as a local value
-    /// and the conjugation it was owed silently never happens.
-    ///
-    /// This is **not** the emission id that earlier designs used and dropped. That was a handle on a
-    /// graph node, invalidated by `merge_parallel_nodes` and `prune`; this names a *box*, is a
-    /// build-time constant, and nothing downstream can invalidate it. See
-    /// [`CollectSpec::owned`](CollectSpec::owned).
+    /// Which annotated box this emission came from. Only that box's collectors may consume it; see
+    /// [`CollectSpec::owned`].
     pub box_id: u32,
     /// Which annotation this emission stands in for.
     pub source: EmitSource,
@@ -127,9 +109,7 @@ pub struct EmitSpec {
     pub direction: Option<Direction>,
     /// Subsystem grouping over the emission's qubits, in the *global* circuit frame.
     ///
-    /// The instruction's qargs are body-local (a box body is its own circuit indexed `0..width`),
-    /// so this is the one place the global frame is recorded; the graph reader relies on it rather
-    /// than re-deriving it through enclosing box qargs.
+    /// The instruction's own qargs are body-local, so this is the only record of the global frame.
     pub partition: Partition,
     /// Per-part descriptors, parallel with `partition.iter()`.
     pub parts: Vec<EmitPart>,
@@ -177,10 +157,7 @@ impl Emit {
 
 #[pymethods]
 impl Emit {
-    /// Construct an `Emit` directly.
-    ///
-    /// The lowering builds these in Rust; this constructor exists so the instruction can be
-    /// exercised from Python and from tests without running a full lowering.
+    /// Construct an `Emit` directly, for use from Python and from tests.
     #[new]
     #[pyo3(signature = (subsystems, source="twirl", distribution_key=0, direction="left", virtual_type="pauli", draw_start=0, adjoint=false, box_id=0))]
     #[allow(clippy::too_many_arguments)]
@@ -335,14 +312,12 @@ impl Emit {
     }
 
     // `circuit_to_dag(copy_operations=True)` deep-copies every operation, so an `Emit` that cannot
-    // be copied cannot survive a DAG round-trip. The instruction is immutable, so both copies are
-    // shallow; `__reduce__` additionally makes it picklable.
+    // be copied cannot survive a DAG round-trip. It is immutable, so both copies are shallow.
     fn __copy__(&self) -> Emit {
         self.clone()
     }
 
-    /// Qiskit's operation-copying protocol (`PythonOperation::py_copy` calls this by name), used by
-    /// the control-flow builder when it captures a box body.
+    /// Qiskit's operation-copying protocol; `PythonOperation::py_copy` calls this by name.
     #[pyo3(signature = (name=None))]
     fn copy(&self, name: Option<String>) -> PyResult<Emit> {
         if name.is_some() {
@@ -380,13 +355,8 @@ static REGISTERED: PyOnceLock<()> = PyOnceLock::new();
 
 /// Register [`Emit`] as an `abc` virtual subclass of `qiskit.circuit.Operation`, once.
 ///
-/// Without this, `QuantumCircuit.append` rejects the instruction: Qiskit classifies operations with
-/// `issubclass` against `Gate` / `Instruction` / `Operation`, and `Emit` inherits from none of them.
-///
-/// This must not run while the `qiskit._accelerate` module is still initialising — importing
-/// `qiskit.circuit` that early fails, because `qiskit/__init__.py` has not yet installed the
-/// `sys.modules["qiskit._accelerate.*"]` aliases that `qiskit.circuit` itself imports from. So it is
-/// deferred to the first point where an `Emit` actually comes into existence.
+/// **Must not run while `qiskit._accelerate` is still initialising**, since importing
+/// `qiskit.circuit` that early fails; call it at the first point an `Emit` comes into existence.
 pub fn ensure_registered(py: Python) -> PyResult<()> {
     REGISTERED.get_or_try_init::<_, PyErr>(py, || {
         qiskit_circuit::imports::OPERATION
@@ -397,19 +367,18 @@ pub fn ensure_registered(py: Python) -> PyResult<()> {
     Ok(())
 }
 
-// --- Lowering output vocabulary -----------------------------------------------------------------
+// --- Collect ------------------------------------------------------------------------------------
 //
-// `Collect` is deliberately *not* a `BoxAnnotation` variant. `BoxAnnotation` is the input vocabulary
-// — what a user writes on a circuit before lowering — whereas `Collect` is written *by* the lowering
-// onto the boxes it creates. Keeping them apart means `extract_annotation` never has to consider a
-// lowering artefact, and a lowered circuit is distinguishable from an annotated one.
+// `Collect` is deliberately not a `BoxAnnotation` variant: that enum is the *input* vocabulary,
+// while this is written by the build pass. Keeping them apart is what makes a lowered circuit
+// distinguishable from an annotated one.
 
 /// Try to read an [`EmitSpec`] back out of a Python object.
 pub fn extract_emit(obj: &Bound<'_, PyAny>) -> Option<EmitSpec> {
     obj.cast::<Emit>().ok().map(|e| e.get().inner.clone())
 }
 
-/// Per-part descriptor for a collector: what synthesizer to use on this subsystem.
+/// Per-part descriptor for a collector, parallel with its partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectPart {
     /// How the collected virtual gates on this part will be synthesized.
@@ -421,13 +390,7 @@ pub struct CollectPart {
 pub struct CollectSpec {
     /// The annotated boxes whose emissions this collector may consume, ascending.
     ///
-    /// Build gives each of a box's two collectors that box's own id. Merging unions them, so a shared
-    /// middle collector owns every box that contributed to it — which is exactly the set of emissions
-    /// it is allowed to take.
-    ///
-    /// A collector may own several boxes, and (with control flow) a box's id may appear on several
-    /// collectors, provided they lie on mutually exclusive paths. See the control-flow section of
-    /// `SAMPLEX_IR_DESIGN.md`.
+    /// Build gives each of a box's two collectors that box's own id; merging unions them.
     pub owned: Vec<u32>,
     /// Subsystem grouping over the collector's qubits, in the *global* circuit frame.
     pub partition: Partition,
@@ -454,8 +417,7 @@ impl CollectSpec {
 
     /// Take on another collector's ownership, keeping the set sorted and duplicate-free.
     ///
-    /// Sorted so that a merged collector's set does not depend on the order the merge happened to
-    /// visit its members in; two runs must produce identical IR2.
+    /// Sorted so the result does not depend on the order the merge visited its members in.
     pub fn absorb_ownership(&mut self, other: &[u32]) {
         self.owned.extend_from_slice(other);
         self.owned.sort_unstable();
@@ -463,15 +425,15 @@ impl CollectSpec {
     }
 }
 
-/// Marks a box whose body holds the "easy" gates absorbed into a dressing, to be replaced by a
-/// synthesizer template in a later stage.
+/// Marks a box whose body holds what a dressing absorbed, to be replaced by a synthesizer template
+/// during lowering.
 #[pyclass(module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
 pub struct Collect {
     pub(crate) inner: CollectSpec,
 }
 
 impl Collect {
-    /// Wrap a spec. The `#[new]` constructor below is the Python-facing equivalent.
+    /// Wrap a spec.
     pub fn new_from_spec(inner: CollectSpec) -> Self {
         Collect { inner }
     }
@@ -479,10 +441,9 @@ impl Collect {
 
 #[pymethods]
 impl Collect {
-    /// Construct a `Collect` annotation.
+    /// Construct a `Collect` annotation, owning nothing and covering no qubits.
     ///
-    /// From Python this produces an empty collector, with no body yet. The build pass populates
-    /// the body directly in Rust.
+    /// Build writes an empty body too; `absorb_dressing` is what fills one in.
     #[new]
     #[pyo3(signature = (synthesizer="rzsx"))]
     fn new(synthesizer: &str) -> PyResult<PyClassInitializer<Self>> {

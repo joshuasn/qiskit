@@ -10,6 +10,8 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+//! The transforms, one file per pass. See the crate doc for the chain and the ordering constraints.
+
 use pyo3::prelude::*;
 
 pub mod absorb_emissions;

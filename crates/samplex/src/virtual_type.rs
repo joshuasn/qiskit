@@ -12,10 +12,8 @@
 
 //! The algebraic type of a virtual gate.
 //!
-//! This is an object rather than part of any one IR: the annotation vocabulary resolves *to* it, the
-//! emission circuit carries it on each emission, and the sampling graph infers it along edges. It
-//! previously lived in the sampling-graph module, which forced the annotation module to import from
-//! the graph — a dependency pointing the wrong way.
+//! An object rather than part of any one IR: the annotation vocabulary resolves *to* it, the
+//! emission circuit carries it on each emission, and the sampling graph infers it along edges.
 
 use qiskit_circuit::operations::{Operation, StandardGate};
 
@@ -42,21 +40,16 @@ impl VirtualType {
 
 /// Whether a virtual gate of this type stays in its group when conjugated by `gate`.
 ///
-/// This is the real limit on which circuits samplomatic supports — not box nesting, not control flow.
-/// A Pauli stays a Pauli through a Clifford, which is what samplomatic's `PAULI_PAST_CLIFFORD` tables
-/// encode; conjugating a Pauli by a non-Clifford leaves the group entirely and there is no rule to
-/// apply. So a gate on an emission's propagation path with no rule for that emission's type must be a
-/// hard error rather than a silently wrong answer.
-///
-/// Deliberately an allowlist: a gate absent from it is refused, so adding gate support is a conscious
-/// act rather than something that happens by accident.
+/// The real limit on which circuits are supported — not box nesting, not control flow. A gate on a
+/// propagation path with no rule for that emission's type must be a hard error, not a silently
+/// wrong answer. Deliberately an allowlist, so adding gate support is a conscious act.
 pub fn propagates(virtual_type: VirtualType, gate: StandardGate) -> bool {
     use StandardGate::*;
-    // Conjugating by a single-qubit gate keeps a single-qubit group closed, so any 1Q Clifford works
-    // for the finite groups and any 1Q gate at all works for U2.
+    // Conjugating by a single-qubit gate keeps a single-qubit group closed, so any 1Q Clifford
+    // works for the finite groups and any 1Q gate at all works for U2.
     let clifford_1q = matches!(gate, H | S | Sdg | SX | SXdg | X | Y | Z);
-    // Two-qubit entanglers with propagation rules. `RZZ` is here because samplomatic supports it as a
-    // fractional entangler under Pauli twirling.
+    // Two-qubit entanglers with propagation rules. `RZZ` is here because samplomatic supports it as
+    // a fractional entangler under Pauli twirling.
     let clifford_2q = matches!(gate, CX | CZ | CY | ECR | Swap | DCX | RZZ);
 
     match virtual_type {
@@ -64,8 +57,8 @@ pub fn propagates(virtual_type: VirtualType, gate: StandardGate) -> bool {
         VirtualType::Pauli | VirtualType::Z2 => clifford_1q || clifford_2q,
         // Local C1 elements propagate through the same entanglers, per the local-C1 tables.
         VirtualType::C1 => clifford_1q || clifford_2q,
-        // A U2 element conjugated by a single-qubit gate is still a U2 element, but an entangler takes
-        // it out of the local group, so there is nothing to propagate.
+        // A U2 element conjugated by a single-qubit gate is still a U2 element, but an entangler
+        // takes it out of the local group, so there is nothing to propagate.
         VirtualType::U2 => gate.num_qubits() == 1,
     }
 }

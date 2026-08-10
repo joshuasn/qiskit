@@ -10,33 +10,18 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
-//! Lower: emission circuit (IR2) → template circuit.
+//! Lower: emission circuit (IR2) → template circuit, sampling graph and parameter table.
 //!
-//! Each collect box becomes a *synth template* — the fixed parametric fragment whose angles the
-//! sampling graph will fill in. The absorbed gates in its body are discarded, because they are folded
-//! into those angles rather than executed separately; that is the whole point of having absorbed them.
-//! `Emit` instructions are markers and disappear. Hard boxes were only a grouping, so their content is
-//! flattened out.
+//! Each collect box becomes a *synth template*, the parametric fragment whose angles the graph
+//! fills in; the absorbed gates in its body fold into those angles rather than reaching the
+//! template. `Emit` instructions disappear, and hard boxes are flattened out.
 //!
-//! **Parameters are minted here and nowhere earlier.** Merging changes how many collectors exist and
-//! how wide they are, so a label assigned before `merge_collectors` would be invalidated by it — on the
-//! notebook circuit, six collectors and 48 parameters become four and 36. The ordering constraint is
-//! asymmetric: lowering *unmerged* IR2 is correct, just suboptimal (more dressing layers than needed);
-//! what is invalid is merging after lowering. So merging stays a switchable optimization.
+//! **Parameters are minted here and nowhere earlier**, so every pass that changes the number or
+//! width of collectors must already have run.
 //!
-//! Alongside the template this returns each collector's parameter range, which is what the sampling
-//! graph's `Collect` nodes need in order to know which angles they are responsible for.
-//!
-//! **This is the one pass that reads a DAG and writes a flat circuit.** IR2 is a `DAGCircuit`, but the
-//! template is a terminal artifact handed to `QuantumCircuit._from_circuit_data` rather than a pass
-//! input, so it stays `CircuitData` and nothing here mutates its input. Both readers — the template
-//! writer and the graph's `flatten` — traverse in `topological_op_nodes` order, which is what lets
-//! [`build_sampling_graph`] pair its collectors with the template's parameter ranges by position.
-//!
-//! Inside a collector body that order is *arbitrary rather than wrong*: it is one linear extension of
-//! the body among several, differing from the walk's own order wherever two steps sit on disjoint
-//! wires. Nothing downstream depends on which one it is, but nothing may report it as circuit order
-//! either; see the note in `flatten` and
+//! Nothing here mutates its input. Both readers traverse in `topological_op_nodes` order, which is
+//! what lets [`build_sampling_graph`] pair its collectors with the template's parameter ranges by
+//! position. Inside a collector body that order must not be reported as circuit order; see
 //! [`Collect::steps`](crate::virtual_flow_graph::Collect::steps).
 
 use std::sync::Arc;
@@ -68,8 +53,7 @@ use crate::virtual_flow_graph::{
 };
 use crate::virtual_type::{VirtualType, propagates};
 
-/// How many angles a synthesizer needs per qubit. Both supported synthesizers are three-angle Euler
-/// decompositions.
+/// How many angles a synthesizer needs per qubit; both are three-angle Euler decompositions.
 const PARAMS_PER_QUBIT: usize = 3;
 
 /// Where one collector's angles live in the template's parameter vector.
@@ -137,12 +121,8 @@ pub fn py_build_template(
     Ok((PyCircuitData { inner: template }, summary))
 }
 
-/// Lower an emission circuit into the three artifacts that execute it: template circuit, sampling
-/// graph, and parameter table.
-///
-/// All three are read off the same IR2 circuit, so the graph's parameter ranges are exactly the ones
-/// the template minted, and the keys its absorbed gates carry are exactly the ones the table interned.
-/// The table is empty unless some absorbed gate had a symbolic angle.
+/// Lower an emission circuit into its three artifacts, all read off the same IR2 circuit: template
+/// circuit, sampling graph, parameter table.
 #[pyfunction]
 #[pyo3(name = "lower")]
 pub fn py_lower(
@@ -164,9 +144,8 @@ fn write_scope(
     collectors: &mut Vec<CollectorParams>,
     next_param: &mut usize,
 ) -> PyResult<()> {
-    // Topological order, which is the order the template's parameters are minted in and hence the
-    // order `CollectorParams` are reported in. [`flatten`] walks the same order, which is what lets
-    // `build_sampling_graph` pair its collectors with these positionally.
+    // Topological order, which is the order parameters are minted in and hence the order
+    // `CollectorParams` are reported in. `flatten` walks the same order, so the two line up.
     for node in src.topological_op_nodes(false) {
         let inst = src.dag()[node].unwrap_operation();
 
@@ -196,7 +175,8 @@ fn write_scope(
             continue;
         }
 
-        // A hard box was a grouping, so flatten it — recursing so nested collectors are lowered too.
+        // A hard box was a grouping, so flatten it — recursing so nested collectors are lowered
+        // too.
         if let Some(body) = plain_box_body(src, inst)? {
             let inner: Vec<usize> = src
                 .qargs_interner()
@@ -223,8 +203,7 @@ fn write_scope(
 
 /// Write the parametric fragment for one collector, on each of its qubits.
 ///
-/// `RzSx` is `rz sx rz sx rz` and `RzRx` is `rz rx rz` — both three angles, matching samplomatic's
-/// synthesizers.
+/// `RzSx` is `rz sx rz sx rz` and `RzRx` is `rz rx rz`; both take three angles.
 fn write_synth_template(
     out: &mut CircuitData,
     synthesizer: SynthesizerType,
@@ -261,12 +240,10 @@ fn write_synth_template(
     Ok(())
 }
 
-/// Mint a template parameter.
-///
-/// Names are zero-padded so that lexicographic order matches numeric order, matching samplomatic's
-/// `ParamIter`. Each carries a fresh uuid, so parameters from two runs share names and indices but are
-/// not equal objects — the same semantics as Python's `Parameter`.
+/// Mint a template parameter named `p{index:04}`, zero-padded so lexicographic order is numeric
+/// order.
 fn fresh_parameter(index: usize) -> Param {
+    // A fresh uuid each time, so two runs' parameters share names but are not equal objects.
     let symbol = Symbol::standalone(format!("p{index:04}"), None);
     Param::ParameterExpression(Arc::new(ParameterExpression::from_symbol(symbol)))
 }
@@ -291,10 +268,7 @@ fn plain_box_body<'a>(
 
 /// Copy an instruction into the template with explicitly remapped bits.
 ///
-/// Nothing block-carrying reaches here: a collector is handled above, and every other `box` is
-/// flattened by [`plain_box_body`], which is exhaustive because `build` rejects control flow that is
-/// not a `box`. Lowering could not do anything sensible with such an instruction anyway — the
-/// template is a flat parametric circuit — so the case is reported rather than guessed at.
+/// Errors on a block-carrying instruction, which should be unreachable.
 fn copy_with_qargs(
     inst: &PackedInstruction,
     out: &mut CircuitData,
@@ -318,8 +292,7 @@ fn copy_with_qargs(
 
 // --- Sampling graph construction ----------------------------------------------------------------
 //
-// The template says *what to execute*; the graph says *how to compute the angles*. Both are read off
-// the same IR2 circuit, so they agree by construction rather than by convention.
+// The template says *what to execute*; the graph says *how to compute the angles*.
 
 /// One collector, flattened out of the circuit.
 struct CollectorInfo {
@@ -328,19 +301,13 @@ struct CollectorInfo {
     param_indices: Vec<usize>,
     /// The annotated boxes whose emissions this collector consumes.
     owned: Vec<u32>,
-    /// Everything this collector composes — local emissions and absorbed gates — in the order
-    /// [`flatten`] read them out of the body. Per-wire order is what that guarantees; see
-    /// [`Collect::steps`].
+    /// Everything this collector composes, in the order `flatten` read it out of the body.
     steps: Vec<CollectStep>,
 }
 
 impl CollectorInfo {
-    /// The absorbed gates alone, in the same order. Used by an *enclosing* emission crossing this
-    /// collector, which conjugates by the gates and ignores what the collector consumes.
-    ///
-    /// Reading them in a different linear extension would be harmless here: [`chain`] advances the
-    /// frontier per qubit, so gates on disjoint wires build independent `Propagate` nodes whatever
-    /// order they are visited in, and gates sharing a wire keep their relative order in any extension.
+    /// The absorbed gates alone, for an enclosing emission crossing this collector: it conjugates
+    /// by the gates and ignores what the collector consumes.
     fn gates(&self) -> impl Iterator<Item = &AbsorbedGate> {
         crate::virtual_flow_graph::collect_step_gates(&self.steps)
     }
@@ -353,24 +320,19 @@ enum Event {
     Gate(StandardGate, Vec<usize>),
     Measure(Vec<usize>, Vec<usize>),
     Reset(Vec<usize>),
-    /// A real operation with no virtual effect — a barrier, say. It still blocks nothing, but it is
-    /// kept so positions line up with the template.
+    /// A real operation with no virtual effect, kept so positions line up with the template.
     Opaque,
 }
 
 /// What identifies one conjugation node: a gate occurrence together with the flow crossing it.
 ///
 /// The occurrence is `(event position, offset)`, the offset being the position within a collector's
-/// absorbed run — zero for a gate that stands on its own.
+/// absorbed run and zero for a gate that stands on its own.
 type GateKey = (usize, usize, Direction, VirtualType);
 
 /// Build the sampling graph for an emission circuit, and the parameter table it refers into.
 ///
-/// `collectors` comes from [`build_template`], so the graph's `Collect` nodes carry exactly the
-/// parameter ranges the template minted.
-///
-/// The table is built here rather than passed in because this is where absorbed gates are read: it is
-/// an *output* of lowering, unlike the distribution table, which the build pass produced.
+/// `collectors` must come from [`build_template`] over the same circuit.
 pub fn build_sampling_graph(
     py: Python,
     dag: &DAGCircuit,
@@ -410,15 +372,10 @@ pub fn build_sampling_graph(
         }));
     }
 
-    // One Propagate node per *conjugation*, created lazily and shared by the emissions for which it is
-    // the same conjugation. The key is the gate occurrence — (event position, offset within a
-    // collector's absorbed run) — plus the handedness and virtual type of the flow crossing it.
-    //
-    // Direction and type belong in the key because they change what the node computes: conjugating a
-    // Pauli by CX leftward and rightward are different operations, as are conjugating a Pauli and a
-    // local C1 by the same gate. Sharing across them would fuse operations that cannot be evaluated as
-    // one. Both cases are reachable — an outer right-walking factor and an inner left-walking factor
-    // cross the same nested hard gates in opposite directions.
+    // One Propagate node per *conjugation*, created lazily and shared by the emissions for which it
+    // is the same conjugation. Direction and virtual type are in the key because they change what
+    // the node computes, so sharing across them would fuse operations that cannot be evaluated as
+    // one.
     let mut gate_nodes: HashMap<GateKey, NodeIndex> = HashMap::new();
     let mut emission_nodes: HashMap<usize, NodeIndex> = HashMap::new();
 
@@ -457,16 +414,16 @@ pub fn build_sampling_graph(
             continue;
         };
         let source = emission_nodes[&position];
-        // A local emission is resolved in place inside its collector's body, so it never reaches the
-        // top-level event list; anything here is still travelling.
+        // A local emission is resolved in place inside its collector's body, so it never reaches
+        // the top-level event list; anything here is still travelling.
         let direction = spec.direction.expect(
             "a local emission never surfaces as a top-level Event::Emission — it lives inside its \
              collector's body",
         );
         // Unreachable in well-formed IR2: build writes both of a box's collectors, so an emission
-        // always has an owner ahead of it. Reaching this means the pairing was broken between the two
-        // passes, which would otherwise show up as a randomization that is never undone — so it is
-        // reported rather than skipped.
+        // always has an owner ahead of it. Reaching this means the pairing was broken between the
+        // two passes, which would otherwise show up as a randomization that is never undone — so it
+        // is reported rather than skipped.
         let target = scan_for_owning_collector(&events, position, direction, spec.box_id, &infos)
             .ok_or_else(|| {
             PyValueError::new_err(format!(
@@ -492,11 +449,7 @@ pub fn build_sampling_graph(
 
 /// Scan from `start` in `direction` for the collector that *owns* this emission's box.
 ///
-/// Nearest-collector-wins is wrong, and silently so. An emission propagating out of an enclosing box
-/// passes the collectors of every nested box on its way — those collectors face it and are nearer than
-/// its own — so taking the first one found conjugates it by only part of the content it was meant to
-/// cross, or by none at all. Ownership is the pairing build recorded for exactly this reason; position
-/// only decides *which* of an owner's collectors, when a merge has left more than one.
+/// Ownership, not proximity. Position only decides which of an owner's collectors.
 fn scan_for_owning_collector(
     events: &[Event],
     start: usize,
@@ -520,13 +473,8 @@ fn scan_for_owning_collector(
 
 /// Read one absorbed gate parameter, interning it only if it is genuinely symbolic.
 ///
-/// A fully bound expression folds to [`AbsorbedParam::Bound`] rather than being interned, which is what
-/// leaves [`ParameterTable::free`] meaning exactly "what the caller still has to supply" — an entry
-/// there is never something already determined.
-///
-/// [`Param::Obj`] is refused rather than stored: it holds a `Py<PyAny>`, and the sampling graph is read
-/// without the GIL, so carrying one would turn cloning a graph off-thread into a panic. No standard
-/// gate produces one today, so this is a guard rather than a limitation.
+/// A fully bound expression folds to [`AbsorbedParam::Bound`]. A [`Param::Obj`] is refused
+/// outright.
 fn absorbed_param(table: &mut ParameterTable, param: &Param) -> PyResult<AbsorbedParam> {
     match param {
         Param::Float(value) => Ok(AbsorbedParam::Bound(*value)),
@@ -534,8 +482,8 @@ fn absorbed_param(table: &mut ParameterTable, param: &Param) -> PyResult<Absorbe
             match expr.try_to_value(true).into_py_result()? {
                 Value::Real(value) => Ok(AbsorbedParam::Bound(value)),
                 Value::Int(value) => Ok(AbsorbedParam::Bound(value as f64)),
-                // Reported rather than silently projected onto the real axis: a complex angle is not
-                // something a rotation can be given, so it means the circuit was already wrong.
+                // Reported rather than silently projected onto the real axis: a complex angle is
+                // not something a rotation can be given, so it means the circuit was already wrong.
                 Value::Complex(value) => Err(PyValueError::new_err(format!(
                     "cannot absorb a gate whose angle evaluates to the complex value {value}"
                 ))),
@@ -558,8 +506,7 @@ fn flatten(
     infos: &mut Vec<CollectorInfo>,
     parameters: &mut ParameterTable,
 ) -> PyResult<()> {
-    // The same order [`write_scope`] uses, so the collectors this produces line up positionally with
-    // the parameter ranges the template minted.
+    // The same order `write_scope` uses, so the collectors line up with the template's ranges.
     for node in src.topological_op_nodes(false) {
         let inst = src.dag()[node].unwrap_operation();
         let qubits: Vec<usize> = src
@@ -570,21 +517,16 @@ fn flatten(
             .collect();
 
         if let Some(spec) = collect_annotation(py, inst) {
-            // A collector's body is its absorbed content — gates and local emissions alike. This read
-            // yields *a* linear extension of it, not the order the absorption walk appended in:
-            // `topological_op_nodes` breaks ties lexicographically on `(qargs, cargs)`, so nodes on
-            // disjoint qubits come back lowest-qubit-first. That is exactly where relative order does
-            // not matter, and a local emission is a real `Emit` instruction spanning every qubit it
-            // covers, so it stays a barrier that no extension can move content across. What this must
-            // not be reported as is circuit order — see `Collect::steps`.
+            // This read yields *a* linear extension of the body, not the order the absorption walk
+            // appended in. Harmless — a local emission spans every qubit it covers, so it stays a
+            // barrier — but it must not be reported as circuit order. See `Collect::steps`.
             let mut steps = Vec::new();
             if let Some(body) = block_body(src, inst)? {
                 for node in body.topological_op_nodes(false) {
                     let gate = body.dag()[node].unwrap_operation();
                     if let OperationRef::StandardGate(standard) = gate.op.view() {
-                        // The angles have to come along: the collector folds them into what it
-                        // synthesizes, so they reach neither the template nor anything else if they
-                        // are not read here.
+                        // The angles have to come along: this is the only place they are read, and
+                        // the collector's body does not reach the template.
                         let params = gate
                             .params_view()
                             .iter()
@@ -671,7 +613,7 @@ fn walk_emission(
     );
 
     // Walking in the emission's own direction is what makes propagation derivable rather than
-    // recorded: everything crossed on the way to its collector conjugates it.
+    // recorded.
     let indices: Vec<usize> = match direction {
         Direction::Right => (from + 1..events.len()).collect(),
         Direction::Left => (0..from).rev().collect(),
@@ -681,9 +623,9 @@ fn walk_emission(
         match &events[index] {
             Event::Collector(collector) if *collector == target_index => break,
             Event::Collector(collector) => {
-                // A *foreign* collector's absorbed gates are still real gates on this emission's
-                // path, so they conjugate it — even though that collector owns them for its own
-                // multiplication. The two roles are independent.
+                // A foreign collector's absorbed gates are still real gates on this emission's
+                // path, so they conjugate it, even though that collector also multiplies them into
+                // its own layer.
                 let absorbed: Vec<&AbsorbedGate> = infos[*collector].gates().collect();
                 let order: Vec<usize> = match direction {
                     Direction::Right => (0..absorbed.len()).collect(),
@@ -743,8 +685,8 @@ fn chain(
     if !gate_qubits.iter().any(|q| tracked.contains(q)) {
         return Ok(());
     }
-    // Refuse rather than emit a node that cannot be evaluated: conjugating this virtual type by this
-    // gate leaves its group, so there is no rule to apply.
+    // Refuse rather than emit a node that cannot be evaluated: conjugating this virtual type by
+    // this gate leaves its group, so there is no rule to apply.
     if !propagates(virtual_type, gate) {
         return Err(PyValueError::new_err(format!(
             "cannot propagate a {} virtual gate through '{}': no propagation rule exists for that \
@@ -777,12 +719,8 @@ fn chain(
     Ok(())
 }
 
-/// The graph node for one emission.
-///
-/// A direct mapping, now that twirls, basis changes and noise injections are one node kind: the table
-/// entry travels onto the node as-is and its discriminant *is* the source tag. All this has left to do
-/// is check that the tag IR2 recorded and the entry it points at still agree, which they only would
-/// not if IR2 were built inconsistently.
+/// The graph node for one emission, checking that its source tag agrees with the entry it points
+/// at.
 fn emission_kind(spec: &EmitSpec, table: &DistributionTable) -> PyResult<NodeKind> {
     let entry = table.get(spec.dist()).ok_or_else(|| {
         PyValueError::new_err(format!(

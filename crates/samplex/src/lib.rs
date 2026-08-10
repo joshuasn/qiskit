@@ -10,6 +10,27 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+//! Sampling randomizations of quantum circuits, as a chain of circuit dialects.
+//!
+//! ```text
+//! IR1  annotated circuit    DAGCircuit + samplex annotations on boxes    annotated_circuit
+//!   --build-->
+//! IR2  emission circuit     Emit instructions, Collect boxes, hard       emission_circuit
+//!      + DistributionTable  boxes                                        distributions
+//!   --absorb_dressing, merge_collectors-->
+//! IR3  sampling graph       dataflow over virtual state                  virtual_flow_graph
+//!      + template circuit   parameterized circuit
+//!      + ParameterTable     the symbolic absorbed angles                 parameters
+//!   --merge_parallel_nodes, prune, set_virtual_types-->
+//! ```
+//!
+//! Each root module holds one stage's vocabulary; each file under [`passes`] is one transform.
+//! `absorb_dressing` must precede `merge_collectors` (merging concatenates collector bodies), and
+//! both must precede `lower` (which mints the template's parameters).
+//!
+//! IR3 is plain data: the IR3 passes hold no `Python` token, and lowering pays the GIL once at the
+//! IR2 boundary.
+
 use pyo3::prelude::*;
 
 macro_rules! parse_enum {

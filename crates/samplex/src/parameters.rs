@@ -10,25 +10,17 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
-//! The symbolic angles absorbed into collectors, and the symbols a caller has to bind.
+//! IR3's side object: the symbolic angles absorbed into collectors, and the symbols a caller must
+//! bind.
 //!
-//! A collector folds its absorbed gates into the angles it synthesizes, so an absorbed gate's angle is
-//! an input to sampling rather than something the template executes. Bound angles need nothing from
-//! this table — they travel inline on
-//! [`AbsorbedGate`](crate::virtual_flow_graph::AbsorbedGate) as
-//! [`AbsorbedParam::Bound`](crate::virtual_flow_graph::AbsorbedParam::Bound). What a table is for is
-//! the question no individual gate can answer: **what must the caller supply before drawing.**
-//! [`ParameterTable::free`] is that list, the parameter analogue of
-//! [`DistributionTable::draw_counts`](crate::distributions::DistributionTable) sizing the sample
-//! arrays.
+//! Bound angles are not here — they travel inline on
+//! [`AbsorbedGate`](crate::virtual_flow_graph::AbsorbedGate). This table answers the question no
+//! individual gate can: **what must the caller supply before drawing.** [`ParameterTable::free`] is
+//! that list.
 //!
-//! Interning mirrors [`DistributionTable`](crate::distributions::DistributionTable), which is the
-//! other side object of the same shape — but not the same lifetime, which is why they are two
-//! objects. The distribution table is an *input* to lowering, produced by the build pass; this one is
-//! an *output*, because parameters are minted during lowering and deliberately nowhere earlier.
-//!
-//! The table is GIL-free: [`ParameterExpression`] is Rust-native (a `SymbolExpr` plus a name map), so
-//! nothing here holds a Python object and the sampling graph stays plain data.
+//! An *output* of lowering, since parameters are minted there, unlike
+//! [`DistributionTable`](crate::distributions::DistributionTable), which build produces. GIL-free:
+//! [`ParameterExpression`] is Rust-native, so the sampling graph stays plain data.
 
 use std::sync::Arc;
 
@@ -51,25 +43,24 @@ impl ParamKey {
 
 /// The order two symbols are listed in, and the identity they are deduplicated by.
 ///
-/// [`Symbol::fullname`] rather than [`Symbol::name`] because a `ParameterVector` element's `name` is
-/// the bare vector name, shared by every element — it is `fullname` that a caller binds by. The uuid
-/// is the tiebreak, so two symbols that share a name but differ in identity both appear rather than
-/// one silently standing in for the other. It is taken as a `u128` so that samplex needs no `uuid`
-/// dependency of its own.
+/// [`Symbol::fullname`], not [`Symbol::name`]: a `ParameterVector` element's `name` is the bare
+/// vector name shared by every element, and `fullname` is what a caller binds by. The uuid tiebreak
+/// keeps two same-named but distinct symbols both listed. Taken as a `u128` to avoid a `uuid`
+/// dependency.
 fn ordering(symbol: &Symbol) -> (String, u128) {
     (symbol.fullname().into_owned(), symbol.uuid().as_u128())
 }
 
 /// The symbolic angles absorbed into collectors, and the symbols the caller must bind.
 ///
-/// Every entry has at least one free symbol: a fully bound expression is folded to
-/// [`AbsorbedParam::Bound`](crate::virtual_flow_graph::AbsorbedParam::Bound) as it is read and never
-/// reaches here. So `free` being empty means there is nothing to bind, not that nothing was checked.
+/// Every entry has at least one free symbol, since a fully bound expression is folded to
+/// [`AbsorbedParam::Bound`](crate::virtual_flow_graph::AbsorbedParam::Bound) as it is read. So an
+/// empty [`free`](Self::free) means there is nothing to bind, not that nothing was checked.
 ///
-/// This table owns *only* the user's own parameters. The `p0000…` angles lowering mints for the synth
-/// templates are a separate space, addressed by index into the template's own parameter vector, so a
-/// user parameter that happens to be named `p0000` is not a collision here — but a consumer must not
-/// merge the two lists by name, because it would become one there.
+/// Holds *only* the user's own parameters. The `p0000…` angles lowering mints for the synth
+/// templates are a separate space, addressed by index, so a user parameter named `p0000` is not a
+/// collision here — but **a consumer must not merge the two lists by name**, because it would
+/// become one there.
 #[pyclass(module = "qiskit._accelerate.samplex", skip_from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct ParameterTable {
@@ -99,11 +90,8 @@ impl ParameterTable {
 
     /// Fold an expression's symbols into `free`, keeping it deduplicated and sorted.
     ///
-    /// Insertion is by binary search rather than push-then-sort because
-    /// [`ParameterExpression::iter_symbols`] walks a `HashMap`: anything that took its order from that
-    /// iteration would come out differently run to run. It is the same trap as building a
-    /// [`Partition`](crate::partition::Partition) from a `HashSet`, which was a real bug in the
-    /// original builder, and it is invisible in a single run.
+    /// By binary search rather than push-then-sort: [`ParameterExpression::iter_symbols`] walks a
+    /// `HashMap`, so anything taking its order from that iteration would vary run to run.
     fn register_free(&mut self, expr: &ParameterExpression) {
         for symbol in expr.iter_symbols() {
             let key = ordering(symbol);
@@ -198,7 +186,8 @@ mod tests {
         let mut table = ParameterTable::new();
         let expr = symbolic("t");
         let a = table.intern(expr.clone());
-        // A structurally equal expression, not the same `Arc`: equality is by expression, not identity.
+        // A structurally equal expression, not the same `Arc`: equality is by expression, not
+        // identity.
         let b = table.intern(Arc::new((*expr).clone()));
         assert_eq!(a, b);
         assert_eq!(table.len(), 1);
@@ -220,8 +209,8 @@ mod tests {
 
     #[test]
     fn test_free_is_sorted_regardless_of_intern_order() {
-        // The guard on `iter_symbols` walking a `HashMap`: were `free` built in iteration order, this
-        // would pass or fail depending on the run rather than on the code.
+        // The guard on `iter_symbols` walking a `HashMap`: were `free` built in iteration order,
+        // this would pass or fail depending on the run rather than on the code.
         let mut forwards = ParameterTable::new();
         forwards.intern(symbolic("alpha"));
         forwards.intern(symbolic("beta"));

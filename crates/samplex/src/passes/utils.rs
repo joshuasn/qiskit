@@ -10,6 +10,9 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+//! Helpers shared by more than one pass: per-wire adjacency, annotation readback, body
+//! construction.
+
 use std::collections::VecDeque;
 
 use hashbrown::HashMap;
@@ -131,15 +134,15 @@ pub(super) fn emission_spec(
 
 /// The next operation node along one wire, or `None` at the end of it.
 ///
-/// This is the whole per-wire adjacency notion the IR2 passes need: "what does this qubit see next",
-/// as opposed to `quantum_successors`, which pools every wire of a node together. Reaching the wire's
-/// output node counts as the end.
+/// Reaching the wire's output node counts as the end.
 pub(super) fn next_on_wire(
     dag: &DAGCircuit,
     from: NodeIndex,
     qubit: Qubit,
     direction: Direction,
 ) -> Option<NodeIndex> {
+    // Per-wire, unlike `quantum_successors`, which pools every wire of a node together. "What does
+    // this qubit see next" is the whole adjacency notion the IR2 passes need.
     let (search, wire) = match direction {
         Direction::Right => (PetDirection::Outgoing, Wire::Qubit(qubit)),
         Direction::Left => (PetDirection::Incoming, Wire::Qubit(qubit)),
@@ -156,11 +159,6 @@ pub(super) fn next_on_wire(
 }
 
 /// Append an operation to the back of a DAG under construction.
-///
-/// Exists to keep the `cache_pygates` parameter of
-/// [`DAGCircuitBuilder::apply_operation_back`] in one place: everything samplex appends is built
-/// from a `PackedOperation`, never from a live Python object, so there is never a cached gate to
-/// pass. `CircuitData::push_packed_operation` is the same convenience on the flat side.
 pub(super) fn append(
     out: &mut DAGCircuitBuilder,
     op: PackedOperation,
@@ -168,6 +166,10 @@ pub(super) fn append(
     qargs: &[Qubit],
     cargs: &[Clbit],
 ) -> PyResult<()> {
+    // Exists to keep `apply_operation_back`'s `cache_pygates` argument in one place: everything
+    // samplex appends is built from a `PackedOperation`, never a live Python object, so there is
+    // never a cached gate to pass. `CircuitData::push_packed_operation` is the same convenience on
+    // the flat side.
     out.apply_operation_back(
         op,
         qargs,
@@ -181,16 +183,15 @@ pub(super) fn append(
     Ok(())
 }
 
-/// Create an empty `DAGCircuit` body with the given dimensions.
-///
-/// The wires are anonymous: a box body's qubits are positional, addressed only through the box's
-/// qargs, so there is nothing outside for them to be identified with. `with_capacity` reserves
-/// space but registers no wires, hence the explicit adds.
+/// Create an empty `DAGCircuit` body with the given dimensions and anonymous wires.
 pub(super) fn new_dag_body(
     num_qubits: usize,
     num_clbits: usize,
     capacity: usize,
 ) -> PyResult<DAGCircuit> {
+    // Anonymous because a box body's qubits are positional, addressed only through the box's qargs,
+    // so there is nothing outside for them to be identified with. `with_capacity` reserves space
+    // but registers no wires, hence the explicit adds.
     let mut body =
         DAGCircuit::with_capacity(num_qubits, num_clbits, None, Some(capacity), None, None);
     for _ in 0..num_qubits {
