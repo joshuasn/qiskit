@@ -411,7 +411,11 @@ fn collect_step_label(step: &CollectStep) -> String {
         CollectStep::Local(local) => format!("emit {}", format_partition(&local.partition)),
         CollectStep::Gate(gate) => {
             let params: Vec<String> = gate.params.iter().map(param_label).collect();
-            format!("{}({}) {:?}", gate.gate.name(), params.join(", "), gate.qubits)
+            if params.is_empty() {
+                format!("{} {:?}", gate.gate.name(), gate.qubits)
+            } else {
+                format!("{}({}) {:?}", gate.gate.name(), params.join(", "), gate.qubits)
+            }
         }
     }
 }
@@ -448,7 +452,7 @@ fn node_label_color(kind: &NodeKind, partition: &Partition) -> (String, &'static
         NodeKind::Collect(c) => {
             let mut label = format!("Collect({:?}) {}", c.synthesizer, qubits);
             for step in &c.steps {
-                label.push('\n');
+                label.push_str("\n  ");
                 label.push_str(&collect_step_label(step));
             }
             (label, "#f8c8dc")
@@ -580,6 +584,11 @@ mod tests {
                 qubits: vec![1],
                 params: vec![AbsorbedParam::Bound(std::f64::consts::PI)],
             }),
+            CollectStep::Gate(AbsorbedGate {
+                gate: StandardGate::X,
+                qubits: vec![2],
+                params: Vec::new(),
+            }),
         ];
         let (label, _color) = node_label_color(
             &NodeKind::Collect(Collect {
@@ -587,11 +596,14 @@ mod tests {
                 param_indices: vec![0],
                 steps,
             }),
-            &Partition::from_elements([0, 1]),
+            &Partition::from_elements([0, 1, 2]),
         );
-        assert!(label.contains("emit [0]"), "label was: {label}");
-        assert!(label.contains("rz(3.14"), "label was: {label}");
-        assert!(label.contains('\n'), "steps should each be on their own line");
+        // Each step is its own indented line beneath the collector's own header line.
+        assert!(label.contains("\n  emit [0]"), "label was: {label}");
+        assert!(label.contains("\n  rz(3.14"), "label was: {label}");
+        // A parameter-free gate gets no empty parens.
+        assert!(label.contains("\n  x [2]"), "label was: {label}");
+        assert!(!label.contains("x() [2]"), "label was: {label}");
     }
 
     #[test]
