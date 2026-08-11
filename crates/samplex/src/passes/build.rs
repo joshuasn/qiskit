@@ -33,7 +33,6 @@ use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder, NodeIndex};
 use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{
     ControlFlow, ControlFlowInstruction, ControlFlowView, Operation, OperationRef, Param,
-    PyInstruction, PyOpKind,
 };
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use qiskit_circuit::{BlocksMode, Clbit, Qubit, VarsMode};
@@ -43,9 +42,7 @@ use crate::annotated_circuit::{
     resolve_annotations,
 };
 use crate::distributions::{DistEntry, DistKey, DistributionTable};
-use crate::emission_circuit::{
-    Collect, CollectPart, CollectSpec, Emit, EmitPart, EmitSource, EmitSpec,
-};
+use crate::emission_circuit::{Collect, CollectPart, CollectSpec, EmitPart, EmitSource, EmitSpec};
 use crate::partition::Partition;
 use crate::virtual_flow_graph::Direction;
 use crate::virtual_type::VirtualType;
@@ -140,7 +137,6 @@ pub fn py_build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, Distribut
 
 /// Build the emission circuit for an annotated circuit.
 pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, DistributionTable)> {
-    crate::emission_circuit::ensure_registered(py)?;
     let num_qubits = dag.num_qubits();
     let num_clbits = dag.num_clbits();
     let identity_q: Vec<usize> = (0..num_qubits).collect();
@@ -352,7 +348,7 @@ impl Build {
         // move them later.
         let mut hard_builder = new_body(width, body_clbits.len(), hard_nodes.len())?.into_builder();
         if has_hard_content {
-            write_emissions(py, &mut hard_builder, &left_propagating, &inner)?;
+            write_emissions(&mut hard_builder, &left_propagating, &inner)?;
             for node in hard_nodes {
                 let inst = body.dag()[node].unwrap_operation();
                 match inst.op.view() {
@@ -372,7 +368,7 @@ impl Build {
                     _ => copy_instruction(body, inst, &mut hard_builder, &inner)?,
                 }
             }
-            write_emissions(py, &mut hard_builder, &right_propagating, &inner)?;
+            write_emissions(&mut hard_builder, &right_propagating, &inner)?;
         }
         let hard = hard_builder.build();
 
@@ -383,7 +379,7 @@ impl Build {
             &|p| p.edge == Direction::Left && is_outer(p),
             Direction::Left,
         );
-        write_emissions(py, out, &left_outer, scope)?;
+        write_emissions(out, &left_outer, scope)?;
         if matches!(dressing, Dressing::Left) {
             write_easy_gates(out, &easy, &body_scope)?;
         }
@@ -391,12 +387,12 @@ impl Build {
             &|p| p.edge == Direction::Left && !is_outer(p) && is_local(p, Direction::Left),
             Direction::Left,
         );
-        write_emissions(py, out, &left_inner, scope)?;
+        write_emissions(out, &left_inner, scope)?;
         // With no hard content there is no hard box to sit inside, and nothing for the emission to
         // be conjugated by either — so it stays on the spine, where its collector absorbs it as
         // local.
         if !has_hard_content {
-            write_emissions(py, out, &left_propagating, scope)?;
+            write_emissions(out, &left_propagating, scope)?;
         }
 
         // Hard box.
@@ -405,13 +401,13 @@ impl Build {
         // Write right edge: inner emissions, easy gates (if right-dressed), outer emissions,
         // collector.
         if !has_hard_content {
-            write_emissions(py, out, &right_propagating, scope)?;
+            write_emissions(out, &right_propagating, scope)?;
         }
         let right_inner = sorted(
             &|p| p.edge == Direction::Right && !is_outer(p) && is_local(p, Direction::Right),
             Direction::Right,
         );
-        write_emissions(py, out, &right_inner, scope)?;
+        write_emissions(out, &right_inner, scope)?;
         if matches!(dressing, Dressing::Right) {
             write_easy_gates(out, &easy, &body_scope)?;
         }
@@ -419,7 +415,7 @@ impl Build {
             &|p| p.edge == Direction::Right && is_outer(p),
             Direction::Right,
         );
-        write_emissions(py, out, &right_outer, scope)?;
+        write_emissions(out, &right_outer, scope)?;
         write_collect(
             py,
             out,
@@ -633,9 +629,8 @@ fn copy_instruction(
     append(out, inst.op.clone(), params, &qargs, &cargs)
 }
 
-/// Write the `Emit` instructions belonging to one edge of a box, in the order given.
+/// Write the emissions belonging to one edge of a box, in the order given.
 fn write_emissions(
-    py: Python,
     out: &mut DAGCircuitBuilder,
     emissions: &[&Placed],
     scope: &Scope,
@@ -655,15 +650,9 @@ fn write_emissions(
                     .ok_or_else(|| PyValueError::new_err(format!("qubit {g} not in scope")))
             })
             .collect::<PyResult<_>>()?;
-        let emit = Py::new(py, Emit::new(spec.clone()))?;
-        let op = PackedOperation::from(PyInstruction {
-            kind: PyOpKind::Operation,
-            qubits: qargs.len() as u32,
-            clbits: 0,
-            params: 0,
-            op_name: spec.source.name().to_string(),
-            ob: emit.into_any(),
-        });
+        // The spec is the operation, so `Operation::num_qubits` and these qargs agree by
+        // construction — both come from `spec.qubits()`.
+        let op = PackedOperation::from_custom_operation(Box::new(spec.clone()));
         append(out, op, None, &qargs, &[])?;
     }
     Ok(())

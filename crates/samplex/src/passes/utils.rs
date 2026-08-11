@@ -29,7 +29,7 @@ use qiskit_circuit::operations::{ControlFlow, OperationRef};
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use qiskit_circuit::{Block, Clbit, Qubit};
 
-use crate::emission_circuit::{CollectSpec, extract_collect, extract_emit};
+use crate::emission_circuit::{CollectSpec, EmitSpec, extract_collect};
 use crate::virtual_flow_graph::{Direction, Edge, Node};
 
 /// Extension trait that converts any `Result<T, E: Display>` into `PyResult<T>` via `PyValueError`.
@@ -101,11 +101,11 @@ pub(super) fn collect_annotation(py: Python, inst: &PackedInstruction) -> Option
     };
     annotations.iter().find_map(|a| extract_collect(a.bind(py)))
 }
-pub(super) fn is_emission(py: Python, inst: &PackedInstruction) -> bool {
-    match inst.op.view() {
-        OperationRef::PyCustom(py_inst) => extract_emit(py_inst.ob.bind(py)).is_some(),
-        _ => false,
-    }
+pub(super) fn is_emission(inst: &PackedInstruction) -> bool {
+    matches!(
+        inst.op.view(),
+        OperationRef::CustomOperation(op) if op.downcast_ref::<EmitSpec>().is_some()
+    )
 }
 /// The single body of a box instruction.
 pub(super) fn block_body<'a>(
@@ -121,13 +121,10 @@ pub(super) fn block_body<'a>(
     }
 }
 
-/// The [`EmitSpec`](crate::emission_circuit::EmitSpec) on this instruction, if it is an emission.
-pub(super) fn emission_spec(
-    py: Python,
-    inst: &PackedInstruction,
-) -> Option<crate::emission_circuit::EmitSpec> {
+/// The [`EmitSpec`] on this instruction, if it is an emission.
+pub(super) fn emission_spec(inst: &PackedInstruction) -> Option<EmitSpec> {
     match inst.op.view() {
-        OperationRef::PyCustom(py_inst) => extract_emit(py_inst.ob.bind(py)),
+        OperationRef::CustomOperation(op) => op.downcast_ref::<EmitSpec>().cloned(),
         _ => None,
     }
 }

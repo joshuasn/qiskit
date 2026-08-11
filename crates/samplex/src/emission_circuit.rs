@@ -16,16 +16,19 @@
 //! [`DistKey`] and its draw slots, with opposite [`Direction`]s; `InjectNoise` and `ChangeBasis` /
 //! `InjectLocalClifford` produce one each.
 //!
-//! `Emit` is a plain `#[pyclass]` registered as an `abc` virtual subclass of
-//! `qiskit.circuit.Operation` (see [`ensure_registered`]), so it lands in a circuit as a
-//! `PyInstruction` and Rust reads its payload back with a typed `cast::<Emit>()`.
+//! An emission is Rust-native: [`EmitSpec`] *is* the operation, implementing
+//! [`CustomOperation`] so it lands in a circuit as a `PackedOperation` with no Python object at
+//! rest, and Rust reads it back with `downcast_ref::<EmitSpec>()`. The [`Emit`] pyclass is a
+//! read-only view, built on demand by [`EmitSpec::create_py_op`] whenever Python asks a circuit for
+//! the operation — which is what keeps a lowered circuit inspectable and drawable.
 
-use pyo3::IntoPyObjectExt;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::PyString;
 use qiskit_circuit::annotation::PyAnnotation;
+use qiskit_circuit::operations::{CustomOperation, Operation, Param};
+use smallvec::SmallVec;
 
 use crate::annotated_circuit::{SynthesizerType, parse_decomposition};
 use crate::distributions::DistKey;
@@ -54,33 +57,6 @@ impl EmitSource {
         }
     }
 }
-
-parse_enum!(parse_source, EmitSource, "emit source", {
-    "twirl" => Twirl,
-    "inject_noise" => InjectNoise,
-    "change_basis" => ChangeBasis,
-});
-
-parse_enum!(parse_direction, Direction, "direction", {
-    "left" => Left,
-    "right" => Right,
-});
-
-/// Parse a direction that may also be `"local"`, meaning the emission resolves in place rather
-/// than propagating.
-fn parse_direction_opt(s: &str) -> PyResult<Option<Direction>> {
-    match s {
-        "local" => Ok(None),
-        _ => parse_direction(s).map(Some),
-    }
-}
-
-parse_enum!(parse_virtual_type, VirtualType, "virtual type", {
-    "pauli" => Pauli,
-    "c1" => C1,
-    "u2" => U2,
-    "z2" => Z2,
-});
 
 /// Per-part descriptor for an emission, parallel with its partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +112,52 @@ impl EmitSpec {
     }
 }
 
-/// A stand-in instruction for a source of virtual gates in a lowered circuit.
+impl Operation for EmitSpec {
+    fn name(&self) -> &str {
+        self.source.name()
+    }
+
+    fn num_qubits(&self) -> u32 {
+        self.partition.all_elements().len() as u32
+    }
+
+    fn num_clbits(&self) -> u32 {
+        0
+    }
+
+    fn num_params(&self) -> u32 {
+        0
+    }
+
+    fn directive(&self) -> bool {
+        false
+    }
+}
+
+impl CustomOperation for EmitSpec {
+    // An emission is a marker for a later stage to consume, not a gate: it has no matrix and no
+    // definition, so it cannot be decomposed or transpiled through.
+    fn is_unitary(&self) -> bool {
+        false
+    }
+
+    /// Hand Python a read-only [`Emit`] view of this emission.
+    fn create_py_op(
+        &self,
+        py: Python,
+        _params: Option<SmallVec<[Param; 3]>>,
+        _label: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        ensure_registered(py)?;
+        Ok(Py::new(py, Emit::new(self.clone()))?.into_any())
+    }
+}
+
+/// A read-only view onto one [`EmitSpec`] in a lowered circuit.
+///
+/// Never the storage — this is materialized on demand by [`EmitSpec::create_py_op`], so there is no
+/// way to build one from Python and append it. That is deliberate: a Python-constructed `Emit` would
+/// land as a `PyInstruction`, which the `downcast_ref::<EmitSpec>()` readers cannot see.
 #[pyclass(module = "qiskit._accelerate.samplex", frozen, skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct Emit {
@@ -157,52 +178,6 @@ impl Emit {
 
 #[pymethods]
 impl Emit {
-    /// Construct an `Emit` directly, for use from Python and from tests.
-    #[new]
-    #[pyo3(signature = (subsystems, source="twirl", distribution_key=0, direction="left", virtual_type="pauli", draw_start=0, adjoint=false, box_id=0))]
-    #[allow(clippy::too_many_arguments)]
-    fn py_new(
-        py: Python,
-        subsystems: Vec<Vec<usize>>,
-        source: &str,
-        distribution_key: u32,
-        direction: &str,
-        virtual_type: &str,
-        draw_start: u32,
-        adjoint: bool,
-        box_id: u32,
-    ) -> PyResult<Self> {
-        ensure_registered(py)?;
-        if subsystems.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "Emit requires at least one subsystem.",
-            ));
-        }
-        let num_parts = subsystems.len();
-        let partition =
-            Partition::with_parts(subsystems.into_iter().map(|part| part.into_boxed_slice()))
-                .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
-        let dist = DistKey(distribution_key);
-        let vt = parse_virtual_type(virtual_type)?;
-        let parts = (0..num_parts)
-            .map(|i| EmitPart {
-                dist,
-                virtual_type: vt,
-                draw: draw_start + i as u32,
-                adjoint,
-            })
-            .collect();
-        Ok(Emit {
-            inner: EmitSpec {
-                box_id,
-                source: parse_source(source)?,
-                direction: parse_direction_opt(direction)?,
-                partition,
-                parts,
-            },
-        })
-    }
-
     // --- the `qiskit.circuit.Operation` interface ---
 
     #[getter]
@@ -310,45 +285,6 @@ impl Emit {
     fn __eq__(&self, other: &Emit) -> bool {
         self.inner == other.inner
     }
-
-    // `circuit_to_dag(copy_operations=True)` deep-copies every operation, so an `Emit` that cannot
-    // be copied cannot survive a DAG round-trip. It is immutable, so both copies are shallow.
-    fn __copy__(&self) -> Emit {
-        self.clone()
-    }
-
-    /// Qiskit's operation-copying protocol; `PythonOperation::py_copy` calls this by name.
-    #[pyo3(signature = (name=None))]
-    fn copy(&self, name: Option<String>) -> PyResult<Emit> {
-        if name.is_some() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "Emit instructions cannot be renamed; their name is derived from the emission kind.",
-            ));
-        }
-        Ok(self.clone())
-    }
-
-    #[pyo3(signature = (_memo=None))]
-    fn __deepcopy__(&self, _memo: Option<Bound<'_, PyAny>>) -> Emit {
-        self.clone()
-    }
-
-    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
-        (
-            py.get_type::<Emit>(),
-            (
-                self.subsystems(),
-                self.source(),
-                self.inner.dist().0,
-                self.direction(),
-                self.virtual_type(),
-                self.inner.parts[0].draw,
-                self.inner.parts[0].adjoint,
-                self.inner.box_id,
-            ),
-        )
-            .into_py_any(py)
-    }
 }
 
 static REGISTERED: PyOnceLock<()> = PyOnceLock::new();
@@ -356,7 +292,9 @@ static REGISTERED: PyOnceLock<()> = PyOnceLock::new();
 /// Register [`Emit`] as an `abc` virtual subclass of `qiskit.circuit.Operation`, once.
 ///
 /// **Must not run while `qiskit._accelerate` is still initialising**, since importing
-/// `qiskit.circuit` that early fails; call it at the first point an `Emit` comes into existence.
+/// `qiskit.circuit` that early fails. [`EmitSpec::create_py_op`] is the only caller, which keeps it
+/// safe by construction: a view is only ever built when Python asks a circuit for an operation, long
+/// after import.
 pub fn ensure_registered(py: Python) -> PyResult<()> {
     REGISTERED.get_or_try_init::<_, PyErr>(py, || {
         qiskit_circuit::imports::OPERATION
@@ -372,11 +310,6 @@ pub fn ensure_registered(py: Python) -> PyResult<()> {
 // `Collect` is deliberately not a `BoxAnnotation` variant: that enum is the *input* vocabulary,
 // while this is written by the build pass. Keeping them apart is what makes a lowered circuit
 // distinguishable from an annotated one.
-
-/// Try to read an [`EmitSpec`] back out of a Python object.
-pub fn extract_emit(obj: &Bound<'_, PyAny>) -> Option<EmitSpec> {
-    obj.cast::<Emit>().ok().map(|e| e.get().inner.clone())
-}
 
 /// Per-part descriptor for a collector, parallel with its partition.
 #[derive(Debug, Clone, PartialEq, Eq)]

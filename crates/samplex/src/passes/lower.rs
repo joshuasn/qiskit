@@ -171,7 +171,7 @@ fn write_scope(
         }
 
         // Emissions are markers for the sampling graph; they are not executable.
-        if is_emission(py, inst) {
+        if is_emission(inst) {
             continue;
         }
 
@@ -544,7 +544,7 @@ fn flatten(
                         }));
                         continue;
                     }
-                    let local = emission_spec(py, gate).expect(
+                    let local = emission_spec(gate).expect(
                         "a collector body holds only absorbed gates and absorbed local emissions",
                     );
                     steps.push(CollectStep::Local(LocalEmission {
@@ -564,7 +564,7 @@ fn flatten(
             continue;
         }
 
-        if let Some(spec) = emission_spec(py, inst) {
+        if let Some(spec) = emission_spec(inst) {
             events.push(Event::Emission(spec));
             continue;
         }

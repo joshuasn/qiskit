@@ -37,15 +37,13 @@ use qiskit_circuit::Qubit;
 use qiskit_circuit::annotation::PyAnnotation;
 use qiskit_circuit::dag_circuit::DAGCircuit;
 use qiskit_circuit::instruction::Parameters;
-use qiskit_circuit::operations::{
-    ControlFlow, ControlFlowInstruction, OperationRef, PyInstruction, PyOpKind,
-};
+use qiskit_circuit::operations::{ControlFlow, ControlFlowInstruction, OperationRef};
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 
 use super::utils::{
     IntoPyResult, collect_annotation, emission_spec, new_dag_body, next_on_wire, params_of,
 };
-use crate::emission_circuit::{Collect, CollectSpec, Emit, EmitSpec};
+use crate::emission_circuit::{Collect, CollectSpec, EmitSpec};
 use crate::virtual_flow_graph::Direction;
 
 /// Absorb dressing into every collector, in place.
@@ -161,25 +159,9 @@ fn plan_absorptions(py: Python, dag: &DAGCircuit) -> PyResult<Vec<Absorption>> {
 
         // Walking leftward visits the outermost content last, so it comes back reversed.
         let owned = &spec.owned;
-        let mut left = walk_absorb(
-            py,
-            dag,
-            collector,
-            Direction::Left,
-            &qubits,
-            owned,
-            &claimed,
-        )?;
+        let mut left = walk_absorb(dag, collector, Direction::Left, &qubits, owned, &claimed)?;
         left.content.reverse();
-        let right = walk_absorb(
-            py,
-            dag,
-            collector,
-            Direction::Right,
-            &qubits,
-            owned,
-            &claimed,
-        )?;
+        let right = walk_absorb(dag, collector, Direction::Right, &qubits, owned, &claimed)?;
 
         let mut content = left.content;
         content.extend(right.content);
@@ -209,7 +191,6 @@ struct Walk {
 /// rather than ending the walk. Each round drains the adjacent single-qubit gates then takes at
 /// most one emission layer; the walk ends when no layer is available.
 fn walk_absorb(
-    py: Python,
     dag: &DAGCircuit,
     collector: NodeIndex,
     direction: Direction,
@@ -248,7 +229,7 @@ fn walk_absorb(
         let layer = qubits.iter().find_map(|qubit| {
             let node = adjacent(dag, &cursor, *qubit, direction, claimed)?;
             let inst = dag.dag()[node].unwrap_operation();
-            let spec = emission_spec(py, inst)?;
+            let spec = emission_spec(inst)?;
             // Facing is not enough: an emission out of an enclosing box also faces the collectors
             // it passes. For anyone but its owner it is a barrier, which is what returning `None`
             // makes it.
@@ -277,7 +258,8 @@ fn walk_absorb(
             partition: spec.partition.clone(),
             parts: spec.parts.clone(),
         };
-        let op = local_emit_op(py, local_spec)?;
+        // The qargs are resolved later, when the emission is placed into its collector's body.
+        let op = PackedOperation::from_custom_operation(Box::new(local_spec));
         walk.content.push(BodyOp::Local(op, local_wires));
         walk.consumed.push(node);
         for wire in dag.qargs_interner().get(inst.qubits) {
@@ -286,24 +268,6 @@ fn walk_absorb(
     }
 
     Ok(walk)
-}
-
-/// Build the `PackedOperation` for a local emission, resolved in place rather than propagating.
-///
-/// Mirrors `build::write_emissions`, minus the qargs — those are resolved when the emission is
-/// placed into its collector's body.
-fn local_emit_op(py: Python, spec: EmitSpec) -> PyResult<PackedOperation> {
-    let num_qubits = spec.partition.all_elements().len() as u32;
-    let op_name = spec.source.name().to_string();
-    let emit = Py::new(py, Emit::new(spec))?;
-    Ok(PackedOperation::from(PyInstruction {
-        kind: PyOpKind::Operation,
-        qubits: num_qubits,
-        clbits: 0,
-        params: 0,
-        op_name,
-        ob: emit.into_any(),
-    }))
 }
 
 /// The node this wire sees next, or `None` if the wire is not the collector's, has ended, or runs
