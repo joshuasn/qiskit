@@ -16,7 +16,7 @@ use hashbrown::HashMap;
 use qiskit_circuit::operations::Operation;
 use rustworkx_core::petgraph::stable_graph::{NodeIndex, StableDiGraph};
 
-use crate::distributions::{DistEntry, DistributionTable};
+use crate::distributions::{DistEntry, DistKey, DistributionTable};
 use crate::emission_circuit::EmitPart;
 use crate::parameters::ParamKey;
 use crate::partition::Partition;
@@ -117,13 +117,14 @@ impl NodeKind {
 /// A source of virtual gates: one node per still-travelling `Emit` instruction in the emission
 /// circuit.
 ///
-/// Twirls, basis changes and noise injections share this one kind; the [`DistEntry`] discriminant
-/// is the source tag. The entry is cloned out of the table rather than keyed into it, so a graph is
-/// readable without its [`DistributionTable`](crate::distributions::DistributionTable) alongside.
+/// Twirls, basis changes and noise injections share this one kind; the table entry `key` points at
+/// is the source tag. Keyed rather than cloned out of the table, like [`LocalEmission`] — resolving
+/// it (for drawing or [`nodes`](VirtualFlowGraph::nodes)) needs a
+/// [`DistributionTable`](crate::distributions::DistributionTable) alongside.
 #[derive(Debug, Clone)]
 pub struct Emission {
     /// What this emission draws from; its discriminant is the source tag.
-    pub entry: DistEntry,
+    pub key: DistKey,
     /// Which way the emitted state flows towards the collector that consumes it.
     pub direction: Direction,
     /// The algebraic type of the emitted virtual gate, as IR2 resolved it from the annotation.
@@ -259,7 +260,11 @@ impl VirtualFlowGraph {
     /// `steps` is non-empty only for `Collect`; only its per-wire order is meaningful, per
     /// [`Collect::steps`]. A local emission's angles are empty — its payload is in the distribution
     /// table.
-    fn nodes(&self) -> Vec<NodeSummary> {
+    ///
+    /// Pass `table` to resolve an `Emission`'s kind to its full source tag (e.g.
+    /// `"emit:UniformPauli"`); without it, it falls back to `"emit:#key"`.
+    #[pyo3(signature = (table=None))]
+    fn nodes(&self, table: Option<&DistributionTable>) -> Vec<NodeSummary> {
         self.graph
             .node_indices()
             .map(|index| {
@@ -268,7 +273,7 @@ impl VirtualFlowGraph {
                 qubits.sort_unstable();
                 let (kind, params, absorbed) = match &node.kind {
                     NodeKind::Emission(emission) => {
-                        (emission_label(&emission.entry), Vec::new(), Vec::new())
+                        (emission_label(emission.key, table), Vec::new(), Vec::new())
                     }
                     NodeKind::Collect(collect) => (
                         format!("collect:{:?}", collect.synthesizer),
@@ -449,11 +454,16 @@ fn collect_step_label(step: &CollectStep, table: Option<&DistributionTable>) -> 
 }
 
 /// The `kind` string for an emission node. Callers select nodes by these prefixes.
-fn emission_label(entry: &DistEntry) -> String {
-    match entry {
-        DistEntry::Distribution(distribution) => format!("emit:{distribution:?}"),
-        DistEntry::Basis { ref_id, .. } => format!("change_basis:{ref_id}"),
-        DistEntry::Noise { reference, .. } => format!("inject_noise:{reference}"),
+///
+/// Without a table, the key can't be resolved to its source tag, so this falls back to a generic
+/// `"emit:#key"` — always that prefix, never `"change_basis:"`/`"inject_noise:"`, since there is no
+/// way to tell which without resolving it. Mirrors `collect_step_label`'s `Emit(#key)` fallback.
+fn emission_label(key: DistKey, table: Option<&DistributionTable>) -> String {
+    match table.and_then(|t| t.get(key)) {
+        Some(DistEntry::Distribution(distribution)) => format!("emit:{distribution:?}"),
+        Some(DistEntry::Basis { ref_id, .. }) => format!("change_basis:{ref_id}"),
+        Some(DistEntry::Noise { reference, .. }) => format!("inject_noise:{reference}"),
+        None => format!("emit:#{}", key.0),
     }
 }
 
@@ -467,15 +477,18 @@ fn node_label_color(
         // One node kind, but distinct colours: which annotation produced an emission is the first
         // thing you look for in a rendered graph.
         NodeKind::Emission(e) => {
-            let color = match &e.entry {
-                DistEntry::Distribution(_) => "#a8d8ea",
-                DistEntry::Basis { .. } => "#fff2cc",
-                DistEntry::Noise { .. } => "#f8cecc",
+            let (label, color) = match table.and_then(|t| t.get(e.key)) {
+                Some(entry) => {
+                    let color = match entry {
+                        DistEntry::Distribution(_) => "#a8d8ea",
+                        DistEntry::Basis { .. } => "#fff2cc",
+                        DistEntry::Noise { .. } => "#f8cecc",
+                    };
+                    (dist_entry_verb_label(entry), color)
+                }
+                None => (format!("Emit(#{})", e.key.0), "#d9d9d9"),
             };
-            (
-                format!("{} {} {}", dist_entry_verb_label(&e.entry), e.direction.mark(), qubits),
-                color,
-            )
+            (format!("{} {} {}", label, e.direction.mark(), qubits), color)
         }
         NodeKind::Collect(c) => {
             let mut label = format!("Collect({:?}) {}", c.synthesizer, qubits);
@@ -513,9 +526,9 @@ mod tests {
         Partition::with_parts(parts.iter().map(|p| p.to_vec().into_boxed_slice())).unwrap()
     }
 
-    fn emission(entry: DistEntry, direction: Direction) -> Emission {
+    fn emission(key: DistKey, direction: Direction) -> Emission {
         Emission {
-            entry,
+            key,
             direction,
             virtual_type: VirtualType::Pauli,
         }
@@ -525,10 +538,7 @@ mod tests {
     fn test_construct_emission_node() {
         let node = Node {
             partition: Partition::from_elements([0, 1]),
-            kind: NodeKind::Emission(emission(
-                DistEntry::Distribution(DistributionType::UniformPauli),
-                Direction::Right,
-            )),
+            kind: NodeKind::Emission(emission(DistKey(0), Direction::Right)),
         };
         assert_eq!(node.partition.len(), 2);
         assert!(matches!(node.kind, NodeKind::Emission(_)));
@@ -538,24 +548,27 @@ mod tests {
     fn test_emission_label_names_its_source() {
         // The three annotation kinds share one node kind, so the label is the only thing that still
         // distinguishes them — and the Python tests select nodes by these prefixes.
+        let mut table = DistributionTable::new();
+        let pauli = table.intern(DistEntry::Distribution(DistributionType::UniformPauli));
+        let basis = table.intern(DistEntry::Basis {
+            mode: ChangeBasisMode::MeasurePauli,
+            ref_id: "basis_changes.b0".to_string(),
+        });
+        let noise = table.intern(DistEntry::Noise {
+            reference: "n0".to_string(),
+            modifier: None,
+        });
+
+        assert_eq!(emission_label(pauli, Some(&table)), "emit:UniformPauli");
         assert_eq!(
-            emission_label(&DistEntry::Distribution(DistributionType::UniformPauli)),
-            "emit:UniformPauli"
-        );
-        assert_eq!(
-            emission_label(&DistEntry::Basis {
-                mode: ChangeBasisMode::MeasurePauli,
-                ref_id: "basis_changes.b0".to_string(),
-            }),
+            emission_label(basis, Some(&table)),
             "change_basis:basis_changes.b0"
         );
-        assert_eq!(
-            emission_label(&DistEntry::Noise {
-                reference: "n0".to_string(),
-                modifier: None,
-            }),
-            "inject_noise:n0"
-        );
+        assert_eq!(emission_label(noise, Some(&table)), "inject_noise:n0");
+
+        // Without a table (or with a key it doesn't have), it falls back to a generic tag.
+        assert_eq!(emission_label(pauli, None), "emit:#0");
+        assert_eq!(emission_label(DistKey(99), Some(&table)), "emit:#99");
     }
 
     #[test]
@@ -662,29 +675,16 @@ mod tests {
 
     #[test]
     fn test_basis_and_noise_are_emissions_too() {
-        // Unifying the kinds means these are no longer three separate arms to match on.
-        for entry in [
-            DistEntry::Basis {
-                mode: ChangeBasisMode::MeasurePauli,
-                ref_id: "basis_changes.0".to_string(),
-            },
-            DistEntry::Noise {
-                reference: "noise_model.0".to_string(),
-                modifier: Some("modifier.0".to_string()),
-            },
-        ] {
-            let kind = NodeKind::Emission(emission(entry, Direction::Left));
-            assert!(matches!(kind, NodeKind::Emission(_)));
-            assert!(kind.is_source());
-        }
+        // Twirls, basis changes and noise injections all share this one node kind — the key just
+        // points at whichever table entry the source annotation produced.
+        let kind = NodeKind::Emission(emission(DistKey(1), Direction::Left));
+        assert!(matches!(kind, NodeKind::Emission(_)));
+        assert!(kind.is_source());
     }
 
     #[test]
     fn test_sources_and_sinks() {
-        let emit = NodeKind::Emission(emission(
-            DistEntry::Distribution(DistributionType::UniformPauli),
-            Direction::Right,
-        ));
+        let emit = NodeKind::Emission(emission(DistKey(0), Direction::Right));
         assert!(emit.is_source() && !emit.is_sink());
         assert!(NodeKind::Reset.is_source() && !NodeKind::Reset.is_sink());
         let collect = collect_kind();
@@ -698,10 +698,7 @@ mod tests {
     #[test]
     fn test_direction_comes_from_the_node() {
         // Direction is no longer on edges, so these are the only places it can be read from.
-        let emit = NodeKind::Emission(emission(
-            DistEntry::Distribution(DistributionType::UniformPauli),
-            Direction::Left,
-        ));
+        let emit = NodeKind::Emission(emission(DistKey(0), Direction::Left));
         assert_eq!(emit.direction(), Some(Direction::Left));
         let propagate = NodeKind::Propagate(Propagate {
             gate: StandardGate::CX,
@@ -726,10 +723,7 @@ mod tests {
 
         let emit_idx = vfg.graph.add_node(Node {
             partition: Partition::from_elements([0, 1]),
-            kind: NodeKind::Emission(emission(
-                DistEntry::Distribution(DistributionType::UniformPauli),
-                Direction::Right,
-            )),
+            kind: NodeKind::Emission(emission(DistKey(0), Direction::Right)),
         });
 
         let propagate_idx = vfg.graph.add_node(Node {

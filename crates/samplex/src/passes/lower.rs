@@ -741,7 +741,7 @@ fn emission_kind(spec: &EmitSpec, table: &DistributionTable) -> PyResult<NodeKin
         )));
     }
     Ok(NodeKind::Emission(Emission {
-        entry: entry.clone(),
+        key: spec.dist(),
         direction: spec.direction.expect(
             "a local emission never surfaces as a top-level Event::Emission — it lives inside its \
              collector's body",

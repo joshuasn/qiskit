@@ -47,6 +47,16 @@ def graph_of(circuit, optimize=True):
     return graph
 
 
+def graph_and_table_of(circuit, optimize=True):
+    """The sampling graph and its distribution table, for tests that need to resolve emissions."""
+    dag, table = build_lowered(circuit_to_dag(circuit))
+    if optimize:
+        merge_collectors(dag)
+        absorb_dressing(dag)
+    _, graph, _ = lower(dag, table)
+    return graph, table
+
+
 def artifacts(circuit, optimize=True):
     """All three lowering outputs, for the tests that need the parameter table too."""
     dag, table = build_lowered(circuit_to_dag(circuit))
@@ -56,17 +66,17 @@ def artifacts(circuit, optimize=True):
     return lower(dag, table)
 
 
-def kinds(graph):
-    return [node[0] for node in graph.nodes()]
+def kinds(graph, table=None):
+    return [node[0] for node in graph.nodes(table)]
 
 
-def of_kind(graph, prefix):
-    return [node for node in graph.nodes() if node[0].startswith(prefix)]
+def of_kind(graph, prefix, table=None):
+    return [node for node in graph.nodes(table) if node[0].startswith(prefix)]
 
 
-def wiring(graph):
+def wiring(graph, table=None):
     """Edges as (source kind, target kind, direction)."""
-    nodes = graph.nodes()
+    nodes = graph.nodes(table)
     return [(nodes[a][0], nodes[b][0], d) for a, b, d in graph.edges()]
 
 
@@ -359,12 +369,12 @@ class TestPropagation(QiskitTestCase):
         with circuit.box([Twirl(dressing="left")]):
             circuit.h(0)
             circuit.cx(0, 1)
-        graph = graph_of(circuit)
+        graph, table = graph_and_table_of(circuit)
 
         # The near (left) factor is local — absorbed, no graph edge. Only the far (right) factor
         # propagates through the hard box: emit -> cx -> right collector.
-        self.assertIn(("emit:UniformPauli", "propagate:cx", "right"), wiring(graph))
-        self.assertIn(("propagate:cx", "collect:RzSx", "right"), wiring(graph))
+        self.assertIn(("emit:UniformPauli", "propagate:cx", "right"), wiring(graph, table))
+        self.assertIn(("propagate:cx", "collect:RzSx", "right"), wiring(graph, table))
 
     def test_right_dressing_propagates_the_left_factor(self):
         # Mirrored: with the dressing on the right, the hard content conjugates the *left* factor.
@@ -459,9 +469,11 @@ class TestOtherEmissionKinds(QiskitTestCase):
                     circuit = QuantumCircuit(2)
                     with circuit.box([Twirl(dressing=dressing), ChangeBasis("b", placement=placement)]):
                         circuit.cx(0, 1)
-                    graph = graph_of(circuit)
+                    graph, table = graph_and_table_of(circuit)
 
-                    conjugated = {src for src, tgt, _ in wiring(graph) if tgt == "propagate:cx"}
+                    conjugated = {
+                        src for src, tgt, _ in wiring(graph, table) if tgt == "propagate:cx"
+                    }
                     self.assertEqual(conjugated, {"emit:UniformPauli"})
 
     def test_injected_noise_is_never_conjugated_by_box_content(self):
@@ -471,9 +483,11 @@ class TestOtherEmissionKinds(QiskitTestCase):
                     circuit = QuantumCircuit(2)
                     with circuit.box([Twirl(dressing=dressing), InjectNoise("n0", site)]):
                         circuit.cx(0, 1)
-                    graph = graph_of(circuit)
+                    graph, table = graph_and_table_of(circuit)
 
-                    conjugated = {src for src, tgt, _ in wiring(graph) if tgt == "propagate:cx"}
+                    conjugated = {
+                        src for src, tgt, _ in wiring(graph, table) if tgt == "propagate:cx"
+                    }
                     self.assertEqual(conjugated, {"emit:UniformPauli"})
 
     def test_measure_and_reset_become_nodes(self):

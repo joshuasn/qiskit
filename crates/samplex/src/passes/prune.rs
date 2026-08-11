@@ -66,7 +66,7 @@ pub fn prune_unreachable_from_sinks(vfg: &mut VirtualFlowGraph) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distributions::DistEntry;
+    use crate::distributions::DistKey;
     use crate::partition::Partition;
     use crate::passes::test_fixtures::*;
     use crate::virtual_flow_graph::*;
@@ -146,20 +146,8 @@ mod tests {
     fn test_multiple_source_types() {
         let mut vfg = VirtualFlowGraph::new();
         let e = vfg.graph.add_node(emit_node(&[0, 1]));
-        let cb = vfg.graph.add_node(emission_node(
-            &[2, 3],
-            DistEntry::Basis {
-                mode: ChangeBasisMode::MeasurePauli,
-                ref_id: "cb.0".to_string(),
-            },
-        ));
-        let inj = vfg.graph.add_node(emission_node(
-            &[4, 5],
-            DistEntry::Noise {
-                reference: "noise.0".to_string(),
-                modifier: None,
-            },
-        ));
+        let cb = vfg.graph.add_node(emission_node(&[2, 3], DistKey(1)));
+        let inj = vfg.graph.add_node(emission_node(&[4, 5], DistKey(2)));
         let c = vfg.graph.add_node(collect_node(&[0, 1, 2, 3, 4, 5]));
         vfg.graph.add_edge(e, c, Edge::new());
         vfg.graph.add_edge(cb, c, Edge::new());

@@ -13,22 +13,19 @@
 use qiskit_circuit::standard_gate::StandardGate;
 
 use crate::annotated_circuit::{DistributionType, SynthesizerType};
-use crate::distributions::DistEntry;
+use crate::distributions::DistKey;
 use crate::partition::Partition;
 use crate::virtual_flow_graph::*;
 
 pub fn emit_node(qubits: &[usize]) -> Node {
-    emission_node(
-        qubits,
-        DistEntry::Distribution(DistributionType::UniformPauli),
-    )
+    emission_node(qubits, DistKey(0))
 }
 
-pub fn emission_node(qubits: &[usize], entry: DistEntry) -> Node {
+pub fn emission_node(qubits: &[usize], key: DistKey) -> Node {
     Node {
         partition: Partition::from_elements(qubits.iter().copied()),
         kind: NodeKind::Emission(Emission {
-            entry,
+            key,
             direction: Direction::Right,
             virtual_type: VirtualType::Pauli,
         }),
@@ -39,7 +36,7 @@ pub fn typed_emit_node(qubits: &[usize], distribution: DistributionType) -> Node
     Node {
         partition: Partition::from_elements(qubits.iter().copied()),
         kind: NodeKind::Emission(Emission {
-            entry: DistEntry::Distribution(distribution),
+            key: DistKey(0),
             direction: Direction::Right,
             virtual_type: distribution.virtual_type(),
         }),

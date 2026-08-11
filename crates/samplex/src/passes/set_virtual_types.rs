@@ -72,7 +72,7 @@ pub fn set_virtual_types(vfg: &mut VirtualFlowGraph) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distributions::DistEntry;
+    use crate::distributions::DistKey;
     use crate::partition::Partition;
     use crate::passes::test_fixtures::*;
     use crate::virtual_flow_graph::*;
@@ -168,18 +168,8 @@ mod tests {
         // owes is that each edge gets its own source's type — the mode-to-type mapping itself is
         // the build pass's business now that the type travels on the emission.
         let mut vfg = VirtualFlowGraph::new();
-        let cb_pauli = vfg.graph.add_node(basis_node(
-            &[0, 1],
-            ChangeBasisMode::MeasurePauli,
-            "cb.0",
-            VirtualType::Pauli,
-        ));
-        let cb_c1 = vfg.graph.add_node(basis_node(
-            &[2, 3],
-            ChangeBasisMode::LocalClifford,
-            "cb.1",
-            VirtualType::C1,
-        ));
+        let cb_pauli = vfg.graph.add_node(basis_node(&[0, 1], VirtualType::Pauli));
+        let cb_c1 = vfg.graph.add_node(basis_node(&[2, 3], VirtualType::C1));
         let c = vfg.graph.add_node(collect_node(&[0, 1, 2, 3]));
         vfg.graph.add_edge(cb_pauli, c, Edge::new());
         vfg.graph.add_edge(cb_c1, c, Edge::new());
@@ -196,19 +186,11 @@ mod tests {
         );
     }
 
-    fn basis_node(
-        qubits: &[usize],
-        mode: ChangeBasisMode,
-        ref_id: &str,
-        virtual_type: VirtualType,
-    ) -> Node {
+    fn basis_node(qubits: &[usize], virtual_type: VirtualType) -> Node {
         Node {
             partition: Partition::from_elements(qubits.iter().copied()),
             kind: NodeKind::Emission(Emission {
-                entry: DistEntry::Basis {
-                    mode,
-                    ref_id: ref_id.to_string(),
-                },
+                key: DistKey(0),
                 direction: Direction::Left,
                 virtual_type,
             }),
@@ -239,10 +221,7 @@ mod tests {
         let inj = vfg.graph.add_node(Node {
             partition: Partition::from_elements([0, 1]),
             kind: NodeKind::Emission(Emission {
-                entry: DistEntry::Noise {
-                    reference: "noise.0".to_string(),
-                    modifier: None,
-                },
+                key: DistKey(0),
                 direction: Direction::Left,
                 virtual_type: VirtualType::Pauli,
             }),
