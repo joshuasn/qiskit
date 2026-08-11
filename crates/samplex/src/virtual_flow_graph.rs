@@ -16,7 +16,7 @@ use hashbrown::HashMap;
 use qiskit_circuit::operations::Operation;
 use rustworkx_core::petgraph::stable_graph::{NodeIndex, StableDiGraph};
 
-use crate::distributions::DistEntry;
+use crate::distributions::{DistEntry, DistributionTable};
 use crate::emission_circuit::EmitPart;
 use crate::parameters::ParamKey;
 use crate::partition::Partition;
@@ -341,7 +341,11 @@ impl VirtualFlowGraph {
     }
 
     /// Return a Graphviz DOT representation of the graph.
-    fn to_dot(&self) -> String {
+    ///
+    /// Pass `table` to resolve each `Collect` step's local emission to its full distribution
+    /// identity (e.g. `Emit(UniformPauli)`); without it, those steps render as `Emit(#key)`.
+    #[pyo3(signature = (table=None))]
+    fn to_dot(&self, table: Option<&DistributionTable>) -> String {
         use rustworkx_core::petgraph::visit::{EdgeRef, IntoEdgeReferences, IntoNodeReferences};
         use std::fmt::Write;
 
@@ -351,7 +355,7 @@ impl VirtualFlowGraph {
         writeln!(dot, "    node [shape=box, style=filled, fontname=\"Helvetica\"];").unwrap();
 
         for (idx, node) in self.graph.node_references() {
-            let (label, color) = node_label_color(&node.kind, &node.partition);
+            let (label, color) = node_label_color(&node.kind, &node.partition, table);
             writeln!(
                 dot,
                 "    n{} [label={}, fillcolor=\"{}\"];",
@@ -405,10 +409,34 @@ fn param_label(param: &AbsorbedParam) -> String {
     }
 }
 
+/// The verb-form label for a distribution entry, as it reads in a rendered node's box: `Emit(...)`,
+/// `ChangeBasis(...)`, or `InjectNoise(...)`.
+fn dist_entry_verb_label(entry: &DistEntry) -> String {
+    match entry {
+        DistEntry::Distribution(distribution) => format!("Emit({distribution:?})"),
+        DistEntry::Basis { mode, .. } => format!("ChangeBasis({mode:?})"),
+        DistEntry::Noise { reference, .. } => format!("InjectNoise({reference})"),
+    }
+}
+
 /// How one step of a [`Collect`]'s body reads in the rendered node label.
-fn collect_step_label(step: &CollectStep) -> String {
+///
+/// A local emission is named the same way a still-travelling one is elsewhere in the graph —
+/// `Emit(UniformPauli)` and friends — when `table` resolves its key; without a table, the raw key
+/// is all there is to show.
+fn collect_step_label(step: &CollectStep, table: Option<&DistributionTable>) -> String {
     match step {
-        CollectStep::Local(local) => format!("emit {}", format_partition(&local.partition)),
+        CollectStep::Local(local) => {
+            let label = local
+                .parts
+                .first()
+                .map(|part| match table.and_then(|t| t.get(part.dist)) {
+                    Some(entry) => dist_entry_verb_label(entry),
+                    None => format!("Emit(#{})", part.dist.0),
+                })
+                .unwrap_or_else(|| "Emit".to_string());
+            format!("{} {}", label, format_partition(&local.partition))
+        }
         CollectStep::Gate(gate) => {
             let params: Vec<String> = gate.params.iter().map(param_label).collect();
             if params.is_empty() {
@@ -429,23 +457,23 @@ fn emission_label(entry: &DistEntry) -> String {
     }
 }
 
-fn node_label_color(kind: &NodeKind, partition: &Partition) -> (String, &'static str) {
+fn node_label_color(
+    kind: &NodeKind,
+    partition: &Partition,
+    table: Option<&DistributionTable>,
+) -> (String, &'static str) {
     let qubits = format_partition(partition);
     match kind {
         // One node kind, but distinct colours: which annotation produced an emission is the first
         // thing you look for in a rendered graph.
         NodeKind::Emission(e) => {
-            let (label, color) = match &e.entry {
-                DistEntry::Distribution(distribution) => {
-                    (format!("Emit({distribution:?})"), "#a8d8ea")
-                }
-                DistEntry::Basis { mode, .. } => (format!("ChangeBasis({mode:?})"), "#fff2cc"),
-                DistEntry::Noise { reference, .. } => {
-                    (format!("InjectNoise({reference})"), "#f8cecc")
-                }
+            let color = match &e.entry {
+                DistEntry::Distribution(_) => "#a8d8ea",
+                DistEntry::Basis { .. } => "#fff2cc",
+                DistEntry::Noise { .. } => "#f8cecc",
             };
             (
-                format!("{} {} {}", label, e.direction.mark(), qubits),
+                format!("{} {} {}", dist_entry_verb_label(&e.entry), e.direction.mark(), qubits),
                 color,
             )
         }
@@ -453,7 +481,7 @@ fn node_label_color(kind: &NodeKind, partition: &Partition) -> (String, &'static
             let mut label = format!("Collect({:?}) {}", c.synthesizer, qubits);
             for step in &c.steps {
                 label.push_str("\n  ");
-                label.push_str(&collect_step_label(step));
+                label.push_str(&collect_step_label(step, table));
             }
             (label, "#f8c8dc")
         }
@@ -590,20 +618,26 @@ mod tests {
                 params: Vec::new(),
             }),
         ];
-        let (label, _color) = node_label_color(
-            &NodeKind::Collect(Collect {
-                synthesizer: SynthesizerType::RzSx,
-                param_indices: vec![0],
-                steps,
-            }),
-            &Partition::from_elements([0, 1, 2]),
-        );
-        // Each step is its own indented line beneath the collector's own header line.
-        assert!(label.contains("\n  emit [0]"), "label was: {label}");
+        let kind = NodeKind::Collect(Collect {
+            synthesizer: SynthesizerType::RzSx,
+            param_indices: vec![0],
+            steps,
+        });
+        let partition = Partition::from_elements([0, 1, 2]);
+
+        // Without a table, the local emission falls back to its raw key.
+        let (label, _color) = node_label_color(&kind, &partition, None);
+        assert!(label.contains("\n  Emit(#0) [0]"), "label was: {label}");
         assert!(label.contains("\n  rz(3.14"), "label was: {label}");
         // A parameter-free gate gets no empty parens.
         assert!(label.contains("\n  x [2]"), "label was: {label}");
         assert!(!label.contains("x() [2]"), "label was: {label}");
+
+        // With a table, it resolves the same way a still-travelling Emit does.
+        let mut table = DistributionTable::new();
+        table.intern(DistEntry::Distribution(DistributionType::UniformPauli));
+        let (label, _color) = node_label_color(&kind, &partition, Some(&table));
+        assert!(label.contains("\n  Emit(UniformPauli) [0]"), "label was: {label}");
     }
 
     #[test]
