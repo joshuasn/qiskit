@@ -1,6 +1,6 @@
 // This code is part of Qiskit.
 //
-// (C) Copyright IBM 2025
+// (C) Copyright IBM 2025, 2026
 //
 // This code is licensed under the Apache License, Version 2.0. You may
 // obtain a copy of this license in the LICENSE.txt file in the root directory
@@ -14,7 +14,6 @@ use crate::circuit_data::CircuitData;
 use crate::operations::{OperationRef, Param};
 use ndarray::Array2;
 use num_complex::Complex64;
-use pyo3::exceptions::PyNotImplementedError;
 use pyo3::prelude::*;
 use smallvec::SmallVec;
 
@@ -191,8 +190,8 @@ pub fn create_py_op(
         }
         OperationRef::PyCustom(inst) => Ok(inst.ob.clone_ref(py)),
         OperationRef::Unitary(unitary) => unitary.create_py_op(py, label),
-        OperationRef::CustomOperation(_) => Err(PyNotImplementedError::new_err(
-            "Custom operations from Rust cannot be exposed to Python",
-        )),
+        OperationRef::CustomOperation(op) => {
+            op.create_py_op(py, params.map(|p| p.unwrap_params()), label)
+        }
     }
 }

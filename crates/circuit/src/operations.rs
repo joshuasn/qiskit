@@ -1,6 +1,6 @@
 // This code is part of Qiskit.
 //
-// (C) Copyright IBM 2024
+// (C) Copyright IBM 2024, 2026
 //
 // This code is licensed under the Apache License, Version 2.0. You may
 // obtain a copy of this license in the LICENSE.txt file in the root directory
@@ -41,7 +41,7 @@ use num_complex::{Complex64, c64};
 use smallvec::SmallVec;
 
 use numpy::{PyArray1, PyReadonlyArray2, ToPyArray};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyDict, PyFloat, PyTuple, PyType};
 use pyo3::{IntoPyObjectExt, Python, intern};
@@ -1989,6 +1989,29 @@ pub trait CustomOperation:
         None
     }
 
+    /// Build the Python object standing in for this operation, for the places a circuit has to hand
+    /// an operation over to Python: `circuit.data[i].operation`, `count_ops`, `draw`.
+    ///
+    /// This mirrors the inherent `create_py_op` that every other operation type has
+    /// ([`StandardGate`], [`UnitaryGate`], [`PauliProductRotation`], ...): the Rust struct is the
+    /// storage, and the Python object is a view built on demand. Those types can be dispatched to
+    /// directly because `qiskit-circuit` knows them, whereas a custom operation is opaque to it, so
+    /// an implementor that wants to be visible from Python has to name the object itself.
+    ///
+    /// The default refuses, which is what every custom operation did unconditionally before this
+    /// hook existed. Overriding it makes an operation Python-*visible* but not Python-*typed*:
+    /// [`PackedOperation::py_op_matches`] still refuses instance checks against custom operations.
+    fn create_py_op(
+        &self,
+        _py: Python,
+        _params: Option<SmallVec<[Param; 3]>>,
+        _label: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        Err(PyNotImplementedError::new_err(
+            "Custom operations from Rust cannot be exposed to Python",
+        ))
+    }
+
     /// Returns an inverted version of this instruction and the computed parameters.
     fn inverse(&self, _params: &[Param]) -> Option<(PackedOperation, SmallVec<[Param; 3]>)> {
         None
@@ -2144,6 +2167,8 @@ mod test_custom_operations {
     use crate::packed_instruction::PackedOperation;
     use crate::{Clbit, Qubit};
     use ndarray::aview2;
+    use pyo3::exceptions::PyNotImplementedError;
+    use pyo3::prelude::*;
     use smallvec::smallvec;
     use std::f64::consts::PI;
 
@@ -2549,6 +2574,20 @@ mod test_custom_operations {
             // Check that each instance is the same.
             assert_eq!(comparison, ops[idx]);
         }
+    }
+
+    #[test]
+    fn test_create_py_op_default_refuses() {
+        // `OpaqueGate` does not override the hook, so it must keep refusing exactly as every custom
+        // operation did before the hook existed. Guards the claim that adding it changed nothing for
+        // operations that do not opt in.
+        Python::initialize();
+        Python::attach(|py| {
+            let err = OpaqueGate.create_py_op(py, None, None).expect_err(
+                "a custom operation that does not override the hook cannot materialize",
+            );
+            assert!(err.is_instance_of::<PyNotImplementedError>(py));
+        });
     }
 
     // Tests that `OperationRef` delegates each function call correctly for
