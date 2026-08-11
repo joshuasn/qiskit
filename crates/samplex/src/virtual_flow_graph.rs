@@ -380,7 +380,11 @@ impl VirtualFlowGraph {
 }
 
 fn dot_escape(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\l");
+    format!("\"{}\"", escaped)
 }
 
 fn format_partition(partition: &Partition) -> String {
@@ -398,6 +402,17 @@ fn param_label(param: &AbsorbedParam) -> String {
     match param {
         AbsorbedParam::Bound(value) => format!("{value}"),
         AbsorbedParam::Symbolic(key) => format!("#{}", key.0),
+    }
+}
+
+/// How one step of a [`Collect`]'s body reads in the rendered node label.
+fn collect_step_label(step: &CollectStep) -> String {
+    match step {
+        CollectStep::Local(local) => format!("emit {}", format_partition(&local.partition)),
+        CollectStep::Gate(gate) => {
+            let params: Vec<String> = gate.params.iter().map(param_label).collect();
+            format!("{}({}) {:?}", gate.gate.name(), params.join(", "), gate.qubits)
+        }
     }
 }
 
@@ -431,7 +446,12 @@ fn node_label_color(kind: &NodeKind, partition: &Partition) -> (String, &'static
             )
         }
         NodeKind::Collect(c) => {
-            (format!("Collect({:?}) {}", c.synthesizer, qubits), "#f8c8dc")
+            let mut label = format!("Collect({:?}) {}", c.synthesizer, qubits);
+            for step in &c.steps {
+                label.push('\n');
+                label.push_str(&collect_step_label(step));
+            }
+            (label, "#f8c8dc")
         }
         NodeKind::Propagate(p) => (
             format!("{}{:?} {}", p.direction.mark(), p.gate, qubits),
@@ -455,6 +475,7 @@ fn edge_label(edge: &Edge) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::distributions::DistKey;
 
     fn make_partition(parts: &[&[usize]]) -> Partition {
         Partition::with_parts(parts.iter().map(|p| p.to_vec().into_boxed_slice())).unwrap()
@@ -538,6 +559,39 @@ mod tests {
         } else {
             panic!("expected Collect");
         }
+    }
+
+    #[test]
+    fn test_collect_label_shows_its_steps() {
+        // The rendered box is the only place a Collect's absorbed body is visible at a glance, so
+        // the label must name each step rather than only the collector itself.
+        let steps = vec![
+            CollectStep::Local(LocalEmission {
+                partition: make_partition(&[&[0]]),
+                parts: vec![EmitPart {
+                    dist: DistKey(0),
+                    virtual_type: VirtualType::Pauli,
+                    draw: 0,
+                    adjoint: false,
+                }],
+            }),
+            CollectStep::Gate(AbsorbedGate {
+                gate: StandardGate::RZ,
+                qubits: vec![1],
+                params: vec![AbsorbedParam::Bound(std::f64::consts::PI)],
+            }),
+        ];
+        let (label, _color) = node_label_color(
+            &NodeKind::Collect(Collect {
+                synthesizer: SynthesizerType::RzSx,
+                param_indices: vec![0],
+                steps,
+            }),
+            &Partition::from_elements([0, 1]),
+        );
+        assert!(label.contains("emit [0]"), "label was: {label}");
+        assert!(label.contains("rz(3.14"), "label was: {label}");
+        assert!(label.contains('\n'), "steps should each be on their own line");
     }
 
     #[test]
