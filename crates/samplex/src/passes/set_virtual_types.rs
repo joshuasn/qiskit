@@ -14,8 +14,8 @@
 //!
 //! Forward-propagates each source's own type along its outgoing edges.
 
-use rustworkx_core::petgraph::visit::EdgeRef;
 use rustworkx_core::petgraph::Direction as PetDirection;
+use rustworkx_core::petgraph::visit::EdgeRef;
 
 use crate::virtual_flow_graph::{NodeKind, VirtualFlowGraph, VirtualType};
 
@@ -73,16 +73,12 @@ pub fn set_virtual_types(vfg: &mut VirtualFlowGraph) {
 mod tests {
     use super::*;
     use crate::distributions::DistKey;
-    use crate::partition::Partition;
     use crate::passes::test_fixtures::*;
     use crate::virtual_flow_graph::*;
 
     use rustworkx_core::petgraph::stable_graph::NodeIndex;
 
-    fn get_outgoing_vtypes(
-        vfg: &VirtualFlowGraph,
-        idx: NodeIndex,
-    ) -> Vec<Option<VirtualType>> {
+    fn get_outgoing_vtypes(vfg: &VirtualFlowGraph, idx: NodeIndex) -> Vec<Option<VirtualType>> {
         vfg.graph
             .edges_directed(idx, PetDirection::Outgoing)
             .map(|e| e.weight().virtual_type)
@@ -187,45 +183,41 @@ mod tests {
     }
 
     fn basis_node(qubits: &[usize], virtual_type: VirtualType) -> Node {
-        Node {
-            partition: Partition::from_elements(qubits.iter().copied()),
-            kind: NodeKind::Emission(Emission {
+        Node::singletons(
+            qubits.to_vec(),
+            NodeKind::Emission(Emission {
                 key: DistKey(0),
                 direction: Direction::Left,
                 virtual_type,
             }),
-        }
+        )
     }
 
     #[test]
     fn test_reset_is_pauli() {
         let mut vfg = VirtualFlowGraph::new();
-        let r = vfg.graph.add_node(Node {
-            partition: Partition::from_elements([0]),
-            kind: NodeKind::Reset,
-        });
+        let r = vfg
+            .graph
+            .add_node(Node::singletons(vec![0], NodeKind::Reset));
         let c = vfg.graph.add_node(collect_node(&[0]));
         vfg.graph.add_edge(r, c, Edge::new());
 
         set_virtual_types(&mut vfg);
 
-        assert_eq!(
-            get_outgoing_vtypes(&vfg, r),
-            vec![Some(VirtualType::Pauli)]
-        );
+        assert_eq!(get_outgoing_vtypes(&vfg, r), vec![Some(VirtualType::Pauli)]);
     }
 
     #[test]
     fn test_inject_noise_is_pauli() {
         let mut vfg = VirtualFlowGraph::new();
-        let inj = vfg.graph.add_node(Node {
-            partition: Partition::from_elements([0, 1]),
-            kind: NodeKind::Emission(Emission {
+        let inj = vfg.graph.add_node(Node::singletons(
+            vec![0, 1],
+            NodeKind::Emission(Emission {
                 key: DistKey(0),
                 direction: Direction::Left,
                 virtual_type: VirtualType::Pauli,
             }),
-        });
+        ));
         let c = vfg.graph.add_node(collect_node(&[0, 1]));
         vfg.graph.add_edge(inj, c, Edge::new());
 

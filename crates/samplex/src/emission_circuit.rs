@@ -64,7 +64,7 @@ pub struct EmitPart {
     /// The distribution this part draws from.
     pub dist: DistKey,
     /// The algebraic type of the emitted virtual gates on this part.
-    pub virtual_type: VirtualType,
+    pub virtual_type: VirtualType, //todo remove
     /// Index into this part's `dist` key's sample array.
     pub draw: u32,
     /// Whether to take the adjoint of the sampled value before composing or propagating. True for
@@ -77,28 +77,19 @@ pub struct EmitPart {
 pub struct EmitSpec {
     /// Which annotated box this emission came from. Only that box's collectors may consume it; see
     /// [`CollectSpec::owned`].
-    pub box_id: u32,
+    pub box_id: u32, //todo remove
     /// Which annotation this emission stands in for.
-    pub source: EmitSource,
+    pub source: EmitSource, //todo purely visualization, debug info
     /// Which way the emitted virtual state flows, or `None` if it has already resolved in place —
     /// owned directly by the collector body it sits in, rather than propagating towards one.
     pub direction: Option<Direction>,
-    /// Subsystem grouping over the emission's qubits, in the *global* circuit frame.
-    ///
-    /// The instruction's own qargs are body-local, so this is the only record of the global frame.
+    /// How the emission's qubits group into subsystems, by index into its own qargs.
     pub partition: Partition,
     /// Per-part descriptors, parallel with `partition.iter()`.
     pub parts: Vec<EmitPart>,
 }
 
 impl EmitSpec {
-    /// The qubits this emission acts on, in the global frame, in ascending order.
-    pub fn qubits(&self) -> Vec<usize> {
-        let mut qubits: Vec<usize> = self.partition.all_elements().iter().copied().collect();
-        qubits.sort_unstable();
-        qubits
-    }
-
     /// The distribution key of the first part. Convenience for the common uniform case where all
     /// parts share the same distribution.
     pub fn dist(&self) -> DistKey {
@@ -118,7 +109,7 @@ impl Operation for EmitSpec {
     }
 
     fn num_qubits(&self) -> u32 {
-        self.partition.all_elements().len() as u32
+        self.partition.num_qubits() as u32
     }
 
     fn num_clbits(&self) -> u32 {
@@ -187,7 +178,7 @@ impl Emit {
 
     #[getter]
     fn num_qubits(&self) -> usize {
-        self.inner.partition.all_elements().len()
+        self.inner.partition.num_qubits()
     }
 
     #[getter]
@@ -236,13 +227,11 @@ impl Emit {
         }
     }
 
-    /// The qubits this emission acts on, in the global circuit frame.
-    #[getter]
-    fn qubits(&self) -> Vec<usize> {
-        self.inner.qubits()
-    }
-
-    /// The subsystems this emission acts on, in the global circuit frame.
+    /// The subsystems this emission groups its qubits into, as indices into its own qargs.
+    ///
+    /// Read the qubits off the instruction — `circuit_instruction.qubits` — and index into them;
+    /// there is deliberately no `qubits` readout here, since the operation is shared by every
+    /// placement of it and so cannot know which wires it landed on.
     #[getter]
     fn subsystems(&self) -> Vec<Vec<usize>> {
         self.inner
@@ -272,11 +261,11 @@ impl Emit {
             ""
         };
         format!(
-            "Emit({}, dist={}, {}, {:?}, draws={:?}{})",
+            "Emit({}, dist={}, {}, {}, draws={:?}{})",
             self.source(),
             self.inner.dist().0,
             self.direction(),
-            self.inner.qubits(),
+            self.inner.partition,
             draws,
             adjoint_marker,
         )
@@ -324,8 +313,8 @@ pub struct CollectSpec {
     /// The annotated boxes whose emissions this collector may consume, ascending.
     ///
     /// Build gives each of a box's two collectors that box's own id; merging unions them.
-    pub owned: Vec<u32>,
-    /// Subsystem grouping over the collector's qubits, in the *global* circuit frame.
+    pub owned: Vec<u32>, //todo remove
+    /// How the collector's qubits group into subsystems, by index into the box's own qargs.
     pub partition: Partition,
     /// Per-part descriptors, parallel with `partition.iter()`.
     pub parts: Vec<CollectPart>,
@@ -376,7 +365,9 @@ impl Collect {
 impl Collect {
     /// Construct a `Collect` annotation, owning nothing and covering no qubits.
     ///
-    /// Build writes an empty body too; `absorb_dressing` is what fills one in.
+    /// The partition is empty because a bare annotation has no box to take its width from yet, while
+    /// the one part is what `synthesizer` reads. Build writes an empty body too; `absorb_dressing` is
+    /// what fills one in.
     #[new]
     #[pyo3(signature = (synthesizer="rzsx"))]
     fn new(synthesizer: &str) -> PyResult<PyClassInitializer<Self>> {
@@ -385,7 +376,7 @@ impl Collect {
             PyClassInitializer::from(PyAnnotation).add_subclass(Collect {
                 inner: CollectSpec {
                     owned: Vec::new(),
-                    partition: Partition::new(),
+                    partition: Partition::singletons(0),
                     parts: vec![CollectPart { synthesizer: synth }],
                 },
             }),

@@ -252,9 +252,10 @@ impl Build {
         // the pairing later passes check instead of trusting adjacency.
         let box_id = self.alloc_box_id();
         let dressing = resolved.dressing.unwrap_or(Dressing::Left);
-        let emissions = self.build_emissions(&resolved, &global, dressing, box_id);
+        let emissions = self.build_emissions(&resolved, global.len(), dressing, box_id);
         let synthesizer = resolved.synthesizer.unwrap_or(DEFAULT_SYNTHESIZER);
-        let partition = Partition::from_elements(global.iter().copied());
+        // One subsystem per qubit: nothing here samples a box's qubits jointly yet.
+        let partition = Partition::singletons(global.len());
         let collect_parts: Vec<CollectPart> = (0..partition.len())
             .map(|_| CollectPart { synthesizer })
             .collect();
@@ -266,6 +267,8 @@ impl Build {
         let inner_global = global.clone();
         let inner_identity_q: Vec<usize> = (0..width).collect();
         let inner_identity_c: Vec<usize> = (0..body_clbits.len()).collect();
+        // A body is exactly as wide as its box, so inside it the box's qubits *are* `0..width`.
+        let body_qargs: Vec<Qubit> = (0..width as u32).map(Qubit).collect();
         let inner = Scope {
             qubits: &inner_identity_q,
             global: &inner_global,
@@ -348,7 +351,7 @@ impl Build {
         // move them later.
         let mut hard_builder = new_body(width, body_clbits.len(), hard_nodes.len())?.into_builder();
         if has_hard_content {
-            write_emissions(&mut hard_builder, &left_propagating, &inner)?;
+            write_emissions(&mut hard_builder, &left_propagating, &body_qargs)?;
             for node in hard_nodes {
                 let inst = body.dag()[node].unwrap_operation();
                 match inst.op.view() {
@@ -368,7 +371,7 @@ impl Build {
                     _ => copy_instruction(body, inst, &mut hard_builder, &inner)?,
                 }
             }
-            write_emissions(&mut hard_builder, &right_propagating, &inner)?;
+            write_emissions(&mut hard_builder, &right_propagating, &body_qargs)?;
         }
         let hard = hard_builder.build();
 
@@ -379,7 +382,7 @@ impl Build {
             &|p| p.edge == Direction::Left && is_outer(p),
             Direction::Left,
         );
-        write_emissions(out, &left_outer, scope)?;
+        write_emissions(out, &left_outer, &out_qargs)?;
         if matches!(dressing, Dressing::Left) {
             write_easy_gates(out, &easy, &body_scope)?;
         }
@@ -387,12 +390,12 @@ impl Build {
             &|p| p.edge == Direction::Left && !is_outer(p) && is_local(p, Direction::Left),
             Direction::Left,
         );
-        write_emissions(out, &left_inner, scope)?;
+        write_emissions(out, &left_inner, &out_qargs)?;
         // With no hard content there is no hard box to sit inside, and nothing for the emission to
         // be conjugated by either — so it stays on the spine, where its collector absorbs it as
         // local.
         if !has_hard_content {
-            write_emissions(out, &left_propagating, scope)?;
+            write_emissions(out, &left_propagating, &out_qargs)?;
         }
 
         // Hard box.
@@ -401,13 +404,13 @@ impl Build {
         // Write right edge: inner emissions, easy gates (if right-dressed), outer emissions,
         // collector.
         if !has_hard_content {
-            write_emissions(out, &right_propagating, scope)?;
+            write_emissions(out, &right_propagating, &out_qargs)?;
         }
         let right_inner = sorted(
             &|p| p.edge == Direction::Right && !is_outer(p) && is_local(p, Direction::Right),
             Direction::Right,
         );
-        write_emissions(out, &right_inner, scope)?;
+        write_emissions(out, &right_inner, &out_qargs)?;
         if matches!(dressing, Dressing::Right) {
             write_easy_gates(out, &easy, &body_scope)?;
         }
@@ -415,7 +418,7 @@ impl Build {
             &|p| p.edge == Direction::Right && is_outer(p),
             Direction::Right,
         );
-        write_emissions(out, &right_outer, scope)?;
+        write_emissions(out, &right_outer, &out_qargs)?;
         write_collect(
             py,
             out,
@@ -435,11 +438,12 @@ impl Build {
     fn build_emissions(
         &mut self,
         resolved: &ResolvedBox,
-        qubits: &[usize],
+        width: usize,
         dressing: Dressing,
         box_id: u32,
     ) -> Vec<Placed> {
-        let partition = Partition::from_elements(qubits.iter().copied());
+        // Every emission of a box covers the box's full width, one subsystem per qubit.
+        let partition = Partition::singletons(width);
         let num_parts = partition.len();
         let dressing_edge = match dressing {
             Dressing::Left => Direction::Left,
@@ -629,31 +633,26 @@ fn copy_instruction(
     append(out, inst.op.clone(), params, &qargs, &cargs)
 }
 
-/// Write the emissions belonging to one edge of a box, in the order given.
+/// Write the emissions belonging to one edge of a box, in the order given, on `qargs`.
+///
+/// Every emission of a box covers that box's full width, so they all land on the same wires — the
+/// box's own qargs, in whichever frame is being written into. That is also the frame the specs'
+/// partitions index into, which is what keeps them meaningful wherever the emission ends up.
 fn write_emissions(
     out: &mut DAGCircuitBuilder,
     emissions: &[&Placed],
-    scope: &Scope,
+    qargs: &[Qubit],
 ) -> PyResult<()> {
     for spec in emissions.iter().map(|placed| &placed.spec) {
-        // The spec's partition is global; the qargs must be in the output's frame.
-        let qargs: Vec<Qubit> = spec
-            .qubits()
-            .iter()
-            .map(|g| {
-                scope
-                    .global
-                    .iter()
-                    .position(|x| x == g)
-                    .and_then(|local| scope.qubits.get(local).copied())
-                    .map(|i| Qubit(i as u32))
-                    .ok_or_else(|| PyValueError::new_err(format!("qubit {g} not in scope")))
-            })
-            .collect::<PyResult<_>>()?;
-        // The spec is the operation, so `Operation::num_qubits` and these qargs agree by
-        // construction — both come from `spec.qubits()`.
+        if spec.partition.num_qubits() != qargs.len() {
+            return Err(PyValueError::new_err(format!(
+                "an emission on {} qubits cannot be written on {} of them",
+                spec.partition.num_qubits(),
+                qargs.len(),
+            )));
+        }
         let op = PackedOperation::from_custom_operation(Box::new(spec.clone()));
-        append(out, op, None, &qargs, &[])?;
+        append(out, op, None, qargs, &[])?;
     }
     Ok(())
 }

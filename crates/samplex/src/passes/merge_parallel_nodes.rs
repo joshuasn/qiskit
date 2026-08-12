@@ -16,9 +16,9 @@
 //! disjoint qubits, into one wider node.
 
 use hashbrown::{HashMap, HashSet};
+use rustworkx_core::petgraph::Direction as PetDirection;
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
 use rustworkx_core::petgraph::visit::EdgeRef;
-use rustworkx_core::petgraph::Direction as PetDirection;
 
 use qiskit_circuit::standard_gate::StandardGate;
 
@@ -74,7 +74,7 @@ pub fn merge_parallel_nodes(vfg: &mut VirtualFlowGraph) {
             let mut cluster_predecessors: Vec<HashSet<NodeIndex>> = Vec::new();
 
             for &idx in &group {
-                let node_elements = vfg.graph[idx].partition.all_elements().clone();
+                let node_elements: HashSet<usize> = vfg.graph[idx].qubits.iter().copied().collect();
                 let preds: HashSet<NodeIndex> = vfg
                     .graph
                     .neighbors_directed(idx, PetDirection::Incoming)
@@ -112,7 +112,10 @@ pub fn merge_parallel_nodes(vfg: &mut VirtualFlowGraph) {
                 }
 
                 let merged_node = build_merged_node(
-                    &cluster.iter().map(|&idx| &vfg.graph[idx]).collect::<Vec<_>>(),
+                    &cluster
+                        .iter()
+                        .map(|&idx| &vfg.graph[idx])
+                        .collect::<Vec<_>>(),
                 );
 
                 let merged_idx = vfg.graph.add_node(merged_node);
@@ -128,11 +131,7 @@ pub fn merge_parallel_nodes(vfg: &mut VirtualFlowGraph) {
     }
 }
 
-fn rewire_edges(
-    vfg: &mut VirtualFlowGraph,
-    cluster: &[NodeIndex],
-    merged_idx: NodeIndex,
-) {
+fn rewire_edges(vfg: &mut VirtualFlowGraph, cluster: &[NodeIndex], merged_idx: NodeIndex) {
     let mut seen_incoming: HashSet<NodeIndex> = HashSet::new();
     let mut seen_outgoing: HashSet<NodeIndex> = HashSet::new();
 
@@ -167,38 +166,51 @@ fn rewire_edges(
     }
 }
 
+/// Fuse a cluster of disjoint nodes into one wider node.
+///
+/// Members are taken in ascending-qubit order rather than the order clustering happened to visit them
+/// in, so the result does not depend on the walk. Each member's parts shift by where its qubits
+/// landed in the merged list, which is what carries a joint subsystem through the merge intact — a
+/// two-qubit conjugation stays one part rather than becoming two.
 fn build_merged_node(nodes: &[&Node]) -> Node {
-    let partitions: Vec<&Partition> = nodes.iter().map(|n| &n.partition).collect();
-    let merged_partition = Partition::union(&partitions).unwrap();
+    let mut members: Vec<&Node> = nodes.to_vec();
+    members.sort_by_key(|node| node.qubits.iter().copied().min());
 
-    match &nodes[0].kind {
-        NodeKind::Propagate(p) => Node {
-            partition: merged_partition,
-            kind: NodeKind::Propagate(Propagate {
-                gate: p.gate,
-                direction: p.direction,
-            }),
-        },
+    let mut qubits: Vec<usize> = Vec::new();
+    let mut parts: Vec<Box<[usize]>> = Vec::new();
+    for node in &members {
+        let offset = qubits.len();
+        qubits.extend_from_slice(&node.qubits);
+        parts.extend(
+            node.partition
+                .iter()
+                .map(|part| part.iter().map(|index| index + offset).collect()),
+        );
+    }
+    let partition = Partition::new(parts).expect(
+        "the members cover disjoint qubits, so shifting each one's parts by its offset in the \
+         merged list leaves them a partition",
+    );
+
+    let kind = match &members[0].kind {
+        NodeKind::Propagate(p) => NodeKind::Propagate(Propagate {
+            gate: p.gate,
+            direction: p.direction,
+        }),
         NodeKind::Measure(_) => {
-            let mut merged_clbits: Vec<usize> = Vec::new();
-            for n in nodes {
-                if let NodeKind::Measure(m) = &n.kind {
-                    merged_clbits.extend(&m.clbit_indices);
+            // Parallel with `qubits`, so they follow the same member order.
+            let mut clbit_indices: Vec<usize> = Vec::new();
+            for node in &members {
+                if let NodeKind::Measure(m) = &node.kind {
+                    clbit_indices.extend(&m.clbit_indices);
                 }
             }
-            Node {
-                partition: merged_partition,
-                kind: NodeKind::Measure(Measure {
-                    clbit_indices: merged_clbits,
-                }),
-            }
+            NodeKind::Measure(Measure { clbit_indices })
         }
-        NodeKind::Reset => Node {
-            partition: merged_partition,
-            kind: NodeKind::Reset,
-        },
+        NodeKind::Reset => NodeKind::Reset,
         _ => unreachable!(),
-    }
+    };
+    Node::new(qubits, partition, kind)
 }
 
 #[cfg(test)]
@@ -240,8 +252,12 @@ mod tests {
     fn test_different_gates_no_merge() {
         let mut vfg = VirtualFlowGraph::new();
         let e = vfg.graph.add_node(emit_node(&[0, 1, 2, 3]));
-        let pa = vfg.graph.add_node(propagate_node_with_gate(&[0, 1], StandardGate::CX));
-        let pb = vfg.graph.add_node(propagate_node_with_gate(&[2, 3], StandardGate::H));
+        let pa = vfg
+            .graph
+            .add_node(propagate_node_with_gate(&[0, 1], StandardGate::CX));
+        let pb = vfg
+            .graph
+            .add_node(propagate_node_with_gate(&[2, 3], StandardGate::H));
         let c = vfg.graph.add_node(collect_node(&[0, 1, 2, 3]));
         vfg.graph.add_edge(e, pa, Edge::new());
         vfg.graph.add_edge(e, pb, Edge::new());
@@ -259,12 +275,16 @@ mod tests {
         // into one wider node would make it unevaluable.
         let mut vfg = VirtualFlowGraph::new();
         let e = vfg.graph.add_node(emit_node(&[0, 1, 2, 3]));
-        let pa = vfg
-            .graph
-            .add_node(propagate_node_with(&[0, 1], StandardGate::CX, Direction::Right));
-        let pb = vfg
-            .graph
-            .add_node(propagate_node_with(&[2, 3], StandardGate::CX, Direction::Left));
+        let pa = vfg.graph.add_node(propagate_node_with(
+            &[0, 1],
+            StandardGate::CX,
+            Direction::Right,
+        ));
+        let pb = vfg.graph.add_node(propagate_node_with(
+            &[2, 3],
+            StandardGate::CX,
+            Direction::Left,
+        ));
         let c = vfg.graph.add_node(collect_node(&[0, 1, 2, 3]));
         vfg.graph.add_edge(e, pa, Edge::new());
         vfg.graph.add_edge(e, pb, Edge::new());
@@ -314,14 +334,12 @@ mod tests {
     #[test]
     fn test_predecessorless_resets_merge() {
         let mut vfg = VirtualFlowGraph::new();
-        let ra = vfg.graph.add_node(Node {
-            partition: Partition::from_elements([0]),
-            kind: NodeKind::Reset,
-        });
-        let rb = vfg.graph.add_node(Node {
-            partition: Partition::from_elements([1]),
-            kind: NodeKind::Reset,
-        });
+        let ra = vfg
+            .graph
+            .add_node(Node::singletons(vec![0], NodeKind::Reset));
+        let rb = vfg
+            .graph
+            .add_node(Node::singletons(vec![1], NodeKind::Reset));
         let c = vfg.graph.add_node(collect_node(&[0, 1]));
         vfg.graph.add_edge(ra, c, Edge::new());
         vfg.graph.add_edge(rb, c, Edge::new());
@@ -343,18 +361,18 @@ mod tests {
     fn test_measures_merge() {
         let mut vfg = VirtualFlowGraph::new();
         let e = vfg.graph.add_node(emit_node(&[0, 1, 2, 3]));
-        let ma = vfg.graph.add_node(Node {
-            partition: Partition::from_elements([0, 1]),
-            kind: NodeKind::Measure(Measure {
+        let ma = vfg.graph.add_node(Node::singletons(
+            vec![0, 1],
+            NodeKind::Measure(Measure {
                 clbit_indices: vec![0, 1],
             }),
-        });
-        let mb = vfg.graph.add_node(Node {
-            partition: Partition::from_elements([2, 3]),
-            kind: NodeKind::Measure(Measure {
+        ));
+        let mb = vfg.graph.add_node(Node::singletons(
+            vec![2, 3],
+            NodeKind::Measure(Measure {
                 clbit_indices: vec![2, 3],
             }),
-        });
+        ));
         vfg.graph.add_edge(e, ma, Edge::new());
         vfg.graph.add_edge(e, mb, Edge::new());
 

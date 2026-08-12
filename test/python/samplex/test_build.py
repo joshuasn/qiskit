@@ -75,6 +75,26 @@ def emissions(circuit):
     return out
 
 
+def emissions_with_qubits(circuit, frame=None):
+    """Every Emit instruction paired with the global qubits it landed on, in circuit order.
+
+    An `Emit` operation holds only how its qubits group into subsystems, by index into its own
+    qargs — the wires themselves are on the instruction, since one operation can be shared by
+    several placements. So the qubits have to come from the walk, mapped out through each enclosing
+    box's own qargs.
+    """
+    frame = list(range(circuit.num_qubits)) if frame is None else frame
+    out = []
+    for inst in circuit.data:
+        op = inst.operation
+        qubits = [frame[circuit.find_bit(b).index] for b in inst.qubits]
+        if op.name.startswith("samplex_emit"):
+            out.append((op, qubits))
+        for block in getattr(op, "blocks", None) or []:
+            out.extend(emissions_with_qubits(block, qubits))
+    return out
+
+
 def emissions_in_scope(circuit):
     """The Emit operations of one scope, in order, without recursing."""
     return [inst.operation for inst in circuit.data if inst.operation.name.startswith("samplex_emit")]
@@ -560,9 +580,8 @@ class TestFidelity(QiskitTestCase):
             circuit.noop(5, 2)
         lowered, _ = lower(circuit)
 
-        emits = emissions(lowered)
-        for emit in emits:
-            self.assertEqual(sorted(emit.qubits), [2, 5])
+        for _, qubits in emissions_with_qubits(lowered):
+            self.assertEqual(sorted(qubits), [2, 5])
         for _, _, qubits in collectors(lowered):
             self.assertEqual(sorted(qubits), [2, 5])
 
@@ -592,7 +611,7 @@ class TestFidelity(QiskitTestCase):
                     gate_names(lowered),
                     [(c.synthesizer, tuple(gate_names(b))) for c, b, _ in collectors(lowered)],
                     [tuple(q) for _, _, q in collectors(lowered)],
-                    [(e.direction, tuple(e.qubits)) for e in emissions(lowered)],
+                    [(e.direction, tuple(q)) for e, q in emissions_with_qubits(lowered)],
                     table.entries(),
                 )
             )
