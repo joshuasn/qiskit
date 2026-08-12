@@ -51,11 +51,10 @@ def collectors(circuit):
     """The (annotation, body, qubit indices) of each collect box, in circuit order."""
     out = []
     for inst in circuit.data:
-        annotations = getattr(inst.operation, "annotations", None)
-        if annotations:
+        if is_collector(inst.operation):
             out.append(
                 (
-                    annotations[0],
+                    inst.operation.annotations[0],
                     inst.operation.blocks[0],
                     [circuit.find_bit(b).index for b in inst.qubits],
                 )
@@ -80,13 +79,26 @@ def emissions_in_scope(circuit):
     return [inst.operation for inst in circuit.data if inst.operation.name.startswith("emit")]
 
 
-def hard_boxes(circuit):
-    """Boxes carrying no annotation — the ones holding propagating content."""
+def content_boxes(circuit):
+    """The bodies of the content boxes in one scope — every box that is not a collector.
+
+    One per emitting box, always written, even when empty. After absorption its body holds exactly
+    what could not be absorbed, which is what makes an empty one meaningful.
+    """
     return [
         inst.operation.blocks[0]
         for inst in circuit.data
-        if inst.operation.name == "box" and not getattr(inst.operation, "annotations", None)
+        if inst.operation.name == "box" and not is_collector(inst.operation)
     ]
+
+
+def is_collector(op):
+    """Whether a box operation carries a `Collect` annotation.
+
+    Not merely "carries an annotation": a content box carries whatever annotations we do not act on,
+    so the two are told apart by what the annotation is.
+    """
+    return any(hasattr(a, "synthesizer") for a in getattr(op, "annotations", None) or [])
 
 
 def gate_names(circuit):
@@ -94,12 +106,43 @@ def gate_names(circuit):
     return [inst.operation.name for inst in circuit.data]
 
 
+def all_gate_names(circuit):
+    """Every instruction name, descending into boxes, in order.
+
+    The box itself is reported too, so a caller can see where the nesting is.
+    """
+    out = []
+    for inst in circuit.data:
+        out.append(inst.operation.name)
+        for block in getattr(inst.operation, "blocks", None) or []:
+            out.extend(all_gate_names(block))
+    return out
+
+
+def unfolded(circuit, table):
+    """Every emission and gate in physical order, descending into content boxes.
+
+    Emissions are labelled `emit:<source>`. The twirl point is *inside* the content box, so the spine
+    on its own no longer shows how emissions nest around the content; unfolding the box does. Collect
+    boxes are not descended into — what is in one has already been taken off the spine.
+    """
+    out = []
+    for inst in circuit.data:
+        op = inst.operation
+        if op.name.startswith("emit"):
+            out.append(f"emit:{op.source(table)}")
+        elif op.name == "box" and not is_collector(op):
+            out.extend(unfolded(op.blocks[0], table))
+        else:
+            out.append(op.name)
+    return out
+
+
 def real_gates(body):
     """Gate names in a body, excluding the `Emit` markers sitting in it.
 
-    Both kinds of body have them now: a collector body holds the local emissions it absorbed, and a
-    hard body holds the propagating emission written at the edge it starts from. Neither executes, so
-    neither is a gate.
+    Both kinds of body have them: a collector body holds the local emissions it absorbed, and a
+    content box holds the twirl point's emissions. Neither executes, so neither is a gate.
     """
     return [inst.operation.name for inst in body.data if not inst.operation.name.startswith("emit")]
 
@@ -161,34 +204,26 @@ class TestBuildShape(QiskitTestCase):
         self.assertEqual(noise.direction, "right")  # site="after"
         self.assertEqual(basis.direction, "left")  # placement="start"
 
-        # Emissions are placed on the correct side of the hard box (positionally).
-        # Verify via spine ordering: basis is before the hard box, noise is after.
-        names = gate_names(lowered)
-        box_positions = [i for i, n in enumerate(names) if n == "box"]
-        # The hard box is the non-annotated box in the middle
-        hard_pos = box_positions[0] if len(box_positions) == 1 else box_positions[1]
-        basis_pos = next(
-            i
-            for i, inst in enumerate(lowered.data)
-            if inst.operation.name.startswith("emit") and inst.operation.source(table) == "change_basis"
+        # Positionally: the basis change is before the content, the noise after it. The twirl pair sits
+        # at the twirl point in between, which for a left dressing is against the content's near side.
+        self.assertEqual(
+            unfolded(lowered, table),
+            ["box", "emit:change_basis", "emit:twirl", "emit:twirl", "cx", "emit:inject_noise", "box"],
         )
-        noise_pos = next(
-            i
-            for i, inst in enumerate(lowered.data)
-            if inst.operation.name.startswith("emit") and inst.operation.source(table) == "inject_noise"
-        )
-        self.assertLess(basis_pos, hard_pos)  # basis on left edge
-        self.assertGreater(noise_pos, hard_pos)  # noise on right edge
         # twirl distribution + noise ref + basis ref
         self.assertEqual(len(table), 3)
 
-    def test_noise_and_basis_sit_outside_the_hard_box(self):
+    def test_noise_and_basis_sit_outside_the_content(self):
         """A basis change or noise injection is written at the edge its placement names.
 
         Not at the dressing edge, which is where the twirl pair goes. When the two differ — a
         `placement="end"` on a left-dressed box, say — writing it on the dressing edge would leave the
-        hard box between it and the collector consuming it, so the propagation walk would conjugate it
+        content between it and the collector consuming it, so the propagation walk would conjugate it
         by content it is supposed to sit outside of.
+
+        The claim is about the *content*, not about which box: a basis change is on the spine outside
+        the content box while an injection is written inside it, ahead of the content, and both are
+        equally "outside the content".
         """
         for dressing in ("left", "right"):
             for placement, site, side in (("start", "before", "left"), ("end", "after", "right")):
@@ -202,24 +237,16 @@ class TestBuildShape(QiskitTestCase):
                             circuit.cx(0, 1)
                         lowered, table = lower(circuit)
 
-                        names = gate_names(lowered)
-                        # the hard box is the middle `box`; the collectors bracket everything
-                        box_at = [i for i, n in enumerate(names) if n == "box"][1]
-                        # Located on the spine, which is itself the claim: one of these on the spine at
-                        # all means it is outside the hard box. Only a *propagating* emission is
-                        # written inside it, and neither of these ever propagates.
                         kind = (
                             "change_basis" if "ChangeBasis" in type(annotation).__name__ else "inject_noise"
                         )
-                        at = next(
-                            i
-                            for i, inst in enumerate(lowered.data)
-                            if inst.operation.name.startswith("emit") and inst.operation.source(table) == kind
-                        )
+                        order = unfolded(lowered, table)
+                        at = order.index(f"emit:{kind}")
+                        content_at = order.index("cx")
                         self.assertEqual(
-                            at < box_at,
+                            at < content_at,
                             side == "left",
-                            f"{kind} landed on the wrong side of the hard box",
+                            f"{kind} landed on the wrong side of the content",
                         )
 
     def test_emissions_nest_by_how_close_they_are_to_the_content(self):
@@ -242,16 +269,11 @@ class TestBuildShape(QiskitTestCase):
             circuit.cx(0, 1)
         lowered, table = lower(circuit)
 
-        # The right-edge emissions sit after the hard box in innermost-first order.
-        right_emits = []
-        past_hard = False
-        for inst in lowered.data:
-            if inst.operation.name == "box" and not getattr(inst.operation, "annotations", None):
-                past_hard = True
-                continue
-            if past_hard and inst.operation.name.startswith("emit"):
-                right_emits.append(inst.operation.source(table))
-        # noise then basis change (innermost-first); the far twirl half is on the dressing (left) edge
+        # The right-edge emissions sit after the content in innermost-first order: the injection is
+        # written inside the content box against the content, the basis change on the spine outside it.
+        order = unfolded(lowered, table)
+        right_emits = [name[5:] for name in order[order.index("cx") :] if name.startswith("emit:")]
+        # noise then basis change (innermost-first); the twirl pair is on the dressing (left) edge
         self.assertEqual(right_emits, ["inject_noise", "change_basis"])
 
     def test_a_local_clifford_flanks_the_content_but_a_basis_change_wraps_it(self):
@@ -262,16 +284,11 @@ class TestBuildShape(QiskitTestCase):
             with circuit.box([Twirl(), annotation, InjectNoise("n", "after")]):
                 circuit.cx(0, 1)
             lowered, table = lower(circuit)
-            # Collect right-edge emission sources in spine order (after hard box)
-            right_emits = []
-            past_hard = False
-            for inst in lowered.data:
-                if inst.operation.name == "box" and not getattr(inst.operation, "annotations", None):
-                    past_hard = True
-                    continue
-                if past_hard and inst.operation.name.startswith("emit"):
-                    right_emits.append(inst.operation.source(table))
-            return right_emits
+            # Emission sources after the content, in physical order. An injection is written inside the
+            # content box against the content and a basis change on the spine outside it, so the order
+            # only shows up once the box is unfolded.
+            order = unfolded(lowered, table)
+            return [name[5:] for name in order[order.index("cx") :] if name.startswith("emit:")]
 
         # an injection sits inside the noise's own depth band, so construction order decides between them
         self.assertEqual(
@@ -383,7 +400,7 @@ class TestEasyHardSplit(QiskitTestCase):
         left, right = collectors(lowered)
         self.assertEqual(real_gates(left[1]), ["h"])
         self.assertEqual(real_gates(right[1]), [])
-        (hard,) = hard_boxes(lowered)
+        (hard,) = content_boxes(lowered)
         self.assertEqual(real_gates(hard), ["cx"])
 
     def test_right_dressing_absorbs_from_the_right(self):
@@ -398,7 +415,7 @@ class TestEasyHardSplit(QiskitTestCase):
         self.assertEqual(real_gates(left[1]), [])
         # absorbed gates keep circuit order even though the sweep runs backwards
         self.assertEqual(real_gates(right[1]), ["s", "h"])
-        (hard,) = hard_boxes(lowered)
+        (hard,) = content_boxes(lowered)
         self.assertEqual(real_gates(hard), ["cx"])
 
     def test_emissions_sit_on_the_dressing_edge(self):
@@ -409,12 +426,15 @@ class TestEasyHardSplit(QiskitTestCase):
                 circuit = QuantumCircuit(2)
                 with circuit.box([Twirl(dressing=dressing)]):
                     circuit.cx(0, 1)
-                lowered, _ = lower(circuit)
+                lowered, table = lower(circuit)
 
-                names = gate_names(lowered)
-                emit_at = names.index("emit")
-                box_at = names.index("box", 1)  # the hard box, after the first collector
-                self.assertEqual(emit_at < box_at, expect_before)
+                # Both halves are at the twirl point, inside the content box, so the side they are on
+                # is their position relative to the content rather than to the box.
+                order = unfolded(lowered, table)
+                self.assertEqual(order.count("emit:twirl"), 2)
+                emit_at = order.index("emit:twirl")
+                content_at = order.index("cx")
+                self.assertEqual(emit_at < content_at, expect_before)
 
 
 class TestPerQubitAbsorption(QiskitTestCase):
@@ -435,7 +455,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
         left, _ = collectors(lowered)
         # q2 is untouched by the cx, so h(2) is at the dressing edge on its own wire
         self.assertEqual(real_gates(left[1]), ["h"])
-        (hard,) = hard_boxes(lowered)
+        (hard,) = content_boxes(lowered)
         self.assertEqual(real_gates(hard), ["cx"])
 
     def test_a_run_on_a_clean_wire_is_absorbed(self):
@@ -448,7 +468,12 @@ class TestPerQubitAbsorption(QiskitTestCase):
         self.assertEqual(real_gates(collectors(lowered)[0][1]), ["h", "s"])
 
     def test_a_poisoned_wire_is_left_alone(self):
-        # h(0) really is behind the cx on its own wire, so it cannot be commuted out.
+        """h(0) really is behind the cx on its own wire, so it cannot be commuted out.
+
+        Nor can the collector on the other side reach in and take it: it is on the far side of the twirl
+        point, so the far half is conjugated by it on the way past, and only the dressing side of that
+        point folds into a collector.
+        """
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left")]):
             circuit.cx(0, 1)
@@ -456,8 +481,8 @@ class TestPerQubitAbsorption(QiskitTestCase):
         lowered, _ = lower_absorbed(circuit)
 
         self.assertEqual(real_gates(collectors(lowered)[0][1]), [])
-        (hard,) = hard_boxes(lowered)
-        self.assertEqual(real_gates(hard), ["cx", "h"])
+        (content,) = content_boxes(lowered)
+        self.assertEqual(real_gates(content), ["cx", "h"])
 
     def test_poison_spreads_transitively(self):
         # q2 is clean until cx(1,2), which is itself poisoned by cx(0,1) — so s(2) is content. This is
@@ -470,8 +495,8 @@ class TestPerQubitAbsorption(QiskitTestCase):
         lowered, _ = lower_absorbed(circuit)
 
         self.assertEqual(real_gates(collectors(lowered)[0][1]), [])
-        (hard,) = hard_boxes(lowered)
-        self.assertEqual(real_gates(hard), ["cx", "cx", "s"])
+        (content,) = content_boxes(lowered)
+        self.assertEqual(real_gates(content), ["cx", "cx", "s"])
 
     def test_right_dressing_sweeps_from_the_other_end(self):
         circuit = QuantumCircuit(3)
@@ -484,18 +509,23 @@ class TestPerQubitAbsorption(QiskitTestCase):
         self.assertEqual(real_gates(left[1]), [])
         # absorbed into the right collector, which is where a right dressing sits
         self.assertEqual(real_gates(right[1]), ["h"])
-        (hard,) = hard_boxes(lowered)
+        (hard,) = content_boxes(lowered)
         self.assertEqual(real_gates(hard), ["cx"])
 
-    def test_a_fully_absorbed_box_has_no_hard_box(self):
-        # An empty box carries no information once propagation is derived from placement.
+    def test_a_fully_absorbed_box_keeps_an_empty_content_box(self):
+        """The content box is always written, and an empty one is a statement rather than noise.
+
+        What is left in a content box after absorption is exactly what could not be absorbed, so an
+        empty body says nothing here was hard.
+        """
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left")]):
             circuit.h(0)
             circuit.s(1)
         lowered, _ = lower_absorbed(circuit)
 
-        self.assertEqual(hard_boxes(lowered), [])
+        (content,) = content_boxes(lowered)
+        self.assertEqual(real_gates(content), [])
         self.assertEqual([real_gates(b) for _, b, _ in collectors(lowered)], [["h", "s"], []])
 
     def test_a_nested_box_is_split_the_same_way(self):
@@ -506,9 +536,9 @@ class TestPerQubitAbsorption(QiskitTestCase):
                 circuit.h(2)
         lowered, _ = lower_absorbed(circuit)
 
-        (outer_hard,) = hard_boxes(lowered)
+        (outer_hard,) = content_boxes(lowered)
         self.assertEqual([real_gates(b) for _, b, _ in collectors(outer_hard)], [["h"], []])
-        self.assertEqual([real_gates(b) for b in hard_boxes(outer_hard)], [["cx"]])
+        self.assertEqual([real_gates(b) for b in content_boxes(outer_hard)], [["cx"]])
 
     def test_no_gate_is_lost_or_duplicated(self):
         circuit = QuantumCircuit(3)
@@ -520,7 +550,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
         lowered, _ = lower_absorbed(circuit)
 
         names = [n for _, body, _ in collectors(lowered) for n in real_gates(body)]
-        names += [n for body in hard_boxes(lowered) for n in real_gates(body)]
+        names += [n for body in content_boxes(lowered) for n in real_gates(body)]
         self.assertEqual(sorted(names), ["cx", "cx", "h", "s"])
 
     def test_an_absorbed_gate_keeps_its_qubit(self):
@@ -612,7 +642,7 @@ class TestNesting(QiskitTestCase):
 
         # outer: two collectors at the top level, inner: two inside the hard box
         self.assertEqual(len(collectors(lowered)), 2)
-        (hard,) = hard_boxes(lowered)
+        (hard,) = content_boxes(lowered)
         self.assertEqual(len(collectors(hard)), 2)
         # four emissions in total: an inverse pair per twirl
         self.assertEqual(len(emissions(lowered)), 4)
@@ -625,11 +655,11 @@ class TestNesting(QiskitTestCase):
                 circuit.cx(0, 1)
         lowered, _ = lower_absorbed(circuit)
 
-        (outer_hard,) = hard_boxes(lowered)
+        (outer_hard,) = content_boxes(lowered)
         inner_left, inner_right = collectors(outer_hard)
         self.assertEqual(real_gates(inner_left[1]), ["h"])
         self.assertEqual(real_gates(inner_right[1]), [])
-        (inner_hard,) = hard_boxes(outer_hard)
+        (inner_hard,) = content_boxes(outer_hard)
         self.assertEqual(real_gates(inner_hard), ["cx"])
 
     def test_outermost_box_still_absorbs(self):
@@ -660,7 +690,7 @@ class TestNesting(QiskitTestCase):
                 circuit.cx(0, 1)
         lowered, _ = lower(circuit)
 
-        (hard,) = hard_boxes(lowered)
+        (hard,) = content_boxes(lowered)
         self.assertEqual(real_gates(hard), ["cx"])
 
 
@@ -690,26 +720,30 @@ class TestRejections(QiskitTestCase):
 
 
 class TestPropagatingEmissionPlacement(QiskitTestCase):
-    """A propagating emission is written inside the hard box; a local one is not.
+    """Both halves of the pair are written inside the content box, at the twirl point.
 
-    The hard content is exactly what conjugates the far half on its way to the far collector, so putting
-    the emission outside the box would place a scope boundary between it and the gates it has to cross —
-    which is what made a later pass have to move it there. Writing it in the right place to begin with is
-    what makes that machinery unnecessary.
+    The twirl point is *not* the box boundary: it sits after the absorbable run, so those gates are on
+    the near side of it and multiply into the dressing instead of being crossed. Putting it at the
+    boundary would leave every gate in the body to be crossed by the far half, and a Pauli cannot cross
+    a non-Clifford at all — an `rz` in a twirled box would stop being expressible.
+
+    The pair stays together for the same reason it shares one draw: two halves about one point. Splitting
+    them across the boundary would compose the near half on the far side of gates the far half is
+    conjugated by.
     """
 
-    def test_the_far_half_is_written_inside_the_hard_box(self):
+    def test_the_pair_is_written_inside_the_content_box(self):
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left")]):
             circuit.cx(0, 1)
         lowered, _ = lower(circuit)
 
-        spine = [op.direction for op in emissions_in_scope(lowered)]
-        (hard,) = hard_boxes(lowered)
-        inside = [op.direction for op in emissions_in_scope(hard)]
-        # The near half stays on the spine, where its collector can absorb it; the far half goes inside.
-        self.assertEqual(spine, ["left"])
-        self.assertEqual(inside, ["right"])
+        self.assertEqual(emissions_in_scope(lowered), [])
+        (content,) = content_boxes(lowered)
+        # Near half first — it faces the collector it will be absorbed into — then the far half, which
+        # is what the hard content conjugates.
+        self.assertEqual([op.direction for op in emissions_in_scope(content)], ["left", "right"])
+        self.assertEqual(gate_names(content), ["emit", "emit", "cx"])
 
     def test_right_dressing_puts_it_at_the_other_end(self):
         circuit = QuantumCircuit(2)
@@ -717,28 +751,31 @@ class TestPropagatingEmissionPlacement(QiskitTestCase):
             circuit.cx(0, 1)
         lowered, _ = lower(circuit)
 
-        (hard,) = hard_boxes(lowered)
-        # Travelling left, so it starts at the hard content's right-hand edge: the back of the body.
-        self.assertEqual(gate_names(hard), ["cx", "emit"])
-        self.assertEqual([op.direction for op in emissions_in_scope(hard)], ["left"])
+        (content,) = content_boxes(lowered)
+        # The twirl point is the content's right-hand edge, so the pair is at the back of the body: the
+        # far half travelling left first, then the near half facing its own collector.
+        self.assertEqual(gate_names(content), ["cx", "emit", "emit"])
+        self.assertEqual([op.direction for op in emissions_in_scope(content)], ["left", "right"])
 
-    def test_a_box_with_no_hard_content_keeps_it_on_the_spine(self):
-        """With nothing to cross there is no hard box, and no conjugation is due."""
+    def test_a_box_with_no_hard_content_still_has_a_twirl_point(self):
+        """With nothing to cross, the twirl point is simply past the whole absorbable run."""
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left")]):
             circuit.h(0)
             circuit.s(1)
         lowered, _ = lower(circuit)
 
-        self.assertEqual(hard_boxes(lowered), [])
-        self.assertEqual(sorted(op.direction for op in emissions_in_scope(lowered)), ["left", "right"])
+        self.assertEqual(emissions_in_scope(lowered), [])
+        (content,) = content_boxes(lowered)
+        self.assertEqual(gate_names(content), ["h", "s", "emit", "emit"])
+        self.assertEqual(sorted(op.direction for op in emissions_in_scope(content)), ["left", "right"])
 
     def test_a_leading_hard_gate_is_not_absorbed_across_the_twirl_point(self):
-        """The hard box is still the barrier that keeps content out of the dressing.
+        """The twirl point is the barrier that keeps content out of the dressing.
 
-        Right dressing puts the twirl point at the *right* edge, so a single-qubit gate that the sweep
-        classified as hard must not fold into the left collector — the far half travels leftward through
-        it, and a target collector's own absorbed gates are not crossed on the way in.
+        Right dressing puts it at the *right* edge, so a single-qubit gate the sweep classified as hard
+        must fold into neither collector — the far half travels leftward through it, and a target
+        collector's own absorbed gates are not crossed on the way in.
         """
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="right")]):
@@ -746,7 +783,8 @@ class TestPropagatingEmissionPlacement(QiskitTestCase):
             circuit.cx(0, 1)
         lowered, _ = lower_absorbed(circuit)
 
-        left, _ = collectors(lowered)
+        left, right = collectors(lowered)
         self.assertEqual(gate_names(left[1]), [])
-        (hard,) = hard_boxes(lowered)
-        self.assertEqual(real_gates(hard), ["s", "cx"])
+        self.assertEqual(gate_names(right[1]), ["emit"])  # the near half, nothing else
+        (content,) = content_boxes(lowered)
+        self.assertEqual(real_gates(content), ["s", "cx"])

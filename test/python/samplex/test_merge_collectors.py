@@ -29,7 +29,7 @@ from qiskit._accelerate.samplex import (
 )
 
 from test import QiskitTestCase
-from test.python.samplex.test_build import collectors, emissions, gate_names, hard_boxes, real_gates
+from test.python.samplex.test_build import collectors, emissions, gate_names, content_boxes, real_gates
 
 
 def build(circuit):
@@ -229,7 +229,7 @@ class TestScopes(QiskitTestCase):
         out, _ = merged(circuit)
 
         self.assertEqual(len(collectors(out)), 2)
-        (hard,) = hard_boxes(out)
+        (hard,) = content_boxes(out)
         self.assertEqual(len(collectors(hard)), 2)
 
     def test_siblings_inside_a_box_still_merge(self):
@@ -241,7 +241,7 @@ class TestScopes(QiskitTestCase):
                 circuit.cx(0, 1)
         out, _ = merged(circuit)
 
-        (hard,) = hard_boxes(out)
+        (hard,) = content_boxes(out)
         # the two inner boxes share a middle collector, just as siblings do at the top level
         self.assertEqual(len(collectors(hard)), 3)
 
@@ -303,7 +303,7 @@ class TestPreservation(QiskitTestCase):
         with circuit.box([Twirl()]):
             circuit.cx(1, 0)
         out, _ = merged(circuit)
-        self.assertEqual([real_gates(h) for h in hard_boxes(out)], [["cx"], ["cx"]])
+        self.assertEqual([real_gates(h) for h in content_boxes(out)], [["cx"], ["cx"]])
 
     def test_merge_is_deterministic(self):
         runs = []

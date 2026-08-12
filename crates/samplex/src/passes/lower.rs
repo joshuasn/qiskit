@@ -14,7 +14,9 @@
 //!
 //! Each collect box becomes a *synth template*, the parametric fragment whose angles the graph
 //! fills in; the absorbed gates in its body fold into those angles rather than reaching the
-//! template. `Emit` instructions disappear, and hard boxes are flattened out.
+//! template. `Emit` instructions disappear. Content boxes are kept, since what is left in one after
+//! absorption is exactly the content that could not be absorbed, and the annotations and duration
+//! they carry are meant for the consumer of the template.
 //!
 //! **Parameters are minted here and nowhere earlier**, so every pass that changes the number or
 //! width of collectors must already have run.
@@ -84,12 +86,14 @@ pub fn build_template(
     let mut collectors = Vec::new();
     let mut next_param = 0usize;
 
-    // The identity frame: at the top level a scope-local qubit is already a circuit qubit.
+    // The identity frame: at the top level a scope-local qubit is already a circuit qubit, and the
+    // output frame and the global frame coincide.
     let identity: Vec<usize> = (0..dag.num_qubits()).collect();
     write_scope(
         py,
         dag,
         &mut out,
+        &identity,
         &identity,
         &mut collectors,
         &mut next_param,
@@ -135,12 +139,17 @@ pub fn py_lower(
     Ok((PyCircuitData { inner: template }, graph, parameters))
 }
 
-/// Emit one scope's worth of template content. `frame` maps scope-local qubits to circuit qubits.
+/// Emit one scope's worth of template content.
+///
+/// `frame` maps scope-local qubits to indices in `out`, which is the enclosing box's body when this
+/// scope is nested; `global` maps them to circuit qubits, which is the frame a [`CollectorParams`] is
+/// always reported in. At the top level the two coincide.
 fn write_scope(
     py: Python,
     src: &DAGCircuit,
     out: &mut CircuitData,
     frame: &[usize],
+    global: &[usize],
     collectors: &mut Vec<CollectorParams>,
     next_param: &mut usize,
 ) -> PyResult<()> {
@@ -151,17 +160,14 @@ fn write_scope(
 
         // A collector becomes the parametric fragment its angles drive.
         if let Some(spec) = collect_annotation(py, inst) {
-            let qubits: Vec<usize> = src
-                .qargs_interner()
-                .get(inst.qubits)
-                .iter()
-                .map(|q| frame[q.index()])
-                .collect();
+            let locals = src.qargs_interner().get(inst.qubits);
+            let written: Vec<usize> = locals.iter().map(|q| frame[q.index()]).collect();
+            let qubits: Vec<usize> = locals.iter().map(|q| global[q.index()]).collect();
             let count = qubits.len() * PARAMS_PER_QUBIT;
             let param_indices: Vec<usize> = (*next_param..*next_param + count).collect();
             *next_param += count;
 
-            write_synth_template(out, spec.synthesizer(), &qubits, &param_indices)?;
+            write_synth_template(out, spec.synthesizer(), &written, &param_indices)?;
             collectors.push(CollectorParams {
                 qubits,
                 synthesizer: spec.synthesizer(),
@@ -175,16 +181,45 @@ fn write_scope(
             continue;
         }
 
-        // A hard box was a grouping, so flatten it — recursing so nested collectors are lowered
-        // too.
+        // A content box is kept, not flattened: its annotations and duration are the point of it, and
+        // after absorption its body holds exactly what could not be absorbed — so the box marks the
+        // hard content rather than merely having contained it. Recursing writes its body in the box's
+        // own frame, nested collectors included.
         if let Some(body) = plain_box_body(src, inst)? {
-            let inner: Vec<usize> = src
-                .qargs_interner()
-                .get(inst.qubits)
+            let locals = src.qargs_interner().get(inst.qubits);
+            let width = locals.len();
+            let cargs = src.cargs_interner().get(inst.clbits).to_vec();
+            let inner_global: Vec<usize> = locals.iter().map(|q| global[q.index()]).collect();
+            let inner_frame: Vec<usize> = (0..width).collect();
+            let mut inner_out = CircuitData::with_capacity(
+                width as u32,
+                cargs.len() as u32,
+                body.num_ops(),
+                Param::Float(0.0),
+            )
+            .into_py_result()?;
+            write_scope(
+                py,
+                body,
+                &mut inner_out,
+                &inner_frame,
+                &inner_global,
+                collectors,
+                next_param,
+            )?;
+            // The op carries the box's annotations, duration and widths; only its body is rebuilt.
+            let qargs: Vec<Qubit> = locals
                 .iter()
-                .map(|q| frame[q.index()])
+                .map(|q| Qubit(frame[q.index()] as u32))
                 .collect();
-            write_scope(py, body, out, &inner, collectors, next_param)?;
+            let block = out.add_block(inner_out);
+            out.push_packed_operation(
+                inst.op.clone(),
+                Some(qiskit_circuit::instruction::Parameters::Blocks(vec![block])),
+                &qargs,
+                &cargs,
+            )
+            .into_py_result()?;
             continue;
         }
 

@@ -155,6 +155,188 @@ pub(super) fn next_on_wire(
     matches!(dag.dag()[next], NodeType::Operation(_)).then_some(next)
 }
 
+/// The address of one instruction in a nested circuit: the box nodes descended through, outermost
+/// first, then the node itself within that innermost scope.
+///
+/// A bare `NodeIndex` only identifies a node once you already know which `DAGCircuit` it belongs to,
+/// which a walk that crosses box boundaries no longer does.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(super) struct Site {
+    pub scope: Vec<NodeIndex>,
+    pub node: NodeIndex,
+}
+
+/// A per-wire walk position that can descend into a box body and climb back out.
+///
+/// One wire, one cursor: a walk over several wires advances each independently, so a wire blocked
+/// inside a box stops on its own while another goes on descending. A cursor climbs back out only of
+/// boxes it descended into — it never ascends above the scope it started in, which is what keeps a
+/// collector inside a box from reaching content outside it.
+#[derive(Clone, Debug)]
+pub(super) struct WireCursor {
+    /// The scope the walk started in. Never climbed out of, which is the whole of "descends, never
+    /// ascends".
+    base: Vec<NodeIndex>,
+    /// The boxes descended through since the start, each with this wire's index in the scope
+    /// *containing* that box.
+    descent: Vec<(NodeIndex, Qubit)>,
+    /// The node the cursor sits on, in the scope its path names. A wire's boundary node while
+    /// mid-descent, which is why this is only ever used as a starting point for the next step.
+    node: NodeIndex,
+    /// This wire's index in that same scope.
+    qubit: Qubit,
+}
+
+impl WireCursor {
+    /// A cursor sitting on `node`, walking along `qubit`, both in the scope `base` names.
+    pub(super) fn new(base: Vec<NodeIndex>, node: NodeIndex, qubit: Qubit) -> Self {
+        WireCursor {
+            base,
+            descent: Vec::new(),
+            node,
+            qubit,
+        }
+    }
+
+    /// Where the cursor is now.
+    pub(super) fn site(&self) -> Site {
+        Site {
+            scope: self.path(),
+            node: self.node,
+        }
+    }
+
+    /// The scope the cursor is currently in.
+    fn path(&self) -> Vec<NodeIndex> {
+        let mut path = self.base.clone();
+        path.extend(self.descent.iter().map(|(node, _)| *node));
+        path
+    }
+
+    /// Advance one operation along this wire, descending into any box `descend` accepts and climbing
+    /// back out at the end of a body.
+    ///
+    /// Returns the site reached, or `None` once the wire has run out in the scope the walk started
+    /// in. A box the cursor descends into and finds nothing on this wire is passed straight through:
+    /// there is nothing there to reorder against, so it is not a barrier.
+    pub(super) fn advance(
+        &mut self,
+        root: &DAGCircuit,
+        direction: Direction,
+        descend: &dyn Fn(&PackedInstruction) -> bool,
+    ) -> PyResult<Option<Site>> {
+        loop {
+            let dag = scope_dag(root, &self.path())?;
+            match next_on_wire(dag, self.node, self.qubit, direction) {
+                Some(next) => {
+                    let inst = dag.dag()[next].unwrap_operation();
+                    if !descend(inst) {
+                        self.node = next;
+                        return Ok(Some(self.site()));
+                    }
+                    let body = block_body(dag, inst)?.ok_or_else(|| {
+                        PyValueError::new_err("cannot descend into a box with no body")
+                    })?;
+                    // The walk only offers nodes adjacent along this wire, so a box reached this way
+                    // covers it.
+                    let local = dag
+                        .qargs_interner()
+                        .get(inst.qubits)
+                        .iter()
+                        .position(|q| *q == self.qubit)
+                        .map(|index| Qubit(index as u32))
+                        .expect("a box reached along a wire covers that wire");
+                    // Enter at the far end of the body from the direction of travel, so the first
+                    // step inside lands on the operation nearest the boundary just crossed.
+                    let boundary = match direction {
+                        Direction::Right => body.qubit_io_map()[local.index()][0],
+                        Direction::Left => body.qubit_io_map()[local.index()][1],
+                    };
+                    self.descent.push((next, self.qubit));
+                    self.node = boundary;
+                    self.qubit = local;
+                }
+                // End of the wire in this scope: climb out of the box it was inside, or stop.
+                None => match self.descent.pop() {
+                    Some((box_node, outer)) => {
+                        self.node = box_node;
+                        self.qubit = outer;
+                    }
+                    None => return Ok(None),
+                },
+            }
+        }
+    }
+}
+
+/// The DAG of the scope a path names.
+pub(super) fn scope_dag<'a>(root: &'a DAGCircuit, scope: &[NodeIndex]) -> PyResult<&'a DAGCircuit> {
+    let mut dag = root;
+    for node in scope {
+        let inst = dag.dag()[*node].unwrap_operation();
+        dag = block_body(dag, inst)?
+            .ok_or_else(|| PyValueError::new_err("a scope on the path has no body"))?;
+    }
+    Ok(dag)
+}
+
+/// The DAG of the scope a path names, for writing.
+pub(super) fn scope_dag_mut<'a>(
+    root: &'a mut DAGCircuit,
+    scope: &[NodeIndex],
+) -> PyResult<&'a mut DAGCircuit> {
+    let mut dag = root;
+    for node in scope {
+        let block = match dag.dag()[*node].unwrap_operation().blocks_view() {
+            [block] => *block,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "a scope on the path should have exactly one body",
+                ));
+            }
+        };
+        dag = dag.view_block_mut(block);
+    }
+    Ok(dag)
+}
+
+/// The instruction a site names.
+pub(super) fn site_instruction<'a>(
+    root: &'a DAGCircuit,
+    site: &Site,
+) -> PyResult<&'a PackedInstruction> {
+    Ok(scope_dag(root, &site.scope)?.dag()[site.node].unwrap_operation())
+}
+
+/// Map wires from the scope `path` names up into the scope the path starts in.
+///
+/// Absorbed content keeps its position in the collector's frame, so content taken out of a nested
+/// body has to be lifted through every box between.
+pub(super) fn lift_wires(
+    root: &DAGCircuit,
+    path: &[NodeIndex],
+    wires: &[Qubit],
+) -> PyResult<Vec<Qubit>> {
+    // Each box's qargs, in the frame of the scope containing it.
+    let mut frames: Vec<Vec<Qubit>> = Vec::with_capacity(path.len());
+    let mut dag = root;
+    for node in path {
+        let inst = dag.dag()[*node].unwrap_operation();
+        frames.push(dag.qargs_interner().get(inst.qubits).to_vec());
+        dag = block_body(dag, inst)?
+            .ok_or_else(|| PyValueError::new_err("a scope on the path has no body"))?;
+    }
+    let mut lifted = wires.to_vec();
+    for frame in frames.iter().rev() {
+        for wire in &mut lifted {
+            *wire = *frame.get(wire.index()).ok_or_else(|| {
+                PyValueError::new_err("absorbed content sits on a wire outside its box")
+            })?;
+        }
+    }
+    Ok(lifted)
+}
+
 /// Append an operation to the back of a DAG under construction.
 pub(super) fn append(
     out: &mut DAGCircuitBuilder,

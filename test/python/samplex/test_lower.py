@@ -31,7 +31,7 @@ from qiskit._accelerate.samplex import (
 )
 
 from test import QiskitTestCase
-from test.python.samplex.test_build import gate_names
+from test.python.samplex.test_build import all_gate_names, gate_names
 
 
 def emission_circuit(circuit):
@@ -61,18 +61,29 @@ def notebook_circuit():
 class TestTemplateShape(QiskitTestCase):
     """What ends up in the template."""
 
-    def test_emissions_and_boxes_are_gone(self):
-        out, _ = template(emission_circuit(notebook_circuit()))
-        names = set(gate_names(out))
-        self.assertNotIn("box", names)
-        self.assertFalse({n for n in names if n.startswith("samplex")})
+    def test_emissions_are_gone_but_content_boxes_remain(self):
+        """Collect boxes become fragments and emissions disappear; a content box is kept.
 
-    def test_hard_content_survives_flattened(self):
+        It is the one box worth keeping: after absorption its body holds exactly what could not be
+        absorbed, so it marks the hard content, and it carries the annotations and duration that were on
+        the user's box and are meant for whoever consumes the template.
+        """
+        out, _ = template(emission_circuit(notebook_circuit()))
+        names = set(all_gate_names(out))
+        self.assertIn("box", names)
+        self.assertFalse({n for n in names if n.startswith("samplex") or n.startswith("emit")})
+        # Every remaining box is a content box: no fragment is wrapped in one.
+        for inst in out.data:
+            if inst.operation.name == "box":
+                self.assertFalse(getattr(inst.operation, "annotations", None))
+
+    def test_hard_content_survives_inside_its_box(self):
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl()]):
             circuit.cx(0, 1)
         out, _ = template(emission_circuit(circuit))
-        self.assertEqual(gate_names(out).count("cx"), 1)
+        self.assertEqual(gate_names(out).count("cx"), 0)
+        self.assertEqual(all_gate_names(out).count("cx"), 1)
 
     def test_absorbed_gates_are_discarded(self):
         # The absorbed `h` folds into the collector's synthesized angles, so it must not also be
@@ -82,15 +93,17 @@ class TestTemplateShape(QiskitTestCase):
             circuit.h(0)
             circuit.cx(0, 1)
         out, _ = template(emission_circuit(circuit))
-        self.assertNotIn("h", gate_names(out))
-        self.assertIn("cx", gate_names(out))
+        self.assertNotIn("h", all_gate_names(out))
+        self.assertIn("cx", all_gate_names(out))
 
     def test_rzsx_fragment(self):
         circuit = QuantumCircuit(1)
         with circuit.box([Twirl(decomposition="rzsx")]):
             circuit.noop(0)
         out, collectors = template(emission_circuit(circuit))
-        self.assertEqual(gate_names(out), ["rz", "sx", "rz", "sx", "rz"] * 2)
+        fragment = ["rz", "sx", "rz", "sx", "rz"]
+        # The empty content box sits between the two fragments: nothing here was hard.
+        self.assertEqual(gate_names(out), fragment + ["box"] + fragment)
         self.assertEqual([len(c[2]) for c in collectors], [3, 3])
 
     def test_rzrx_fragment(self):
@@ -98,7 +111,7 @@ class TestTemplateShape(QiskitTestCase):
         with circuit.box([Twirl(decomposition="rzrx")]):
             circuit.noop(0)
         out, _ = template(emission_circuit(circuit))
-        self.assertEqual(gate_names(out), ["rz", "rx", "rz"] * 2)
+        self.assertEqual(gate_names(out), ["rz", "rx", "rz", "box", "rz", "rx", "rz"])
 
     def test_fragment_is_written_on_every_collector_qubit(self):
         circuit = QuantumCircuit(3)
@@ -190,5 +203,7 @@ class TestNesting(QiskitTestCase):
         out, collectors = template(emission_circuit(circuit))
         # two collectors for the outer box, two for the inner
         self.assertEqual(len(collectors), 4)
+        # The inner box's fragments are written inside the outer content box, and their parameters are
+        # still the template's: a block's symbols are tracked by the circuit that holds it.
         self.assertEqual(out.num_parameters, 4 * 2 * 3)
-        self.assertNotIn("box", gate_names(out))
+        self.assertEqual(all_gate_names(out).count("box"), 2)
