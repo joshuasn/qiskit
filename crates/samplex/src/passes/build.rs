@@ -161,8 +161,6 @@ impl Scope<'_> {
 struct Build {
     table: DistributionTable,
     draw_counts: HashMap<DistKey, u32>,
-    /// The next unused box id. Counts *emitting* boxes only, in the order they are lowered.
-    next_box_id: u32,
 }
 
 /// Build the emission circuit for an annotated circuit.
@@ -187,7 +185,6 @@ pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, Distribution
     let mut build = Build {
         table: DistributionTable::new(),
         draw_counts: HashMap::new(),
-        next_box_id: 0,
     };
     let scope = Scope {
         qubits: &identity_q,
@@ -202,14 +199,6 @@ pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, Distribution
 }
 
 impl Build {
-    /// Claim an id for one emitting box, naming the pairing between its emissions and its
-    /// collectors.
-    fn alloc_box_id(&mut self) -> u32 {
-        let id = self.next_box_id;
-        self.next_box_id += 1;
-        id
-    }
-
     /// Allocate `count` consecutive draw slots for `dist`, returning the start index.
     fn alloc_draws(&mut self, dist: DistKey, count: u32) -> u32 {
         let next = self.draw_counts.entry(dist).or_insert(0);
@@ -303,11 +292,8 @@ impl Build {
             return write_content_box(out, content, foreign, duration, &out_qargs, &out_cargs);
         }
 
-        // One id for this box, stamped on every emission it produces and on both of its collectors;
-        // the pairing later passes check instead of trusting adjacency.
-        let box_id = self.alloc_box_id();
         let dressing = resolved.dressing.unwrap_or(Dressing::Left);
-        let emissions = self.build_emissions(&resolved, &global, dressing, box_id);
+        let emissions = self.build_emissions(&resolved, &global, dressing);
         let synthesizer = resolved.synthesizer.unwrap_or(DEFAULT_SYNTHESIZER);
         let partition = Partition::from_elements(global.iter().copied());
         let collect_parts: Vec<CollectPart> = (0..partition.len())
@@ -317,12 +303,10 @@ impl Build {
         // Collectors start empty — the absorb_dressing pass populates them by walking the spine.
         let empty_body = new_body(width, body_clbits.len(), 0)?;
         let left = CollectSpec {
-            owned: vec![box_id],
             partition: partition.clone(),
             parts: collect_parts.clone(),
         };
         let right = CollectSpec {
-            owned: vec![box_id],
             partition: partition.clone(),
             parts: collect_parts,
         };
@@ -501,7 +485,6 @@ impl Build {
         resolved: &ResolvedBox,
         qubits: &[usize],
         dressing: Dressing,
-        box_id: u32,
     ) -> Vec<Placed> {
         let partition = Partition::from_elements(qubits.iter().copied());
         let num_parts = partition.len();
@@ -527,7 +510,6 @@ impl Build {
                     .collect();
                 emissions.push(Placed {
                     spec: EmitSpec {
-                        box_id,
                         direction: Some(direction),
                         partition: partition.clone(),
                         parts,
@@ -553,7 +535,6 @@ impl Build {
                 .collect();
             emissions.push(Placed {
                 spec: EmitSpec {
-                    box_id,
                     direction: Some(direction),
                     partition: partition.clone(),
                     parts,
@@ -581,7 +562,6 @@ impl Build {
                 .collect();
             emissions.push(Placed {
                 spec: EmitSpec {
-                    box_id,
                     direction: Some(direction),
                     partition: partition.clone(),
                     parts,

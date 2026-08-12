@@ -629,16 +629,21 @@ class TestVirtualTypePreservation(QiskitTestCase):
 
 
 class TestNestedPropagation(QiskitTestCase):
-    """An enclosing emission is conjugated by the *whole* of its box's content, nested boxes included.
+    """Where a nested box's collectors leave an enclosing emission, under the current rule.
 
-    The asymmetry to keep straight: a box's own emissions split its body — easy gates multiply into the
-    near factor, hard gates propagate the far one — while an *enclosing* emission treats all of it as one
-    unit, because every part of the inner box sits inside the outer twirl point.
+    The asymmetry to keep straight: a box's own emissions split its body — the absorbable run multiplies
+    into the near factor, the rest propagates the far one — while an *enclosing* emission ought to treat
+    all of it as one unit, because every part of the inner box sits inside the outer twirl point.
 
-    This is what ownership buys. Nearest-collector-wins routes the outer far half into the first nested
-    collector it passes, which composes it with no conjugation at all: the outer randomization is applied
-    and immediately undone with none of its content in between. The unitary is unchanged, so only the
-    randomization is lost — which is why it needs asserting directly rather than via a round trip.
+    **That is not what happens yet, and these tests pin what does.** The nearest compatible collector
+    wins, so the enclosing box's far half is taken by the first nested collector it passes and composed
+    there with no conjugation at all: the outer randomization is applied and immediately undone with none
+    of its content in between. The unitary is unchanged, so only the randomization is lost, which is why
+    it has to be asserted on the graph rather than via a round trip.
+
+    The fix belongs in compatibility, not in position or in an id: once an emission carries a type an
+    inner collector can decline, it will propagate past and reach its own. When that lands, these
+    assertions are the ones that should change. See `lower::compatible`.
     """
 
     def circuit(self):
@@ -650,17 +655,17 @@ class TestNestedPropagation(QiskitTestCase):
             circuit.cx(1, 0)  # outer content, after the nested box
         return circuit
 
-    def test_both_far_halves_reach_a_collector(self):
+    def test_only_the_innermost_far_half_travels(self):
         graph = graph_of(self.circuit())
 
-        # One emission per box: each box's near half is a local table read on its own collector, so
-        # only the far halves become nodes.
-        self.assertEqual(len(of_kind(graph, "emit:")), 2)
-        # Two conjugations: the inner content, and the outer box's own gate. Before ownership the outer
-        # far half never travelled, so only one existed.
-        self.assertEqual(len(of_kind(graph, "propagate:")), 2)
+        # The enclosing box's far half was absorbed by the inner box's left collector, so it is a local
+        # table read there rather than a node with a path. Only the inner far half is left travelling.
+        self.assertEqual(len(of_kind(graph, "emit:")), 1)
+        # And it crosses only the inner content, so there is one conjugation rather than two.
+        self.assertEqual(len(of_kind(graph, "propagate:")), 1)
 
-    def test_the_outer_box_right_collector_receives_a_value(self):
+    def test_the_outer_box_right_collector_receives_nothing(self):
+        """The cost of the current rule, stated plainly so a change of rule is visible."""
         graph = graph_of(self.circuit())
         nodes = graph.nodes()
         collectors = [i for i, node in enumerate(nodes) if node[0].startswith("collect:")]
@@ -668,13 +673,11 @@ class TestNestedPropagation(QiskitTestCase):
         outer_right = collectors[-1]
 
         incoming = [(a, b) for a, b, _ in graph.edges() if b == outer_right]
-        self.assertTrue(
+        self.assertFalse(
             incoming,
-            "the outer box's right collector has nothing to synthesize: its far half was consumed "
-            "somewhere else, so the outer twirl randomizes nothing",
+            "the outer box's right collector received a value, which means the enclosing far half "
+            "reached it — the rule has changed and this test should now assert that it does",
         )
-        # What reaches it is a conjugation, not the raw emission — the far half crossed content.
-        self.assertTrue(all(nodes[a][0].startswith("propagate:") for a, _ in incoming))
 
     def test_an_unnested_box_is_unchanged(self):
         """The common case keeps exactly one conjugation per hard gate."""

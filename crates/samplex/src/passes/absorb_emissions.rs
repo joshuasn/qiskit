@@ -286,16 +286,14 @@ fn walk_absorb(
             if spec.direction != Some(facing) {
                 continue;
             }
-            // Facing is not enough. An emission propagating out of an enclosing box sits in the same
-            // scope as the collectors of every box nested inside it, and it faces them — so a sibling
-            // collector would take it and undo that box's randomization with none of its content in
-            // between. What separates the two cases is *how* the collector got here: its own emissions
-            // are ones it had to descend to reach, or ones anchored beside it in its own scope.
+            // Facing and adjacent is the whole test. Nothing checks whose box the emission came from:
+            // an emission propagating out of an enclosing box faces the collectors of every box nested
+            // inside it, and the nearest one takes it. That is deliberate but provisional — it
+            // terminates the enclosing twirl at the inner dressing, with none of the enclosing box's
+            // content in between. The discrimination belongs in *compatibility*, not position: once a
+            // collector can be typed as unable to collect a given emission, it will decline and the
+            // emission will carry on to one that can. See `lower::compatible`.
             let local = dag.qargs_interner().get(inst.qubits).to_vec();
-            let descended = site.scope.len() > collector.scope.len();
-            if !descended && !anchored_in_scope(root, py, &site, &spec, &local)? {
-                continue;
-            }
             let wires = lift_to_collector(root, &collector.scope, &site, &local)?;
             // An emission comes off as a whole layer or not at all: taking it on some wires only
             // would pull content from the far side of it into the body ahead of where it belongs.
@@ -320,8 +318,6 @@ fn walk_absorb(
             break;
         };
         let local_spec = EmitSpec {
-            // Absorption resolves the emission in place; it does not change which box it came from.
-            box_id: spec.box_id,
             direction: None,
             partition: spec.partition.clone(),
             parts: spec.parts.clone(),
@@ -393,54 +389,6 @@ fn on_dressing_side(
     Ok(false)
 }
 
-/// Whether this emission has a collector of its own in the scope it sits in, on the side it starts
-/// from.
-///
-/// Scanning against its own direction is scanning back towards where it was written. A collector
-/// there is the near half of the pair it belongs to — the emission is *anchored*, and the collector
-/// ahead of it in its direction is its own. Reaching the boundary of the scope without finding one
-/// means the emission is passing through: it was written to travel out of here, and the only
-/// collector entitled to it is one outside, which has to descend to reach it.
-///
-/// The scan does not descend (a collector inside a nested box is not in this scope) and does not
-/// ascend (the point is precisely whether this scope holds one).
-fn anchored_in_scope(
-    root: &DAGCircuit,
-    py: Python,
-    site: &Site,
-    spec: &EmitSpec,
-    wires: &[Qubit],
-) -> PyResult<bool> {
-    let Some(direction) = spec.direction else {
-        // Already resolved in place; it is not travelling anywhere.
-        return Ok(false);
-    };
-    let back = match direction {
-        Direction::Right => Direction::Left,
-        Direction::Left => Direction::Right,
-    };
-    let dag = scope_dag(root, &site.scope)?;
-    // Every wire, so a collector covering only part of the emission does not count: it could not
-    // synthesize the whole of what was emitted.
-    for wire in wires {
-        let mut at = site.node;
-        let mut found = false;
-        while let Some(next) = next_on_wire(dag, at, *wire, back) {
-            let inst = dag.dag()[next].unwrap_operation();
-            if collect_annotation(py, inst).is_some() {
-                let covered = dag.qargs_interner().get(inst.qubits);
-                found = wires.iter().all(|w| covered.contains(w));
-                break;
-            }
-            at = next;
-        }
-        if !found {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 /// Lift wires from the scope a site lives in up into the frame of the collector absorbing it.
 fn lift_to_collector(
     root: &DAGCircuit,
@@ -497,8 +445,7 @@ fn collect_op(root: &DAGCircuit, plan: &Absorption, py: Python) -> PyResult<Pack
     let scope = scope_dag(root, &plan.collector.scope)?;
     let inst = scope.dag()[plan.collector.node].unwrap_operation();
     let spec = CollectSpec {
-        // Absorption does not change which boxes a collector answers for — only what it composes.
-        owned: plan.spec.owned.clone(),
+        // Absorption changes only what a collector composes, not what it is.
         partition: plan.spec.partition.clone(),
         parts: plan.spec.parts.clone(),
     };

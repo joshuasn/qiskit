@@ -332,10 +332,15 @@ class TestPreservation(QiskitTestCase):
         self.assertEqual(shape(once), shape(twice))
 
 
-class TestOwnership(QiskitTestCase):
-    """A merged collector answers for every box that contributed to it."""
+class TestSharedMiddleIsWideEnough(QiskitTestCase):
+    """A merged collector has to be able to take either box's emissions.
 
-    def test_a_shared_middle_collector_owns_both_boxes(self):
+    Nothing records which boxes contributed to it — a collector is what it covers and what it can
+    synthesize — so what a merge has to preserve is that the shared middle is wide enough and
+    compatible enough for both. Anything narrower would leave one of them unable to be collected.
+    """
+
+    def test_a_shared_middle_collector_covers_both_boxes(self):
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl()]):
             circuit.cx(0, 1)
@@ -343,15 +348,16 @@ class TestOwnership(QiskitTestCase):
             circuit.cx(0, 1)
         out, _ = merged(circuit)
 
-        owners = [list(annotation.owned) for annotation, _, _ in collectors(out)]
-        # Three collectors for two boxes: the middle one is shared, so it may take either box's
-        # emissions. Anything narrower would leave one of them unable to be collected.
-        self.assertEqual(len(owners), 3)
-        self.assertEqual([len(o) for o in owners], [1, 2, 1])
-        self.assertEqual(owners[1], sorted(set(owners[0] + owners[2])))
+        colls = collectors(out)
+        # Three collectors for two boxes: the middle one is shared.
+        self.assertEqual(len(colls), 3)
+        qubits = [tuple(q) for _, _, q in colls]
+        self.assertEqual(qubits, [(0, 1), (0, 1), (0, 1)])
+        # And it synthesizes the same way, or it could not stand in for either.
+        self.assertEqual({a.synthesizer for a, _, _ in colls}, {"rzsx"})
 
-    def test_merging_order_does_not_change_the_owned_set(self):
-        """Sorted and deduplicated, so two runs produce identical IR2."""
+    def test_merging_order_does_not_change_the_result(self):
+        """Two runs produce identical IR2, so nothing depends on the order the walk visited members."""
         circuit = QuantumCircuit(4)
         with circuit.box([Twirl()]):
             circuit.cx(0, 1)
@@ -359,8 +365,9 @@ class TestOwnership(QiskitTestCase):
             circuit.cx(1, 2)
         with circuit.box([Twirl()]):
             circuit.cx(2, 3)
-        runs = [[tuple(a.owned) for a, _, _ in collectors(merged(circuit)[0])] for _ in range(3)]
+        runs = [
+            [(a.synthesizer, tuple(q)) for a, _, q in collectors(merged(circuit)[0])]
+            for _ in range(3)
+        ]
         self.assertEqual(runs[0], runs[1])
         self.assertEqual(runs[0], runs[2])
-        for owned in runs[0]:
-            self.assertEqual(list(owned), sorted(set(owned)))

@@ -334,8 +334,6 @@ struct CollectorInfo {
     qubits: Vec<usize>,
     synthesizer: SynthesizerType,
     param_indices: Vec<usize>,
-    /// The annotated boxes whose emissions this collector consumes.
-    owned: Vec<u32>,
     /// Everything this collector composes, in the order `flatten` read it out of the body.
     steps: Vec<CollectStep>,
 }
@@ -456,17 +454,19 @@ pub fn build_sampling_graph(
              collector's body",
         );
         // Unreachable in well-formed IR2: build writes both of a box's collectors, so an emission
-        // always has an owner ahead of it. Reaching this means the pairing was broken between the
-        // two passes, which would otherwise show up as a randomization that is never undone — so it
-        // is reported rather than skipped.
-        let target = scan_for_owning_collector(&events, position, direction, spec.box_id, &infos)
+        // always has a compatible collector ahead of it. Reaching this means either the pairing was
+        // broken between the two passes or a hand-built circuit has an emission nothing can collect,
+        // which would otherwise show up as a randomization that is never undone — so it is reported
+        // rather than skipped.
+        let target = scan_for_collector(&events, position, direction, spec, &infos, table)
             .ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "emission from box {} travelling {:?} has no owning collector ahead of it; its \
-                     randomization could not be undone",
-                spec.box_id, direction,
-            ))
-        })?;
+                PyValueError::new_err(format!(
+                    "emission on qubits {:?} travelling {:?} has no compatible collector ahead of \
+                     it; its randomization could not be undone",
+                    spec.qubits(),
+                    direction,
+                ))
+            })?;
         walk_emission(
             &mut vfg,
             &events,
@@ -483,15 +483,19 @@ pub fn build_sampling_graph(
     Ok((vfg, parameters))
 }
 
-/// Scan from `start` in `direction` for the collector that *owns* this emission's box.
+/// Scan from `start` in `direction` for the first collector that can take this emission.
 ///
-/// Ownership, not proximity. Position only decides which of an owner's collectors.
-fn scan_for_owning_collector(
+/// Proximity decides, filtered by [`compatible`]. A collector that declines is simply crossed — its
+/// absorbed gates conjugate the emission on the way past — so an emission travels until it finds one
+/// that can take it, out of the box it started in and on through whatever it passes. Reaching the end
+/// of the circuit is the error case.
+fn scan_for_collector(
     events: &[Event],
     start: usize,
     direction: Direction,
-    box_id: u32,
+    spec: &EmitSpec,
     infos: &[CollectorInfo],
+    table: &DistributionTable,
 ) -> Option<usize> {
     let range: Box<dyn Iterator<Item = usize>> = match direction {
         Direction::Right => Box::new((start + 1)..events.len()),
@@ -499,12 +503,40 @@ fn scan_for_owning_collector(
     };
     for i in range {
         if let Event::Collector(index) = &events[i]
-            && infos[*index].owned.contains(&box_id)
+            && compatible(&infos[*index], spec, table)
         {
             return Some(*index);
         }
     }
     None
+}
+
+/// Whether this collector can take this emission.
+///
+/// **This is the seam where "whose emission is this" is decided, and it is deliberately incomplete.**
+/// Two conditions are in place:
+///
+/// - It covers every qubit the emission acts on. A collector that covers only part of an emission
+///   could not synthesize the whole of what was emitted.
+/// - Its synthesizer accepts the emission's virtual type, so the value it would have to produce is one
+///   it can express.
+///
+/// Nothing here asks which annotated box the emission came from — position and these two conditions
+/// are all of it. So a collector nested inside an enclosing box will take that box's propagating
+/// emission if it happens to be the first one the walk reaches, terminating the enclosing
+/// randomization at the inner dressing with none of the enclosing content in between. That is
+/// invisible to a round-trip test, since the circuit still evaluates to the same unitary.
+///
+/// **TO DO: make this a type question.** The intended shape is that an emission carries a type a
+/// collector either accepts or declines — a basis change becoming a distinct type rather than a Pauli
+/// that looks like any other, an inner twirl marked as unable to collect it — so that a collector that
+/// should not have it declines, the emission propagates on, and it reaches its own collector by
+/// walking rather than by consulting an id. Until then a nested twirl of the same group is collected
+/// early, and `test_sampling_graph.py::TestNestedPropagation` pins that provisional behaviour so the
+/// change of rule shows up as a test change rather than silently.
+fn compatible(info: &CollectorInfo, spec: &EmitSpec, table: &DistributionTable) -> bool {
+    spec.qubits().iter().all(|q| info.qubits.contains(q))
+        && info.synthesizer.accepts(spec.virtual_type(table))
 }
 
 /// Read one absorbed gate parameter, interning it only if it is genuinely symbolic.
@@ -594,7 +626,6 @@ fn flatten(
                 qubits,
                 synthesizer: spec.synthesizer(),
                 param_indices: Vec::new(),
-                owned: spec.owned.clone(),
                 steps,
             });
             continue;

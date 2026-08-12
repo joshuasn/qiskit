@@ -55,9 +55,6 @@ pub struct EmitPart {
 /// The payload of an [`Emit`] instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmitSpec {
-    /// Which annotated box this emission came from. Only that box's collectors may consume it; see
-    /// [`CollectSpec::owned`].
-    pub box_id: u32,
     /// Which way the emitted virtual state flows, or `None` if it has already resolved in place —
     /// owned directly by the collector body it sits in, rather than propagating towards one.
     pub direction: Option<Direction>,
@@ -196,12 +193,6 @@ impl Emit {
         self.inner.dist().0
     }
 
-    /// The annotated box this emission came from; only that box's collectors may consume it.
-    #[getter]
-    fn box_id(&self) -> u32 {
-        self.inner.box_id
-    }
-
     #[getter]
     fn direction(&self) -> &'static str {
         match self.inner.direction {
@@ -304,10 +295,6 @@ pub struct CollectPart {
 /// The payload of a [`Collect`] annotation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectSpec {
-    /// The annotated boxes whose emissions this collector may consume, ascending.
-    ///
-    /// Build gives each of a box's two collectors that box's own id; merging unions them.
-    pub owned: Vec<u32>, //todo remove
     /// Subsystem grouping over the collector's qubits, in the *global* circuit frame.
     pub partition: Partition,
     /// Per-part descriptors, parallel with `partition.iter()`.
@@ -324,20 +311,6 @@ impl CollectSpec {
     /// Whether the given virtual type is accepted by all parts of this collector.
     pub fn accepts(&self, vt: VirtualType) -> bool {
         self.parts.iter().all(|part| part.synthesizer.accepts(vt))
-    }
-
-    /// Whether this collector may consume emissions from the box with this id.
-    pub fn owns(&self, box_id: u32) -> bool {
-        self.owned.contains(&box_id)
-    }
-
-    /// Take on another collector's ownership, keeping the set sorted and duplicate-free.
-    ///
-    /// Sorted so the result does not depend on the order the merge visited its members in.
-    pub fn absorb_ownership(&mut self, other: &[u32]) {
-        self.owned.extend_from_slice(other);
-        self.owned.sort_unstable();
-        self.owned.dedup();
     }
 }
 
@@ -357,7 +330,7 @@ impl Collect {
 
 #[pymethods]
 impl Collect {
-    /// Construct a `Collect` annotation, owning nothing and covering no qubits.
+    /// Construct a `Collect` annotation covering no qubits.
     ///
     /// Build writes an empty body too; `absorb_dressing` is what fills one in.
     #[new]
@@ -367,7 +340,6 @@ impl Collect {
         Ok(
             PyClassInitializer::from(PyAnnotation).add_subclass(Collect {
                 inner: CollectSpec {
-                    owned: Vec::new(),
                     partition: Partition::new(),
                     parts: vec![CollectPart { synthesizer: synth }],
                 },
@@ -386,12 +358,6 @@ impl Collect {
             SynthesizerType::RzSx => "rzsx",
             SynthesizerType::RzRx => "rzrx",
         }
-    }
-
-    /// The annotated boxes whose emissions this collector may consume, ascending.
-    #[getter]
-    fn owned(&self) -> Vec<u32> {
-        self.inner.owned.clone()
     }
 
     fn __repr__(&self) -> String {

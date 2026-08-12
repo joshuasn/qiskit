@@ -52,9 +52,6 @@ struct Group {
     /// Per-part descriptors accumulated from merged contributions.
     partition: Partition,
     parts: Vec<CollectPart>,
-    /// Every annotated box whose emissions the contracted collector may consume: the union over the
-    /// members.
-    owned: Vec<u32>,
 }
 
 impl Group {
@@ -110,7 +107,6 @@ fn merge_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
                         span: qubits.iter().copied().collect(),
                         partition: spec.partition.clone(),
                         parts: spec.parts.clone(),
-                        owned: spec.owned.clone(),
                     });
                 }
             }
@@ -170,10 +166,6 @@ fn find_mergeable(
 fn join(group: &mut Group, node: NodeIndex, spec: &CollectSpec, qubits: &[Qubit]) {
     group.members.push(node);
     group.span.extend(qubits.iter().copied());
-    // Sorted and deduplicated, so the set does not depend on the order members were visited in.
-    group.owned.extend_from_slice(&spec.owned);
-    group.owned.sort_unstable();
-    group.owned.dedup();
     group.partition = Partition::union(&[&group.partition, &spec.partition])
         .unwrap_or_else(|_| spec.partition.clone());
     // `find_mergeable` has established that every part shares a synthesizer, so replicate uniformly
@@ -309,7 +301,6 @@ fn merged_op(
     num_clbits: usize,
 ) -> PyResult<PackedOperation> {
     let spec = CollectSpec {
-        owned: group.owned.clone(),
         partition: group.partition.clone(),
         parts: group.parts.clone(),
     };
