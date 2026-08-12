@@ -719,7 +719,6 @@ mod tests {
                 partition: Partition::singletons(1),
                 parts: vec![EmitPart {
                     dist: DistKey(0),
-                    virtual_type: VirtualType::Pauli,
                     draw: 0,
                     adjoint: false,
                 }],

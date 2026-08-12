@@ -253,7 +253,6 @@ fn walk_absorb(
         let local_spec = EmitSpec {
             // Absorption resolves the emission in place; it does not change which box it came from.
             box_id: spec.box_id,
-            source: spec.source,
             direction: None,
             partition: spec.partition.clone(),
             parts: spec.parts.clone(),

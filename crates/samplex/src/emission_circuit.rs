@@ -31,40 +31,20 @@ use qiskit_circuit::operations::{CustomOperation, Operation, Param};
 use smallvec::SmallVec;
 
 use crate::annotated_circuit::{SynthesizerType, parse_decomposition};
-use crate::distributions::DistKey;
+use crate::distributions::{DistEntry, DistKey, DistributionTable};
 use crate::partition::Partition;
 use crate::virtual_flow_graph::Direction;
 use crate::virtual_type::VirtualType;
 
-/// Which kind of annotation an [`Emit`] stands in for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EmitSource {
-    /// One half of a twirl's inverse pair.
-    Twirl,
-    /// Noise drawn from a referenced Pauli-Lindblad map.
-    InjectNoise,
-    /// A deterministic frame change (`ChangeBasis` or `InjectLocalClifford`).
-    ChangeBasis,
-}
-
-impl EmitSource {
-    /// The instruction name reported to Qiskit for this kind of emission.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Twirl => "samplex_emit_twirl",
-            Self::InjectNoise => "samplex_emit_noise",
-            Self::ChangeBasis => "samplex_emit_basis",
-        }
-    }
-}
+/// The instruction name reported to Qiskit for every emission, regardless of kind. Which kind an
+/// emission is comes from the [`DistEntry`] its `dist` key points at; see [`Emit::source`].
+pub const EMIT_NAME: &str = "emit";
 
 /// Per-part descriptor for an emission, parallel with its partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmitPart {
     /// The distribution this part draws from.
     pub dist: DistKey,
-    /// The algebraic type of the emitted virtual gates on this part.
-    pub virtual_type: VirtualType, //todo remove
     /// Index into this part's `dist` key's sample array.
     pub draw: u32,
     /// Whether to take the adjoint of the sampled value before composing or propagating. True for
@@ -77,9 +57,7 @@ pub struct EmitPart {
 pub struct EmitSpec {
     /// Which annotated box this emission came from. Only that box's collectors may consume it; see
     /// [`CollectSpec::owned`].
-    pub box_id: u32, //todo remove
-    /// Which annotation this emission stands in for.
-    pub source: EmitSource, //todo purely visualization, debug info
+    pub box_id: u32,
     /// Which way the emitted virtual state flows, or `None` if it has already resolved in place —
     /// owned directly by the collector body it sits in, rather than propagating towards one.
     pub direction: Option<Direction>,
@@ -96,16 +74,19 @@ impl EmitSpec {
         self.parts[0].dist
     }
 
-    /// The virtual type of the first part. Convenience for the common uniform case where all parts
-    /// share the same virtual type.
-    pub fn virtual_type(&self) -> VirtualType {
-        self.parts[0].virtual_type
+    /// The virtual type of the first part, resolved via `table`. Convenience for the common uniform
+    /// case where all parts share the same virtual type.
+    pub fn virtual_type(&self, table: &DistributionTable) -> VirtualType {
+        table
+            .get(self.dist())
+            .expect("an EmitSpec's dist key always resolves in the table it was built from")
+            .virtual_type()
     }
 }
 
 impl Operation for EmitSpec {
     fn name(&self) -> &str {
-        self.source.name()
+        EMIT_NAME
     }
 
     fn num_qubits(&self) -> u32 {
@@ -173,7 +154,7 @@ impl Emit {
 
     #[getter]
     fn name(&self) -> &'static str {
-        self.inner.source.name()
+        EMIT_NAME
     }
 
     #[getter]
@@ -188,13 +169,17 @@ impl Emit {
 
     // --- payload readouts, for inspection from Python ---
 
-    #[getter]
-    fn source(&self) -> &'static str {
-        match self.inner.source {
-            EmitSource::Twirl => "twirl",
-            EmitSource::InjectNoise => "inject_noise",
-            EmitSource::ChangeBasis => "change_basis",
-        }
+    /// Which kind of annotation this emission stands in for — `"twirl"`, `"inject_noise"`, or
+    /// `"change_basis"` — resolved from `table`'s entry for this emission's distribution key.
+    /// `None` if no table is given, or if the key has no entry in it.
+    #[pyo3(signature = (table=None))]
+    fn source(&self, table: Option<&DistributionTable>) -> Option<&'static str> {
+        let entry = table.and_then(|t| t.get(self.inner.dist()))?;
+        Some(match entry {
+            DistEntry::Distribution(_) => "twirl",
+            DistEntry::Basis { .. } => "change_basis",
+            DistEntry::Noise { .. } => "inject_noise",
+        })
     }
 
     #[getter]
@@ -217,9 +202,8 @@ impl Emit {
         }
     }
 
-    #[getter]
-    fn virtual_type(&self) -> &'static str {
-        match self.inner.virtual_type() {
+    fn virtual_type(&self, table: &DistributionTable) -> &'static str {
+        match self.inner.virtual_type(table) {
             VirtualType::Pauli => "pauli",
             VirtualType::C1 => "c1",
             VirtualType::U2 => "u2",
@@ -261,8 +245,7 @@ impl Emit {
             ""
         };
         format!(
-            "Emit({}, dist={}, {}, {}, draws={:?}{})",
-            self.source(),
+            "Emit(dist=#{}, {}, {}, draws={:?}{})",
             self.inner.dist().0,
             self.direction(),
             self.inner.partition,

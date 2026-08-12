@@ -68,7 +68,7 @@ def emissions(circuit):
     out = []
     for inst in circuit.data:
         op = inst.operation
-        if op.name.startswith("samplex_emit"):
+        if op.name.startswith("emit"):
             out.append(op)
         for block in getattr(op, "blocks", None) or []:
             out.extend(emissions(block))
@@ -97,7 +97,7 @@ def emissions_with_qubits(circuit, frame=None):
 
 def emissions_in_scope(circuit):
     """The Emit operations of one scope, in order, without recursing."""
-    return [inst.operation for inst in circuit.data if inst.operation.name.startswith("samplex_emit")]
+    return [inst.operation for inst in circuit.data if inst.operation.name.startswith("emit")]
 
 
 def hard_boxes(circuit):
@@ -121,7 +121,7 @@ def real_gates(body):
     hard body holds the propagating emission written at the edge it starts from. Neither executes, so
     neither is a gate.
     """
-    return [inst.operation.name for inst in body.data if not inst.operation.name.startswith("samplex_emit")]
+    return [inst.operation.name for inst in body.data if not inst.operation.name.startswith("emit")]
 
 
 def body_locals(body):
@@ -129,7 +129,7 @@ def body_locals(body):
     return [
         inst.operation
         for inst in body.data
-        if inst.operation.name.startswith("samplex_emit") and inst.operation.direction == "local"
+        if inst.operation.name.startswith("emit") and inst.operation.direction == "local"
     ]
 
 
@@ -176,8 +176,8 @@ class TestBuildShape(QiskitTestCase):
         lowered, table = lower(circuit)
 
         all_emits = list(emissions(lowered))
-        noise = next(e for e in all_emits if e.source == "inject_noise")
-        basis = next(e for e in all_emits if e.source == "change_basis")
+        noise = next(e for e in all_emits if e.source(table) == "inject_noise")
+        basis = next(e for e in all_emits if e.source(table) == "change_basis")
         self.assertEqual(noise.direction, "right")  # site="after"
         self.assertEqual(basis.direction, "left")  # placement="start"
 
@@ -190,12 +190,12 @@ class TestBuildShape(QiskitTestCase):
         basis_pos = next(
             i
             for i, inst in enumerate(lowered.data)
-            if inst.operation.name.startswith("samplex_emit") and inst.operation.source == "change_basis"
+            if inst.operation.name.startswith("emit") and inst.operation.source(table) == "change_basis"
         )
         noise_pos = next(
             i
             for i, inst in enumerate(lowered.data)
-            if inst.operation.name.startswith("samplex_emit") and inst.operation.source == "inject_noise"
+            if inst.operation.name.startswith("emit") and inst.operation.source(table) == "inject_noise"
         )
         self.assertLess(basis_pos, hard_pos)  # basis on left edge
         self.assertGreater(noise_pos, hard_pos)  # noise on right edge
@@ -220,7 +220,7 @@ class TestBuildShape(QiskitTestCase):
                         circuit = QuantumCircuit(2)
                         with circuit.box([Twirl(dressing=dressing), annotation]):
                             circuit.cx(0, 1)
-                        lowered, _ = lower(circuit)
+                        lowered, table = lower(circuit)
 
                         names = gate_names(lowered)
                         # the hard box is the middle `box`; the collectors bracket everything
@@ -234,8 +234,7 @@ class TestBuildShape(QiskitTestCase):
                         at = next(
                             i
                             for i, inst in enumerate(lowered.data)
-                            if inst.operation.name.startswith("samplex_emit")
-                            and inst.operation.source == kind
+                            if inst.operation.name.startswith("emit") and inst.operation.source(table) == kind
                         )
                         self.assertEqual(
                             at < box_at,
@@ -261,7 +260,7 @@ class TestBuildShape(QiskitTestCase):
         ):
             circuit.h(0)
             circuit.cx(0, 1)
-        lowered, _ = lower(circuit)
+        lowered, table = lower(circuit)
 
         # The right-edge emissions sit after the hard box in innermost-first order.
         right_emits = []
@@ -270,8 +269,8 @@ class TestBuildShape(QiskitTestCase):
             if inst.operation.name == "box" and not getattr(inst.operation, "annotations", None):
                 past_hard = True
                 continue
-            if past_hard and inst.operation.name.startswith("samplex_emit"):
-                right_emits.append(inst.operation.source)
+            if past_hard and inst.operation.name.startswith("emit"):
+                right_emits.append(inst.operation.source(table))
         # noise then basis change (innermost-first); the far twirl half is on the dressing (left) edge
         self.assertEqual(right_emits, ["inject_noise", "change_basis"])
 
@@ -282,7 +281,7 @@ class TestBuildShape(QiskitTestCase):
             circuit = QuantumCircuit(2)
             with circuit.box([Twirl(), annotation, InjectNoise("n", "after")]):
                 circuit.cx(0, 1)
-            lowered, _ = lower(circuit)
+            lowered, table = lower(circuit)
             # Collect right-edge emission sources in spine order (after hard box)
             right_emits = []
             past_hard = False
@@ -290,8 +289,8 @@ class TestBuildShape(QiskitTestCase):
                 if inst.operation.name == "box" and not getattr(inst.operation, "annotations", None):
                     past_hard = True
                     continue
-                if past_hard and inst.operation.name.startswith("samplex_emit"):
-                    right_emits.append(inst.operation.source)
+                if past_hard and inst.operation.name.startswith("emit"):
+                    right_emits.append(inst.operation.source(table))
             return right_emits
 
         # an injection sits inside the noise's own depth band, so construction order decides between them
@@ -366,9 +365,9 @@ class TestBuildShape(QiskitTestCase):
         lowered, table = lower(circuit)
 
         (emit,) = emissions(lowered)
-        self.assertEqual(emit.source, "change_basis")
+        self.assertEqual(emit.source(table), "change_basis")
         self.assertEqual(emit.direction, "left")
-        self.assertEqual(emit.virtual_type, "c1")
+        self.assertEqual(emit.virtual_type(table), "c1")
         self.assertIn("local_cliffords.c3", table.entries()[0])
 
     def test_tag_only_box_is_transparent(self):
@@ -433,7 +432,7 @@ class TestEasyHardSplit(QiskitTestCase):
                 lowered, _ = lower(circuit)
 
                 names = gate_names(lowered)
-                emit_at = names.index("samplex_emit_twirl")
+                emit_at = names.index("emit")
                 box_at = names.index("box", 1)  # the hard box, after the first collector
                 self.assertEqual(emit_at < box_at, expect_before)
 
@@ -553,7 +552,7 @@ class TestPerQubitAbsorption(QiskitTestCase):
 
         _, body, qubits = collectors(lowered)[0]
         self.assertEqual(qubits, [0, 1, 2])
-        (gate,) = [i for i in body.data if not i.operation.name.startswith("samplex_emit")]
+        (gate,) = [i for i in body.data if not i.operation.name.startswith("emit")]
         self.assertEqual(gate.operation.name, "h")
         self.assertEqual([body.find_bit(b).index for b in gate.qubits], [2])
 
@@ -569,7 +568,7 @@ class TestFidelity(QiskitTestCase):
         lowered, _ = lower_absorbed(circuit)
 
         left, _ = collectors(lowered)
-        (rz,) = [i for i in left[1].data if not i.operation.name.startswith("samplex_emit")]
+        (rz,) = [i for i in left[1].data if not i.operation.name.startswith("emit")]
         self.assertEqual(rz.operation.name, "rz")
         self.assertEqual(rz.operation.params, [theta])
 
@@ -668,9 +667,9 @@ class TestNesting(QiskitTestCase):
         with circuit.box([Twirl()]):
             with circuit.box([ChangeBasis("b1", placement="end")]):
                 circuit.cx(0, 1)
-        lowered, _ = lower(circuit)
+        lowered, table = lower(circuit)
 
-        sources = sorted(e.source for e in emissions(lowered))
+        sources = sorted(e.source(table) for e in emissions(lowered))
         self.assertEqual(sources, ["change_basis", "twirl", "twirl"])
 
     def test_nested_unannotated_box_is_flattened_into_hard_content(self):
@@ -739,7 +738,7 @@ class TestPropagatingEmissionPlacement(QiskitTestCase):
 
         (hard,) = hard_boxes(lowered)
         # Travelling left, so it starts at the hard content's right-hand edge: the back of the body.
-        self.assertEqual(gate_names(hard), ["cx", "samplex_emit_twirl"])
+        self.assertEqual(gate_names(hard), ["cx", "emit"])
         self.assertEqual([op.direction for op in emissions_in_scope(hard)], ["left"])
 
     def test_a_box_with_no_hard_content_keeps_it_on_the_spine(self):
