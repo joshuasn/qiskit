@@ -16,10 +16,16 @@
 //! walks outward from each collector along each of its own wires independently, writing what it
 //! takes over into the collector's body:
 //!
-//! - A single-qubit standard gate → copied in as-is.
+//! - A single-qubit standard gate *from inside its own box* → copied in as-is.
 //! - An emission facing it, adjacent on *every* wire it covers → rewritten to `direction: None` and
 //!   placed in the body.
 //! - Anything else → that wire is done, and only that wire.
+//!
+//! **A dressing folds in only its own box's gates.** A gate in the collector's own scope belongs to
+//! whatever encloses the box, so it stays where it is even when adjacent. That is a statement about
+//! what a dressing *is* rather than a safety rule — an emission always arrives at a collector from its
+//! content side, so a gate on the outward side is never on the path of one targeting it. It costs the
+//! folding of single-qubit gates sitting on the spine beside a box: those stay in the template.
 //!
 //! What the resulting sequence guarantees is per-wire order, not circuit order; see
 //! [`Collect::steps`].
@@ -257,9 +263,11 @@ fn walk_absorb(
                 if !is_absorbable_gate(dag, inst) {
                     break;
                 }
-                // Inside a box, only the dressing side of the twirl point is this collector's to take.
-                if site.scope.len() > collector.scope.len()
-                    && !on_dressing_side(dag, &site, direction, facing)?
+                // A dressing is its own box's. A gate in the collector's own scope belongs to whatever
+                // encloses that box, not to it, so only what the walk descended into is on offer — and
+                // of that, only the dressing side of the twirl point.
+                if site.scope.len() == collector.scope.len()
+                    || !on_dressing_side(dag, &site, direction, facing)?
                 {
                     break;
                 }

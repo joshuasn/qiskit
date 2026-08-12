@@ -272,20 +272,30 @@ class TestAbsorbedAngles(QiskitTestCase):
         self.assertEqual(params.entries(), ["t"])
         self.assertEqual(params.free_parameters, ["t"])
 
-    def test_angles_absorbed_from_the_spine_survive_too(self):
-        # The case with the widest reach: `absorb_dressing` pulls in single-qubit gates from *outside*
-        # the box, so a rotation the user never put in a box still loses its angle if it is not read.
+    def test_angles_on_the_spine_are_left_where_they_are(self):
+        """A dressing folds in only its own box's gates, so a rotation outside a box keeps its angle.
+
+        It stays a real gate in the template, which means its parameter stays the *template's* to bind
+        rather than becoming a `ParameterTable` entry. The distinction matters to a caller: one is bound
+        the ordinary way, the other has to be supplied to the sampler.
+        """
         theta = Parameter("t")
         circuit = QuantumCircuit(2)
         circuit.rz(theta, 0)
         with circuit.box([Twirl()]):
             circuit.cx(0, 1)
         circuit.rz(0.5, 1)
-        _, graph, params = artifacts(circuit)
+        template, graph, params = artifacts(circuit)
 
         absorbed = [step for c in of_kind(graph, "collect:") for step in gates(c)]
-        self.assertEqual(sorted(absorbed), [("rz", [0], ["#0"]), ("rz", [1], ["0.5"])])
-        self.assertEqual(params.free_parameters, ["t"])
+        self.assertEqual(absorbed, [])
+        self.assertEqual(params.free_parameters, [])
+        # Both rotations are still executed, and `t` is still the template's own to bind.
+        executed = QuantumCircuit._from_circuit_data(template)
+        names = [inst.operation.name for inst in executed.data]
+        # The two spine rotations, plus three `rz` per qubit per collector for the rzsx fragments.
+        self.assertEqual(names.count("rz"), 2 + 3 * 2 * 2)
+        self.assertIn("t", [p.name for p in executed.parameters])
 
     def test_a_merged_collector_keeps_both_contributions_angles(self):
         circuit = QuantumCircuit(2)
@@ -303,9 +313,9 @@ class TestAbsorbedAngles(QiskitTestCase):
     def test_one_symbol_on_two_gates_is_one_entry(self):
         theta = Parameter("t")
         circuit = QuantumCircuit(2)
-        circuit.rz(theta, 0)
-        circuit.rz(theta, 1)
         with circuit.box([Twirl()]):
+            circuit.rz(theta, 0)
+            circuit.rz(theta, 1)
             circuit.cx(0, 1)
         _, graph, params = artifacts(circuit)
 
@@ -335,9 +345,9 @@ class TestAbsorbedAngles(QiskitTestCase):
         # elements into one. The caller binds `v[0]` and `v[1]` separately.
         vector = ParameterVector("v", 2)
         circuit = QuantumCircuit(2)
-        circuit.rz(vector[0], 0)
-        circuit.rz(vector[1], 1)
         with circuit.box([Twirl()]):
+            circuit.rz(vector[0], 0)
+            circuit.rz(vector[1], 1)
             circuit.cx(0, 1)
         _, _, params = artifacts(circuit)
 
@@ -347,9 +357,9 @@ class TestAbsorbedAngles(QiskitTestCase):
         # `iter_symbols` walks a HashMap, so an unsorted free list would differ run to run.
         vector = ParameterVector("w", 4)
         circuit = QuantumCircuit(4)
-        for index in range(4):
-            circuit.rz(vector[index], index)
         with circuit.box([Twirl()]):
+            for index in range(4):
+                circuit.rz(vector[index], index)
             circuit.cx(0, 1)
             circuit.cx(2, 3)
 
