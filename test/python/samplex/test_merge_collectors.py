@@ -25,11 +25,35 @@ from qiskit._accelerate.samplex import (
     Twirl,
     absorb_dressing,
     build_lowered,
+    lower,
     merge_collectors,
 )
 
 from test import QiskitTestCase
-from test.python.samplex.test_build import collectors, emissions, gate_names, content_boxes, real_gates
+from test.python.samplex.test_build import (
+    body_locals,
+    collectors,
+    content_boxes,
+    emissions,
+    gate_names,
+    is_collector,
+    real_gates,
+)
+
+
+def all_collectors(circuit):
+    """Every collect box at any depth, in circuit order.
+
+    `collectors` reports one scope. Promotion moves a collector *between* scopes, so counting one scope
+    would show a promotion as a collector vanishing and a refusal as one appearing.
+    """
+    out = []
+    for inst in circuit.data:
+        if is_collector(inst.operation):
+            out.append(inst.operation)
+        for block in getattr(inst.operation, "blocks", None) or []:
+            out.extend(all_collectors(block))
+    return out
 
 
 def build(circuit):
@@ -43,6 +67,19 @@ def merged(circuit):
     dag, table = build_lowered(circuit_to_dag(circuit))
     merge_collectors(dag)
     absorb_dressing(dag)
+    return dag_to_circuit(dag), table
+
+
+def dressed_then_merged(circuit):
+    """The emission circuit in the documented pass order: absorb, then merge.
+
+    Promotion only has anything to do in this order. It refuses to move a collector while an emission
+    inside the box is still travelling towards the one it would fold into, and before absorption *every*
+    emission is still travelling — so merging an unabsorbed circuit promotes nothing.
+    """
+    dag, table = build_lowered(circuit_to_dag(circuit))
+    absorb_dressing(dag)
+    merge_collectors(dag)
     return dag_to_circuit(dag), table
 
 
@@ -371,3 +408,147 @@ class TestSharedMiddleIsWideEnough(QiskitTestCase):
         ]
         self.assertEqual(runs[0], runs[1])
         self.assertEqual(runs[0], runs[2])
+
+
+class TestPromotion(QiskitTestCase):
+    """A collector leaving its box, folded into the one just outside it.
+
+    Not a contraction: a nested collector covers a subset of its box's qubits, which are a subset of the
+    enclosing collector's, so nothing is widened. The outer collector keeps its width and gains a body,
+    and the inner one is deleted — one dressing layer fewer per nesting level.
+
+    Two conditions gate it. Nothing may lie between the two collectors on any wire the inner one covers,
+    or the transfer would reorder its content against whatever does. And nothing inside the box may still
+    be travelling towards the outer collector, because the gates being moved sit on such an emission's
+    path: they are crossed today, and afterwards they would be inside its target and composed instead.
+    """
+
+    def test_a_box_with_nothing_propagating_promotes_its_inner_collector(self):
+        circuit = QuantumCircuit(2)
+        with circuit.box([ChangeBasis("b")]):  # no twirl, so nothing of its own propagates
+            with circuit.box([Twirl()]):
+                circuit.cx(0, 1)
+
+        before, _ = build(circuit)
+        after, _ = dressed_then_merged(circuit)
+        self.assertEqual(len(all_collectors(before)), 4)
+        self.assertEqual(len(all_collectors(after)), 3)
+        # The content box stays: what is left in one is what could not be absorbed, so it still says
+        # something even after a collector has left it.
+        self.assertEqual(len(content_boxes(after)), 1)
+
+    def test_the_promoted_body_holds_both_contributions_in_order(self):
+        circuit = QuantumCircuit(2)
+        # `placement="start"` puts the basis change on the left edge, so the outer left collector has a
+        # body of its own for the promoted one to be appended to.
+        with circuit.box([ChangeBasis("b", placement="start")]):
+            with circuit.box([Twirl()]):
+                circuit.cx(0, 1)
+        after, table = dressed_then_merged(circuit)
+
+        outer_left = collectors(after)[0]
+        locals_ = body_locals(outer_left[1])
+        # The outer collector's own content first and the promoted content after it, because that is the
+        # order the two sat in: its basis change, then the inner box's near half.
+        self.assertEqual([op.source(table) for op in locals_], ["change_basis", "twirl"])
+
+    def test_both_sides_promote_when_nothing_propagates_at_all(self):
+        """With no twirl anywhere there is nothing travelling, so neither side is refused.
+
+        This is also the only shape that exercises a *leftward* promotion, where the inner collector sits
+        first and so its content has to be composed first.
+        """
+        circuit = QuantumCircuit(2)
+        with circuit.box([ChangeBasis("outer", placement="end")]):
+            with circuit.box([ChangeBasis("inner", placement="end")]):
+                circuit.noop(0, 1)
+
+        before, _ = build(circuit)
+        after, _ = dressed_then_merged(circuit)
+        self.assertEqual(len(all_collectors(before)), 4)
+        self.assertEqual(len(all_collectors(after)), 2)
+
+        # Both basis changes end up in the outer right collector, innermost first: the inner collector
+        # sat before the outer one, so its contribution composes before it. Build interns the enclosing
+        # box's distribution first, so the inner one's key is the higher of the two.
+        outer_right = collectors(after)[-1]
+        keys = [op.distribution_key for op in body_locals(outer_right[1])]
+        self.assertEqual(keys, [1, 0])
+
+    def test_a_nested_twirl_promotes_on_its_dressing_side(self):
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl(dressing="left")]):
+            with circuit.box([Twirl(dressing="left")]):
+                circuit.cx(0, 1)
+
+        after, _ = dressed_then_merged(circuit)
+        # Four collectors become three. The inner box's left collector had nothing travelling towards the
+        # outer left one — both near halves are already absorbed and the inner far half travels the other
+        # way — so it can leave.
+        self.assertEqual(len(all_collectors(after)), 3)
+
+    def test_the_far_half_blocks_promotion_on_the_side_it_travels_towards(self):
+        """The inner right collector stays: the inner far half is heading for the outer right one.
+
+        Promoting it would re-point that emission at the outer collector and move the gates it crosses
+        into it, so the conjugation it is owed would be composed rather than crossed.
+        """
+        circuit = QuantumCircuit(2)
+        with circuit.box([ChangeBasis("b")]):
+            with circuit.box([Twirl(dressing="left")]):
+                circuit.cx(0, 1)
+        after, _ = dressed_then_merged(circuit)
+
+        # Three, not two: the left side promoted and the right side did not.
+        self.assertEqual(len(all_collectors(after)), 3)
+        # And the inner far half is still travelling.
+        self.assertEqual(len([e for e in emissions(after) if e.direction != "local"]), 1)
+
+    def test_an_emission_in_between_blocks_promotion(self):
+        """The outer box's own far half is standalone and sits between the two collectors."""
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl(dressing="left")]):
+            circuit.cx(0, 1)  # keeps the outer far half from being absorbed
+            with circuit.box([Twirl(dressing="left")]):
+                circuit.cx(0, 1)
+
+        after, _ = dressed_then_merged(circuit)
+        self.assertEqual(len(all_collectors(after)), 4)
+
+    def test_promotion_is_transitive_across_two_levels(self):
+        """Taking one collector out exposes the next level down, which the fixed point then takes."""
+        circuit = QuantumCircuit(2)
+        with circuit.box([ChangeBasis("b0")]):
+            with circuit.box([ChangeBasis("b1")]):
+                with circuit.box([Twirl()]):
+                    circuit.cx(0, 1)
+
+        before, _ = build(circuit)
+        after, _ = dressed_then_merged(circuit)
+        self.assertEqual(len(all_collectors(before)), 6)
+        # Both left-hand collectors reached the outermost one, one round each.
+        self.assertEqual(len(all_collectors(after)), 4)
+
+    def test_promotion_keeps_every_conjugation(self):
+        """The check that matters: a promotion must not take a gate off an emission's path.
+
+        The template evaluates to the same unitary either way, so a lost conjugation shows up only as a
+        missing `Propagate` node.
+        """
+        circuit = QuantumCircuit(2)
+        with circuit.box([ChangeBasis("b")]):
+            with circuit.box([Twirl(dressing="left")]):
+                circuit.h(0)
+                circuit.cx(0, 1)
+
+        def propagates(merge):
+            dag, table = build_lowered(circuit_to_dag(circuit))
+            absorb_dressing(dag)
+            if merge:
+                merge_collectors(dag)
+            _, graph, _ = lower(dag, table)
+            return sorted(node[0] for node in graph.nodes() if node[0].startswith("propagate:"))
+
+        self.assertEqual(propagates(merge=True), propagates(merge=False))
+        # And there was something to preserve.
+        self.assertTrue(propagates(merge=False))

@@ -12,29 +12,40 @@
 
 //! Merge collectors: emission circuit (IR2) → emission circuit (IR2), in place.
 //!
-//! Adjacent boxes that share a synthesizer come to share a *middle* collector, so N boxes in a row
-//! need N+1 dressing layers rather than 2N. One [`DAGCircuit::replace_block`] contraction per
-//! group, which takes the union of its members' qargs and derives its position from their edges.
+//! Two ways for two collectors to become one, and they need different machinery.
 //!
-//! Two rules govern what may fuse, both per qubit: a candidate must overlap a group's `span`, and
-//! every one of its qubits must still be at that group's `frontier`. **Siblings only** — promoting
-//! a collector out of its box is declined, and each scope is walked with its own state.
+//! **Siblings, in one scope.** Adjacent boxes that share a synthesizer come to share a *middle*
+//! collector, so N boxes in a row need N+1 dressing layers rather than 2N. One
+//! [`DAGCircuit::replace_block`] contraction per group, which takes the union of its members' qargs
+//! and derives its position from their edges. Two rules govern what may fuse, both per qubit: a
+//! candidate must overlap a group's `span`, and every one of its qubits must still be at that group's
+//! `frontier`. Each scope is walked with its own state.
+//!
+//! **A collector leaving its box**, folded into the one just outside it — one dressing layer fewer per
+//! nesting level. This is *not* a contraction: a nested collector covers a subset of its box's qubits,
+//! which are a subset of the enclosing collector's, so nothing is ever widened. `replace_block` cannot
+//! contract across DAGs anyway. It is a body transfer plus a node deletion, and it runs to a fixed
+//! point before the sibling sweep, since promoting one collector out exposes the next level down.
 
 use hashbrown::{HashMap, HashSet};
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
 
 use pyo3::prelude::*;
 use qiskit_circuit::annotation::PyAnnotation;
-use qiskit_circuit::dag_circuit::DAGCircuit;
+use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder};
 use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{ControlFlow, ControlFlowInstruction, OperationRef};
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use qiskit_circuit::{Clbit, Qubit};
 
-use super::utils::{IntoPyResult, collect_annotation, new_dag_body, params_of};
+use super::utils::{
+    IntoPyResult, Site, WireCursor, block_body, collect_annotation, emission_spec, lift_wires,
+    new_dag_body, params_of, scope_dag, scope_dag_mut,
+};
 use crate::annotated_circuit::SynthesizerType;
 use crate::emission_circuit::{Collect, CollectPart, CollectSpec};
 use crate::partition::Partition;
+use crate::virtual_flow_graph::Direction;
 
 /// Collectors that will fuse into one, and the state deciding what else may join them.
 struct Group {
@@ -74,7 +85,292 @@ pub fn py_merge_collectors(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
 
 /// Merge adjacent collectors throughout an emission circuit, in place.
 pub fn merge_collectors(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
+    // Promotion first, to a fixed point: taking one collector out of its box can leave the next level
+    // down as its box's new head. Each round re-plans against the rewritten circuit rather than reusing
+    // sites, and rounds are bounded by nesting depth.
+    while promote_round(py, dag)? {}
     merge_scope(py, dag)
+}
+
+// --- Promotion: a collector leaving its box -----------------------------------------------------
+
+/// One collector folding into the collector just outside its box.
+struct Promotion {
+    /// The collector that stays, and gains a body. Its width and spec do not change: its partition
+    /// already covers the qubits of anything nested inside its box.
+    outer: Site,
+    /// The collector that goes.
+    inner: Site,
+    /// Which way `outer` had to walk to reach `inner`, which is what puts the two bodies in circuit
+    /// order: rightward means `outer`'s content comes first.
+    direction: Direction,
+}
+
+/// Do one round of promotions, reporting whether anything moved.
+fn promote_round(py: Python, dag: &mut DAGCircuit) -> PyResult<bool> {
+    let plans = plan_promotions(py, dag)?;
+    for plan in &plans {
+        promote(py, dag, plan)?;
+    }
+    Ok(!plans.is_empty())
+}
+
+/// Find every promotion available in the circuit as it stands.
+///
+/// A collector takes part in at most one promotion per round, in either role: a middle collector in a
+/// two-level nest is both somebody's `inner` and somebody else's `outer`, and doing both at once would
+/// substitute a node this round also deletes. The fixed-point loop picks up the rest.
+fn plan_promotions(py: Python, root: &DAGCircuit) -> PyResult<Vec<Promotion>> {
+    let mut plans: Vec<Promotion> = Vec::new();
+    let mut claimed: HashSet<Site> = HashSet::new();
+    plan_promotions_in(py, root, &mut Vec::new(), &mut plans, &mut claimed)?;
+    Ok(plans)
+}
+
+fn plan_promotions_in(
+    py: Python,
+    root: &DAGCircuit,
+    path: &mut Vec<NodeIndex>,
+    plans: &mut Vec<Promotion>,
+    claimed: &mut HashSet<Site>,
+) -> PyResult<()> {
+    let nodes: Vec<NodeIndex> = scope_dag(root, path)?.topological_op_nodes(false).collect();
+
+    for node in &nodes {
+        let dag = scope_dag(root, path)?;
+        let inst = dag.dag()[*node].unwrap_operation();
+        if collect_annotation(py, inst).is_none() {
+            continue;
+        }
+        let outer = Site {
+            scope: path.clone(),
+            node: *node,
+        };
+        if claimed.contains(&outer) {
+            continue;
+        }
+        for direction in [Direction::Left, Direction::Right] {
+            let Some(inner) = promotable(py, root, &outer, direction)? else {
+                continue;
+            };
+            if claimed.contains(&inner) {
+                continue;
+            }
+            claimed.insert(outer.clone());
+            claimed.insert(inner.clone());
+            plans.push(Promotion {
+                outer: outer.clone(),
+                inner,
+                direction,
+            });
+            break;
+        }
+    }
+
+    // Recurse, so a collector two levels down is considered against the collector one level down.
+    for node in &nodes {
+        let dag = scope_dag(root, path)?;
+        let inst = dag.dag()[*node].unwrap_operation();
+        if !is_box(inst) || collect_annotation(py, inst).is_some() {
+            continue;
+        }
+        path.push(*node);
+        plan_promotions_in(py, root, path, plans, claimed)?;
+        path.pop();
+    }
+    Ok(())
+}
+
+/// The collector that may leave its box and fold into `outer`, walking `direction`, if any.
+fn promotable(
+    py: Python,
+    root: &DAGCircuit,
+    outer: &Site,
+    direction: Direction,
+) -> PyResult<Option<Site>> {
+    let dag = scope_dag(root, &outer.scope)?;
+    let inst = dag.dag()[outer.node].unwrap_operation();
+    let spec = collect_annotation(py, inst).expect("only asked of a collector");
+    let wires: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();
+
+    // Every distinct collector-inside-a-box any of `outer`'s wires reaches first. More than one is
+    // ordinary — two narrow boxes side by side inside one content box — so each is judged on its own
+    // and the first that qualifies wins; a later round can take the others.
+    let mut candidates: Vec<Site> = Vec::new();
+    for wire in &wires {
+        let Some(site) = first_site(py, root, outer, *wire, direction)? else {
+            continue;
+        };
+        // A collector in the same scope is a sibling, which the contraction sweep handles.
+        if site.scope.len() <= outer.scope.len() {
+            continue;
+        }
+        let reached = scope_dag(root, &site.scope)?.dag()[site.node].unwrap_operation();
+        if collect_annotation(py, reached).is_none() {
+            continue;
+        }
+        if !candidates.contains(&site) {
+            candidates.push(site);
+        }
+    }
+
+    for inner in candidates {
+        let inner_dag = scope_dag(root, &inner.scope)?;
+        let inner_inst = inner_dag.dag()[inner.node].unwrap_operation();
+        let inner_spec = collect_annotation(py, inner_inst).expect("checked above");
+        // Every part of both, not just the first: the two are about to become one layer, and a part
+        // that synthesizes differently could not be expressed by it. Same test `find_mergeable` makes.
+        let synthesizer = spec.synthesizer();
+        if !inner_spec
+            .parts
+            .iter()
+            .chain(spec.parts.iter())
+            .all(|part| part.synthesizer == synthesizer)
+        {
+            continue;
+        }
+        let inner_wires = lift_to(root, &outer.scope, &inner, inner_dag, inner_inst)?;
+        // Always true for a nested collector, since its box sits inside `outer`'s — checked because
+        // the transfer would silently drop content if it were not.
+        if !inner_wires.iter().all(|wire| wires.contains(wire)) {
+            continue;
+        }
+        // P1: nothing between them, on every wire the inner collector covers. Wires of `outer` beyond
+        // it may reach anything at all; they carry none of the content being moved.
+        let mut adjacent = true;
+        for wire in &inner_wires {
+            if first_site(py, root, outer, *wire, direction)? != Some(inner.clone()) {
+                adjacent = false;
+                break;
+            }
+        }
+        if !adjacent {
+            continue;
+        }
+        // P2: nothing inside the box is travelling towards `outer`.
+        let towards_outer = match direction {
+            Direction::Right => Direction::Left,
+            Direction::Left => Direction::Right,
+        };
+        if holds_emission_towards(scope_dag(root, &inner.scope)?, towards_outer)? {
+            continue;
+        }
+        return Ok(Some(inner));
+    }
+    Ok(None)
+}
+
+/// The first site one of a collector's wires reaches, descending into boxes but not into collectors.
+fn first_site(
+    py: Python,
+    root: &DAGCircuit,
+    from: &Site,
+    wire: Qubit,
+    direction: Direction,
+) -> PyResult<Option<Site>> {
+    let descend = |inst: &PackedInstruction| is_box(inst) && collect_annotation(py, inst).is_none();
+    let mut cursor = WireCursor::new(from.scope.clone(), from.node, wire);
+    cursor.advance(root, direction, &descend)
+}
+
+/// Whether any emission in this body, at any depth, is still travelling in `direction`.
+///
+/// Refusing on one is what keeps promotion clear of the two things it would otherwise depend on. Such
+/// an emission is heading for the collector we would fold into, and the gates being moved sit on its
+/// path: today they are crossed, with the inner collector foreign to it, and afterwards they would be
+/// inside its target and composed instead. Deleting the inner collector also re-points the emission it
+/// was itself collecting, so the outer one would receive two from the same side. Both need the
+/// composition position of an incoming emission to be defined, and nothing defines it yet.
+fn holds_emission_towards(dag: &DAGCircuit, direction: Direction) -> PyResult<bool> {
+    for (_, inst) in dag.op_nodes(true) {
+        if let Some(spec) = emission_spec(inst) {
+            if spec.direction == Some(direction) {
+                return Ok(true);
+            }
+            continue;
+        }
+        if let Some(body) = block_body(dag, inst)?
+            && holds_emission_towards(body, direction)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A nested collector's qargs, lifted out of the boxes between it and `base` into that frame.
+fn lift_to(
+    root: &DAGCircuit,
+    base: &[NodeIndex],
+    site: &Site,
+    site_dag: &DAGCircuit,
+    inst: &PackedInstruction,
+) -> PyResult<Vec<Qubit>> {
+    let local = site_dag.qargs_interner().get(inst.qubits).to_vec();
+    lift_wires(scope_dag(root, base)?, &site.scope[base.len()..], &local)
+}
+
+/// Move one collector's body into the collector outside its box, and delete it.
+fn promote(py: Python, root: &mut DAGCircuit, plan: &Promotion) -> PyResult<()> {
+    // Everything is read before anything is written: the merged body is built while both collectors
+    // are still in place.
+    let (op, body) = {
+        let outer_dag = scope_dag(root, &plan.outer.scope)?;
+        let outer_inst = outer_dag.dag()[plan.outer.node].unwrap_operation();
+        let frame: Vec<Qubit> = outer_dag.qargs_interner().get(outer_inst.qubits).to_vec();
+        let num_clbits = outer_dag.cargs_interner().get(outer_inst.clbits).len();
+        let spec = collect_annotation(py, outer_inst).expect("planned from a collector");
+        let outer_body = block_body(outer_dag, outer_inst)?;
+
+        let inner_dag = scope_dag(root, &plan.inner.scope)?;
+        let inner_inst = inner_dag.dag()[plan.inner.node].unwrap_operation();
+        let inner_wires = lift_to(root, &plan.outer.scope, &plan.inner, inner_dag, inner_inst)?;
+        let inner_body = block_body(inner_dag, inner_inst)?;
+
+        let capacity =
+            outer_body.map_or(0, |b| b.num_ops()) + inner_body.map_or(0, |b| b.num_ops());
+        let mut body = new_dag_body(frame.len(), num_clbits, capacity)?.into_builder();
+        // Circuit order, which is what keeps the composition order of the two contributions right: the
+        // outer collector's content comes first exactly when it sits first.
+        let outer_first = matches!(plan.direction, Direction::Right);
+        for (contribution, wires) in order_contributions(
+            (outer_body, &frame),
+            (inner_body, &inner_wires),
+            outer_first,
+        ) {
+            if let Some(contribution) = contribution {
+                append_contribution(&mut body, contribution, wires, &frame)?;
+            }
+        }
+        let op = collect_op(py, spec, frame.len(), num_clbits)?;
+        (op, body.build())
+    };
+
+    let outer_scope = scope_dag_mut(root, &plan.outer.scope)?;
+    let block = outer_scope.add_block(body);
+    outer_scope
+        .substitute_op(
+            plan.outer.node,
+            op,
+            Some(Parameters::Blocks(vec![block])),
+            None,
+        )
+        .into_py_result()?;
+    scope_dag_mut(root, &plan.inner.scope)?.remove_op_node(plan.inner.node);
+    Ok(())
+}
+
+/// The two contributions in the order they compose.
+fn order_contributions<'a>(
+    outer: (Option<&'a DAGCircuit>, &'a [Qubit]),
+    inner: (Option<&'a DAGCircuit>, &'a [Qubit]),
+    outer_first: bool,
+) -> [(Option<&'a DAGCircuit>, &'a [Qubit]); 2] {
+    if outer_first {
+        [outer, inner]
+    } else {
+        [inner, outer]
+    }
 }
 
 /// Merge collectors within one scope, then recurse into box bodies with fresh state.
@@ -268,29 +564,41 @@ fn merged_body(
             // A collector that has not been through the absorb pass has no body to contribute.
             continue;
         };
-        let contribution = &dag.blocks()[block];
-
-        // In written order, not topological order: a collector body is a *sequence*. A body is
-        // built once and never edited, so its node indices are already in the order they were
-        // appended.
-        for (_, gate) in contribution.op_nodes(true) {
-            let qargs: Vec<Qubit> = contribution
-                .qargs_interner()
-                .get(gate.qubits)
-                .iter()
-                .map(|local| {
-                    let global = member[local.index()];
-                    let merged = frame
-                        .iter()
-                        .position(|q| *q == global)
-                        .expect("a member's qubits are part of the group's span");
-                    Qubit(merged as u32)
-                })
-                .collect();
-            super::utils::append(&mut body, gate.op.clone(), params_of(gate), &qargs, &[])?;
-        }
+        append_contribution(&mut body, &dag.blocks()[block], &member, frame)?;
     }
     Ok(body.build())
+}
+
+/// Append one collector's body to a merged body, remapping its wires into `frame`.
+///
+/// `wires` maps the contribution's body-local wires into the frame `frame` is expressed in: a sibling's
+/// own qargs, or a promoted collector's qargs lifted out through the boxes between.
+///
+/// In written order, not topological order: a collector body is a *sequence*. A body is built once and
+/// never edited, so its node indices are already in the order they were appended.
+fn append_contribution(
+    out: &mut DAGCircuitBuilder,
+    contribution: &DAGCircuit,
+    wires: &[Qubit],
+    frame: &[Qubit],
+) -> PyResult<()> {
+    for (_, gate) in contribution.op_nodes(true) {
+        let qargs: Vec<Qubit> = contribution
+            .qargs_interner()
+            .get(gate.qubits)
+            .iter()
+            .map(|local| {
+                let outer = wires[local.index()];
+                let merged = frame
+                    .iter()
+                    .position(|q| *q == outer)
+                    .expect("a contribution's qubits are part of the merged frame");
+                Qubit(merged as u32)
+            })
+            .collect();
+        super::utils::append(out, gate.op.clone(), params_of(gate), &qargs, &[])?;
+    }
+    Ok(())
 }
 
 /// The collector operation carrying the merged descriptors.
@@ -304,6 +612,16 @@ fn merged_op(
         partition: group.partition.clone(),
         parts: group.parts.clone(),
     };
+    collect_op(py, spec, num_qubits, num_clbits)
+}
+
+/// A collect box of the given width, carrying this spec.
+fn collect_op(
+    py: Python,
+    spec: CollectSpec,
+    num_qubits: usize,
+    num_clbits: usize,
+) -> PyResult<PackedOperation> {
     let annotation = Py::new(py, (Collect::new_from_spec(spec), PyAnnotation))?;
     Ok(PackedOperation::from_control_flow(Box::new(
         ControlFlowInstruction {
