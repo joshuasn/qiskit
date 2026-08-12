@@ -347,7 +347,7 @@ class TestBuildShape(QiskitTestCase):
         (emit,) = emissions(lowered)
         self.assertEqual(emit.source(table), "change_basis")
         self.assertEqual(emit.direction, "left")
-        self.assertEqual(emit.virtual_type, "c1")
+        self.assertEqual(emit.virtual_type(table), "c1")
         self.assertIn("local_cliffords.c3", table.entries()[0])
 
     def test_tag_only_box_is_transparent(self):

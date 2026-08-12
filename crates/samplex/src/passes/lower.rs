@@ -442,6 +442,7 @@ pub fn build_sampling_graph(
             collector_nodes[target],
             &infos,
             &mut gate_nodes,
+            table,
         )?;
     }
     Ok((vfg, parameters))
@@ -604,6 +605,7 @@ fn walk_emission(
     target_node: NodeIndex,
     infos: &[CollectorInfo],
     gate_nodes: &mut HashMap<GateKey, NodeIndex>,
+    table: &DistributionTable,
 ) -> PyResult<()> {
     let qubits: HashSet<usize> = spec.partition.all_elements().iter().copied().collect();
     let mut frontier: HashMap<usize, NodeIndex> = qubits.iter().map(|q| (*q, source)).collect();
@@ -611,6 +613,7 @@ fn walk_emission(
         "a local emission never surfaces as a top-level Event::Emission — it lives inside its \
          collector's body",
     );
+    let virtual_type = spec.virtual_type(table);
 
     // Walking in the emission's own direction is what makes propagation derivable rather than
     // recorded.
@@ -642,7 +645,7 @@ fn walk_emission(
                         (index, offset),
                         gate.gate,
                         &gate.qubits,
-                        spec.virtual_type(),
+                        virtual_type,
                     )?;
                 }
             }
@@ -655,7 +658,7 @@ fn walk_emission(
                 (index, 0),
                 *gate,
                 gate_qubits,
-                spec.virtual_type(),
+                virtual_type,
             )?,
             _ => {}
         }
@@ -721,18 +724,18 @@ fn chain(
 
 /// The graph node for one emission, resolved from the table entry its `dist` key points at.
 fn emission_kind(spec: &EmitSpec, table: &DistributionTable) -> PyResult<NodeKind> {
-    if table.get(spec.dist()).is_none() {
-        return Err(PyValueError::new_err(format!(
+    let entry = table.get(spec.dist()).ok_or_else(|| {
+        PyValueError::new_err(format!(
             "emission (dist={}) references a missing table entry",
             spec.dist().0
-        )));
-    }
+        ))
+    })?;
     Ok(NodeKind::Emission(Emission {
         key: spec.dist(),
         direction: spec.direction.expect(
             "a local emission never surfaces as a top-level Event::Emission — it lives inside its \
              collector's body",
         ),
-        virtual_type: spec.virtual_type(),
+        virtual_type: entry.virtual_type(),
     }))
 }

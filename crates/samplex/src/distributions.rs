@@ -19,6 +19,7 @@ use hashbrown::{HashMap, HashSet};
 use pyo3::prelude::*;
 
 use crate::annotated_circuit::{ChangeBasisMode, DistributionType};
+use crate::virtual_type::VirtualType;
 
 /// A key into a [`DistributionTable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -62,6 +63,15 @@ impl DistEntry {
                 modifier: None,
             } => format!("Noise({reference})"),
             Self::Basis { mode, ref_id } => format!("Basis({mode:?}, {ref_id})"),
+        }
+    }
+
+    /// The algebraic type of the virtual gates drawn from this entry.
+    pub fn virtual_type(&self) -> VirtualType {
+        match self {
+            Self::Distribution(distribution) => distribution.virtual_type(),
+            Self::Noise { .. } => VirtualType::Pauli,
+            Self::Basis { mode, .. } => mode.virtual_type(),
         }
     }
 }

@@ -45,8 +45,6 @@ pub const EMIT_NAME: &str = "emit";
 pub struct EmitPart {
     /// The distribution this part draws from.
     pub dist: DistKey,
-    /// The algebraic type of the emitted virtual gates on this part.
-    pub virtual_type: VirtualType,
     /// Index into this part's `dist` key's sample array.
     pub draw: u32,
     /// Whether to take the adjoint of the sampled value before composing or propagating. True for
@@ -85,10 +83,13 @@ impl EmitSpec {
         self.parts[0].dist
     }
 
-    /// The virtual type of the first part. Convenience for the common uniform case where all parts
-    /// share the same virtual type.
-    pub fn virtual_type(&self) -> VirtualType {
-        self.parts[0].virtual_type
+    /// The virtual type of the first part, resolved via `table`. Convenience for the common uniform
+    /// case where all parts share the same virtual type.
+    pub fn virtual_type(&self, table: &DistributionTable) -> VirtualType {
+        table
+            .get(self.dist())
+            .expect("an EmitSpec's dist key always resolves in the table it was built from")
+            .virtual_type()
     }
 }
 
@@ -210,9 +211,8 @@ impl Emit {
         }
     }
 
-    #[getter]
-    fn virtual_type(&self) -> &'static str {
-        match self.inner.virtual_type() {
+    fn virtual_type(&self, table: &DistributionTable) -> &'static str {
+        match self.inner.virtual_type(table) {
             VirtualType::Pauli => "pauli",
             VirtualType::C1 => "c1",
             VirtualType::U2 => "u2",
@@ -307,7 +307,7 @@ pub struct CollectSpec {
     /// The annotated boxes whose emissions this collector may consume, ascending.
     ///
     /// Build gives each of a box's two collectors that box's own id; merging unions them.
-    pub owned: Vec<u32>,
+    pub owned: Vec<u32>, //todo remove
     /// Subsystem grouping over the collector's qubits, in the *global* circuit frame.
     pub partition: Partition,
     /// Per-part descriptors, parallel with `partition.iter()`.

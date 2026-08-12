@@ -615,7 +615,6 @@ mod tests {
                 partition: make_partition(&[&[0]]),
                 parts: vec![EmitPart {
                     dist: DistKey(0),
-                    virtual_type: VirtualType::Pauli,
                     draw: 0,
                     adjoint: false,
                 }],

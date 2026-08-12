@@ -45,7 +45,6 @@ use crate::distributions::{DistEntry, DistKey, DistributionTable};
 use crate::emission_circuit::{Collect, CollectPart, CollectSpec, EmitPart, EmitSpec};
 use crate::partition::Partition;
 use crate::virtual_flow_graph::Direction;
-use crate::virtual_type::VirtualType;
 
 use super::utils::{IntoPyResult, append, new_dag_body};
 
@@ -451,14 +450,12 @@ impl Build {
             let dist = self
                 .table
                 .intern(DistEntry::Distribution(twirl.distribution));
-            let virtual_type = twirl.distribution.virtual_type();
             let draw_base = self.alloc_draws(dist, num_parts as u32);
             for direction in [Direction::Left, Direction::Right] {
                 let adjoint = direction != dressing_edge;
                 let parts = (0..num_parts)
                     .map(|i| EmitPart {
                         dist,
-                        virtual_type,
                         draw: draw_base + i as u32,
                         adjoint,
                     })
@@ -481,12 +478,10 @@ impl Build {
                 ref_id: basis.ref_id.clone(),
             });
             let direction: Direction = basis.placement.into();
-            let virtual_type = basis.mode.virtual_type();
             let draw_base = self.alloc_draws(dist, num_parts as u32);
             let parts = (0..num_parts)
                 .map(|i| EmitPart {
                     dist,
-                    virtual_type,
                     draw: draw_base + i as u32,
                     adjoint: false,
                 })
@@ -511,12 +506,10 @@ impl Build {
                 modifier: noise.modifier.clone(),
             });
             let direction: Direction = noise.site.into();
-            let virtual_type = VirtualType::Pauli;
             let draw_base = self.alloc_draws(dist, num_parts as u32);
             let parts = (0..num_parts)
                 .map(|i| EmitPart {
                     dist,
-                    virtual_type,
                     draw: draw_base + i as u32,
                     adjoint: false,
                 })

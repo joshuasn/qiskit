@@ -40,7 +40,7 @@ pub enum BuildError {
 /// A partition of a sequence of `usize` elements into non-overlapping subsets (parts).
 ///
 /// Parts may have different sizes.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)] // this can be a partition of the qubits
 pub struct Partition {
     all_elements: HashSet<usize>,
     parts: IndexMap<Box<[usize]>, usize>,
