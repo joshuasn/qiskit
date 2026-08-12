@@ -31,32 +31,14 @@ use qiskit_circuit::operations::{CustomOperation, Operation, Param};
 use smallvec::SmallVec;
 
 use crate::annotated_circuit::{SynthesizerType, parse_decomposition};
-use crate::distributions::DistKey;
+use crate::distributions::{DistEntry, DistKey, DistributionTable};
 use crate::partition::Partition;
 use crate::virtual_flow_graph::Direction;
 use crate::virtual_type::VirtualType;
 
-/// Which kind of annotation an [`Emit`] stands in for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EmitSource {
-    /// One half of a twirl's inverse pair.
-    Twirl,
-    /// Noise drawn from a referenced Pauli-Lindblad map.
-    InjectNoise,
-    /// A deterministic frame change (`ChangeBasis` or `InjectLocalClifford`).
-    ChangeBasis,
-}
-
-impl EmitSource {
-    /// The instruction name reported to Qiskit for this kind of emission.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Twirl => "samplex_emit_twirl",
-            Self::InjectNoise => "samplex_emit_noise",
-            Self::ChangeBasis => "samplex_emit_basis",
-        }
-    }
-}
+/// The instruction name reported to Qiskit for every emission, regardless of kind. Which kind an
+/// emission is comes from the [`DistEntry`] its `dist` key points at; see [`Emit::source`].
+pub const EMIT_NAME: &str = "emit";
 
 /// Per-part descriptor for an emission, parallel with its partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,8 +60,6 @@ pub struct EmitSpec {
     /// Which annotated box this emission came from. Only that box's collectors may consume it; see
     /// [`CollectSpec::owned`].
     pub box_id: u32,
-    /// Which annotation this emission stands in for.
-    pub source: EmitSource,
     /// Which way the emitted virtual state flows, or `None` if it has already resolved in place —
     /// owned directly by the collector body it sits in, rather than propagating towards one.
     pub direction: Option<Direction>,
@@ -114,7 +94,7 @@ impl EmitSpec {
 
 impl Operation for EmitSpec {
     fn name(&self) -> &str {
-        self.source.name()
+        EMIT_NAME
     }
 
     fn num_qubits(&self) -> u32 {
@@ -182,7 +162,7 @@ impl Emit {
 
     #[getter]
     fn name(&self) -> &'static str {
-        self.inner.source.name()
+        EMIT_NAME
     }
 
     #[getter]
@@ -197,13 +177,17 @@ impl Emit {
 
     // --- payload readouts, for inspection from Python ---
 
-    #[getter]
-    fn source(&self) -> &'static str {
-        match self.inner.source {
-            EmitSource::Twirl => "twirl",
-            EmitSource::InjectNoise => "inject_noise",
-            EmitSource::ChangeBasis => "change_basis",
-        }
+    /// Which kind of annotation this emission stands in for — `"twirl"`, `"inject_noise"`, or
+    /// `"change_basis"` — resolved from `table`'s entry for this emission's distribution key.
+    /// `None` if no table is given, or if the key has no entry in it.
+    #[pyo3(signature = (table=None))]
+    fn source(&self, table: Option<&DistributionTable>) -> Option<&'static str> {
+        let entry = table.and_then(|t| t.get(self.inner.dist()))?;
+        Some(match entry {
+            DistEntry::Distribution(_) => "twirl",
+            DistEntry::Basis { .. } => "change_basis",
+            DistEntry::Noise { .. } => "inject_noise",
+        })
     }
 
     #[getter]
@@ -272,8 +256,7 @@ impl Emit {
             ""
         };
         format!(
-            "Emit({}, dist={}, {}, {:?}, draws={:?}{})",
-            self.source(),
+            "Emit(dist=#{}, {}, {:?}, draws={:?}{})",
             self.inner.dist().0,
             self.direction(),
             self.inner.qubits(),

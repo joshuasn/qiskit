@@ -84,7 +84,7 @@ def emits(circuit):
     return [
         inst
         for inst, _ in walk(circuit)
-        if inst.operation.name.startswith("samplex_emit_") and inst.operation.direction != "local"
+        if inst.operation.name.startswith("emit") and inst.operation.direction != "local"
     ]
 
 
@@ -93,13 +93,13 @@ def body_locals(body):
     return [
         inst.operation
         for inst in body.data
-        if inst.operation.name.startswith("samplex_emit_") and inst.operation.direction == "local"
+        if inst.operation.name.startswith("emit") and inst.operation.direction == "local"
     ]
 
 
 def real_gates(body):
     """Gate names in a collector body, excluding absorbed local emissions."""
-    return [inst.operation.name for inst in body.data if not inst.operation.name.startswith("samplex_emit_")]
+    return [inst.operation.name for inst in body.data if not inst.operation.name.startswith("emit")]
 
 
 class TestLocalAbsorption(QiskitTestCase):
@@ -153,11 +153,13 @@ class TestLocalAbsorption(QiskitTestCase):
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left"), InjectNoise("n0", "after")]):
             circuit.cx(0, 1)
-        ir2 = build(circuit)
+        dag, table = build_lowered(circuit_to_dag(circuit))
+        absorb_dressing(dag)
+        ir2 = dag_to_circuit(dag)
         # Only the far twirl half remains; the noise injection is absorbed
         remaining = emits(ir2)
         self.assertEqual(len(remaining), 1)
-        self.assertEqual(remaining[0].operation.source, "twirl")
+        self.assertEqual(remaining[0].operation.source(table), "twirl")
 
     def test_twirl_with_basis_change_absorbs_all_local(self):
         circuit = QuantumCircuit(2)
@@ -236,11 +238,13 @@ class TestOwnership(QiskitTestCase):
         with circuit.box([Twirl(dressing="left")]):
             with circuit.box([ChangeBasis("b", placement="end")]):
                 circuit.cx(0, 1)
-        ir2 = build(circuit)
+        dag, table = build_lowered(circuit_to_dag(circuit))
+        absorb_dressing(dag)
+        ir2 = dag_to_circuit(dag)
 
         # The inner ChangeBasis sits at the inner box's right edge, adjacent to that box's own right
         # collector, so it is absorbed there — no descent, no escaping.
-        self.assertNotIn("change_basis", [e.operation.source for e in emits(ir2)])
+        self.assertNotIn("change_basis", [e.operation.source(table) for e in emits(ir2)])
 
 
 class TestAbsorptionWithMerge(QiskitTestCase):

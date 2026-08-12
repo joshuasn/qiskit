@@ -159,7 +159,7 @@ class TestSharedMiddleCollector(QiskitTestCase):
             [
                 (i.operation.name, [body.find_bit(b).index for b in i.qubits])
                 for i in body.data
-                if not i.operation.name.startswith("samplex_emit")
+                if not i.operation.name.startswith("emit")
             ],
             [("s", [0]), ("h", [3])],
         )
@@ -252,7 +252,7 @@ class TestPreservation(QiskitTestCase):
     def test_emissions_and_content_are_untouched(self):
         # Propagating emissions (those not absorbed) survive merge unchanged.
         circuit = notebook_circuit()
-        dag, _ = build_lowered(circuit_to_dag(circuit))
+        dag, table = build_lowered(circuit_to_dag(circuit))
         no_merge = copy.copy(dag)
         absorb_dressing(no_merge)
         with_merge = copy.copy(dag)
@@ -266,14 +266,22 @@ class TestPreservation(QiskitTestCase):
         # local emission lives in a collector body alongside other content on disjoint qubits, where
         # relative order is deliberately unconstrained — see lower.rs's topological-order argument.
         self.assertEqual(
-            [(e.source, e.direction, tuple(e.qubits)) for e in emissions(before) if e.direction != "local"],
-            [(e.source, e.direction, tuple(e.qubits)) for e in emissions(after) if e.direction != "local"],
+            [
+                (e.source(table), e.direction, tuple(e.qubits))
+                for e in emissions(before)
+                if e.direction != "local"
+            ],
+            [
+                (e.source(table), e.direction, tuple(e.qubits))
+                for e in emissions(after)
+                if e.direction != "local"
+            ],
         )
 
     def test_emissions_are_preserved_through_merge(self):
         # Whether or not merge runs, the same propagating emissions remain standalone.
         circuit = notebook_circuit()
-        dag, _ = build_lowered(circuit_to_dag(circuit))
+        dag, table = build_lowered(circuit_to_dag(circuit))
         no_merge = copy.copy(dag)
         absorb_dressing(no_merge)
         with_merge = copy.copy(dag)
@@ -284,8 +292,8 @@ class TestPreservation(QiskitTestCase):
         after = dag_to_circuit(with_merge)
 
         self.assertEqual(
-            [(e.source, e.direction) for e in emissions(before)],
-            [(e.source, e.direction) for e in emissions(after)],
+            [(e.source(table), e.direction) for e in emissions(before)],
+            [(e.source(table), e.direction) for e in emissions(after)],
         )
 
     def test_hard_content_survives(self):

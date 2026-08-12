@@ -43,8 +43,8 @@ use qiskit_circuit::operations::StandardInstruction;
 
 use super::utils::{IntoPyResult, block_body, collect_annotation, emission_spec, is_emission};
 use crate::annotated_circuit::SynthesizerType;
-use crate::distributions::{DistEntry, DistributionTable};
-use crate::emission_circuit::{EmitSource, EmitSpec};
+use crate::distributions::DistributionTable;
+use crate::emission_circuit::EmitSpec;
 use crate::parameters::ParameterTable;
 use crate::partition::Partition;
 use crate::virtual_flow_graph::{
@@ -719,24 +719,11 @@ fn chain(
     Ok(())
 }
 
-/// The graph node for one emission, checking that its source tag agrees with the entry it points
-/// at.
+/// The graph node for one emission, resolved from the table entry its `dist` key points at.
 fn emission_kind(spec: &EmitSpec, table: &DistributionTable) -> PyResult<NodeKind> {
-    let entry = table.get(spec.dist()).ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "emission (dist={}) references a missing table entry",
-            spec.dist().0
-        ))
-    })?;
-    let agrees = matches!(
-        (spec.source, entry),
-        (EmitSource::Twirl, DistEntry::Distribution(_))
-            | (EmitSource::ChangeBasis, DistEntry::Basis { .. })
-            | (EmitSource::InjectNoise, DistEntry::Noise { .. })
-    );
-    if !agrees {
+    if table.get(spec.dist()).is_none() {
         return Err(PyValueError::new_err(format!(
-            "emission (dist={}) does not match its table entry",
+            "emission (dist={}) references a missing table entry",
             spec.dist().0
         )));
     }

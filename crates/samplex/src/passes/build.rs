@@ -42,7 +42,7 @@ use crate::annotated_circuit::{
     resolve_annotations,
 };
 use crate::distributions::{DistEntry, DistKey, DistributionTable};
-use crate::emission_circuit::{Collect, CollectPart, CollectSpec, EmitPart, EmitSource, EmitSpec};
+use crate::emission_circuit::{Collect, CollectPart, CollectSpec, EmitPart, EmitSpec};
 use crate::partition::Partition;
 use crate::virtual_flow_graph::Direction;
 use crate::virtual_type::VirtualType;
@@ -466,7 +466,6 @@ impl Build {
                 emissions.push(Placed {
                     spec: EmitSpec {
                         box_id,
-                        source: EmitSource::Twirl,
                         direction: Some(direction),
                         partition: partition.clone(),
                         parts,
@@ -495,7 +494,6 @@ impl Build {
             emissions.push(Placed {
                 spec: EmitSpec {
                     box_id,
-                    source: EmitSource::ChangeBasis,
                     direction: Some(direction),
                     partition: partition.clone(),
                     parts,
@@ -526,7 +524,6 @@ impl Build {
             emissions.push(Placed {
                 spec: EmitSpec {
                     box_id,
-                    source: EmitSource::InjectNoise,
                     direction: Some(direction),
                     partition: partition.clone(),
                     parts,
