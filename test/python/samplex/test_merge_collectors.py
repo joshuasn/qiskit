@@ -74,9 +74,10 @@ def merged(circuit):
 def dressed_then_merged(circuit):
     """The emission circuit in the documented pass order: absorb, then merge.
 
-    Promotion only has anything to do in this order. It refuses to move a collector while an emission
-    inside the box is still travelling towards the one it would fold into, and before absorption *every*
-    emission is still travelling — so merging an unabsorbed circuit promotes nothing.
+    Promotion works either way round, but it finds more to do in this order — not because it asks whether
+    absorption has run, but because absorption *removes* things from between two collectors. An emission
+    or a foldable gate still sitting there refuses the transfer on adjacency alone, so the same circuit
+    can promote after absorption where it could not before.
     """
     dag, table = build_lowered(circuit_to_dag(circuit))
     absorb_dressing(dag)
@@ -414,13 +415,18 @@ class TestPromotion(QiskitTestCase):
     enclosing collector's, so nothing is widened. The outer collector keeps its width and gains a body,
     and the inner one is deleted — one dressing layer fewer per nesting level.
 
-    Two conditions gate it. Nothing may lie between the two collectors on any wire the inner one covers,
-    or the transfer would reorder its content against whatever does. And nothing inside the box may still
-    be travelling towards the outer collector, because the gates being moved sit on such an emission's
-    path: they are crossed today, and afterwards they would be inside its target and composed instead.
+    Adjacency gates it: nothing may lie between the two collectors on any wire the inner one covers, or
+    the transfer would reorder its content against whatever does.
+
+    Beyond that it refuses on hazards rather than on how much has been optimized already. An emission
+    inside the box heading for the outer collector is not itself a problem — after the transfer it simply
+    arrives there instead, crossing nothing extra. What is a problem is moving *content* onto its path,
+    since gates crossed today would be composed inside its target instead; or a *second* such emission,
+    since which of two arriving from one side composes nearer the collector's edge is a question only the
+    incoming-placement rule answers.
     """
 
-    def test_a_box_with_nothing_propagating_promotes_its_inner_collector(self):
+    def test_a_box_with_nothing_propagating_promotes_both_inner_collectors(self):
         circuit = QuantumCircuit(2)
         with circuit.box([ChangeBasis("b")]):  # no twirl, so nothing of its own propagates
             with circuit.box([Twirl()]):
@@ -428,10 +434,12 @@ class TestPromotion(QiskitTestCase):
 
         before, _ = build(circuit)
         after, _ = dressed_then_merged(circuit)
+        # Both sides go: the left one has nothing travelling its way, and the right one has only the inner
+        # far half, which retargets to the outer collector rather than losing anything.
         self.assertEqual(len(all_collectors(before)), 4)
-        self.assertEqual(len(all_collectors(after)), 3)
+        self.assertEqual(len(all_collectors(after)), 2)
         # The content box stays: what is left in one is what could not be absorbed, so it still says
-        # something even after a collector has left it.
+        # something even after its collectors have left it.
         self.assertEqual(len(content_boxes(after)), 1)
 
     def test_the_promoted_body_holds_both_contributions_in_order(self):
@@ -472,23 +480,24 @@ class TestPromotion(QiskitTestCase):
         keys = [op.distribution_key for op in body_locals(outer_right[1])]
         self.assertEqual(keys, [1, 0])
 
-    def test_a_nested_twirl_promotes_on_its_dressing_side(self):
+    def test_a_nested_twirl_promotes_on_both_sides(self):
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="left")]):
             with circuit.box([Twirl(dressing="left")]):
                 circuit.cx(0, 1)
 
         after, _ = dressed_then_merged(circuit)
-        # Four collectors become three. The inner box's left collector had nothing travelling towards the
-        # outer left one — both near halves are already absorbed and the inner far half travels the other
-        # way — so it can leave.
-        self.assertEqual(len(all_collectors(after)), 3)
+        # The inner box's dressing layers both go: the left collector has nothing travelling its way, and
+        # the right one has only the inner far half, which retargets rather than losing a conjugation.
+        self.assertEqual(len(all_collectors(after)), 2)
 
-    def test_the_far_half_blocks_promotion_on_the_side_it_travels_towards(self):
-        """The inner right collector stays: the inner far half is heading for the outer right one.
+    def test_one_emission_heading_out_retargets_rather_than_refusing(self):
+        """An emission heading for the outer collector is not a hazard by itself.
 
-        Promoting it would re-point that emission at the outer collector and move the gates it crosses
-        into it, so the conjugation it is owed would be composed rather than crossed.
+        The inner right collector is empty, so promoting it moves nothing onto that emission's path; the
+        emission simply arrives at the outer collector instead, crossing exactly what it crossed before,
+        since nothing lies between the two. Refusing here was the old guard mistaking "an emission is
+        travelling" for "something is at risk".
         """
         circuit = QuantumCircuit(2)
         with circuit.box([ChangeBasis("b")]):
@@ -496,10 +505,27 @@ class TestPromotion(QiskitTestCase):
                 circuit.cx(0, 1)
         after, _ = dressed_then_merged(circuit)
 
-        # Three, not two: the left side promoted and the right side did not.
-        self.assertEqual(len(all_collectors(after)), 3)
-        # And the inner far half is still travelling.
+        self.assertEqual(len(all_collectors(after)), 2)
+        # The far half is still travelling — it has further to go now, not less.
         self.assertEqual(len([e for e in emissions(after) if e.direction != "local"]), 1)
+
+    def test_two_emissions_heading_out_refuse(self):
+        """Two arriving at one collector from one side is what the incoming-placement rule would order.
+
+        The enclosing box's own far half and the inner box's both travel rightward towards the outer right
+        collector. Promoting the inner right one would leave both arriving there, and which composes
+        nearer its edge is not defined yet — so it is refused. The left side is refused too, by adjacency:
+        the enclosing box's content sits between the two collectors there.
+        """
+        circuit = QuantumCircuit(2)
+        with circuit.box([Twirl(dressing="left")]):
+            circuit.cx(1, 0)  # keeps the enclosing far half standalone and heading right
+            with circuit.box([Twirl(dressing="left")]):
+                circuit.cx(0, 1)
+
+        after, _ = dressed_then_merged(circuit)
+        self.assertEqual(len(all_collectors(after)), 4)
+        self.assertEqual(len([e for e in emissions(after) if e.direction != "local"]), 2)
 
     def test_a_foldable_gate_in_between_does_not_block_promotion(self):
         """A gate between the two collectors blocks promotion only if it is still there.
@@ -518,7 +544,7 @@ class TestPromotion(QiskitTestCase):
         before, _ = build(circuit)
         after, _ = dressed_then_merged(circuit)
         self.assertEqual(len(all_collectors(before)), 4)
-        self.assertEqual(len(all_collectors(after)), 3)
+        self.assertEqual(len(all_collectors(after)), 2)
 
     def test_an_emission_in_between_blocks_promotion(self):
         """The outer box's own far half is standalone and sits between the two collectors."""
@@ -542,8 +568,28 @@ class TestPromotion(QiskitTestCase):
         before, _ = build(circuit)
         after, _ = dressed_then_merged(circuit)
         self.assertEqual(len(all_collectors(before)), 6)
-        # Both left-hand collectors reached the outermost one, one round each.
-        self.assertEqual(len(all_collectors(after)), 4)
+        # Every level's collectors reach the outermost pair, one round per level.
+        self.assertEqual(len(all_collectors(after)), 3)
+
+    def test_promotion_works_in_either_pass_order(self):
+        """It asks about hazards, not about how much has been optimized already.
+
+        Merging an unabsorbed circuit is a valid thing to do, and promotion does fire there: every body is
+        empty then, so the transfer is purely structural — delete a collector, let what it was catching
+        arrive at the next one out. What it finds is *less*, because absorption is what clears the things
+        that refuse the transfer on adjacency; see `dressed_then_merged`.
+        """
+        circuit = QuantumCircuit(2)
+        with circuit.box([ChangeBasis("b", placement="start")]):
+            with circuit.box([Twirl()]):
+                circuit.cx(0, 1)
+
+        dag, _ = build_lowered(circuit_to_dag(circuit))
+        merge_collectors(dag)  # no absorption at all: every collector body is empty
+        promoted_first = len(all_collectors(dag_to_circuit(dag)))
+
+        self.assertEqual(len(all_collectors(build(circuit)[0])), 4)
+        self.assertLess(promoted_first, 4)
 
     def test_promotion_keeps_every_conjugation(self):
         """The check that matters: a promotion must not take a gate off an emission's path.

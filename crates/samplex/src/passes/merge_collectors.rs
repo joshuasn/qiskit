@@ -26,6 +26,12 @@
 //! which are a subset of the enclosing collector's, so nothing is ever widened. `replace_block` cannot
 //! contract across DAGs anyway. It is a body transfer plus a node deletion, and it runs to a fixed
 //! point before the sibling sweep, since promoting one collector out exposes the next level down.
+//!
+//! Promotion refuses on hazards, not on which pass has run. Before absorption every collector body is
+//! empty, so promoting is purely structural then — delete a collector, re-point whatever it was
+//! catching — and an unabsorbed circuit is a valid IR2 rather than an unfinished one. What geometry
+//! *does* differ by pass order is adjacency: absorption removes content from between two collectors, so
+//! a promotion it refuses before may be available after.
 
 use hashbrown::{HashMap, HashSet};
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
@@ -301,12 +307,22 @@ fn promotable(
         if !adjacent {
             continue;
         }
-        // P2: nothing inside the box is travelling towards `outer`.
-        let towards_outer = match direction {
+        // P2, as two hazards rather than one blanket refusal. `outward` is the way an emission would
+        // have to travel to end up at `outer`, and after the transfer every such emission does, since
+        // the collector that was catching them is gone.
+        let outward = match direction {
             Direction::Right => Direction::Left,
             Direction::Left => Direction::Right,
         };
-        if holds_emission_towards(scope_dag(root, &inner.scope)?, towards_outer)? {
+        let arriving = count_emissions_towards(scope_dag(root, &inner.scope)?, outward)?;
+        if arriving > 0 && !body_is_empty(inner_dag, inner_inst)? {
+            // The content being moved sits on such an emission's path: crossed today, with the inner
+            // collector foreign to it, and composed inside its target afterwards.
+            continue;
+        }
+        if arriving > 1 {
+            // Two would arrive at `outer` from the same side, and which composes nearer its edge is a
+            // question only the incoming-placement rule answers.
             continue;
         }
         return Ok(Some(inner));
@@ -327,29 +343,35 @@ fn first_site(
     cursor.advance(root, direction, &descend)
 }
 
-/// Whether any emission in this body, at any depth, is still travelling in `direction`.
+/// How many emissions in this body, at any depth, are still travelling in `direction`.
 ///
-/// Refusing on one is what keeps promotion clear of the two things it would otherwise depend on. Such
-/// an emission is heading for the collector we would fold into, and the gates being moved sit on its
-/// path: today they are crossed, with the inner collector foreign to it, and afterwards they would be
-/// inside its target and composed instead. Deleting the inner collector also re-points the emission it
-/// was itself collecting, so the outer one would receive two from the same side. Both need the
-/// composition position of an incoming emission to be defined, and nothing defines it yet.
-fn holds_emission_towards(dag: &DAGCircuit, direction: Direction) -> PyResult<bool> {
+/// These are the ones that end up at the collector being folded into, since the transfer deletes the
+/// collector that was catching them. The count is what separates promotion's two hazards from each
+/// other: one of them needs any such emission plus content to move, the other needs two of them.
+///
+/// A local emission is not counted — it has resolved in place and travels nowhere.
+fn count_emissions_towards(dag: &DAGCircuit, direction: Direction) -> PyResult<usize> {
+    let mut total = 0;
     for (_, inst) in dag.op_nodes(true) {
         if let Some(spec) = emission_spec(inst) {
             if spec.direction == Some(direction) {
-                return Ok(true);
+                total += 1;
             }
             continue;
         }
-        if let Some(body) = block_body(dag, inst)?
-            && holds_emission_towards(body, direction)?
-        {
-            return Ok(true);
+        if let Some(body) = block_body(dag, inst)? {
+            total += count_emissions_towards(body, direction)?;
         }
     }
-    Ok(false)
+    Ok(total)
+}
+
+/// Whether a collector has nothing in its body to move.
+///
+/// Before absorption every body is empty, which is why promotion pre-absorption is purely structural:
+/// it deletes a collector and re-points whatever that collector was catching, moving no content at all.
+fn body_is_empty(dag: &DAGCircuit, inst: &PackedInstruction) -> PyResult<bool> {
+    Ok(block_body(dag, inst)?.is_none_or(|body| body.num_ops() == 0))
 }
 
 /// A nested collector's qargs, lifted out of the boxes between it and `base` into that frame.
