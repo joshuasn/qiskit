@@ -30,7 +30,9 @@ class SamplexAbsorbDressing(TransformationPass):
     the sampling graph needs. An emission whose collector sits inside an adjacent box descends into
     that box and is absorbed there.
 
-    Runs in place and may be composed either side of :class:`.SamplexMergeCollectors`.
+    Runs in place, and is best run *before* :class:`.SamplexMergeCollectors` rather than after: taking
+    the dressing in is what clears the emissions and foldable gates that otherwise sit between two
+    collectors and stop them merging. Either order is valid; the other one merely merges less.
     """
 
     def run(self, dag):

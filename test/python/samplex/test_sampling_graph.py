@@ -41,8 +41,8 @@ def graph_of(circuit, optimize=True):
     """The sampling graph, with the IR2 optimizations optionally applied first."""
     dag, table = build_lowered(circuit_to_dag(circuit))
     if optimize:
-        merge_collectors(dag)
         absorb_dressing(dag)
+        merge_collectors(dag)
     _, graph, _ = lower(dag, table)
     return graph
 
@@ -51,8 +51,8 @@ def graph_and_table_of(circuit, optimize=True):
     """The sampling graph and its distribution table, for tests that need to resolve emissions."""
     dag, table = build_lowered(circuit_to_dag(circuit))
     if optimize:
-        merge_collectors(dag)
         absorb_dressing(dag)
+        merge_collectors(dag)
     _, graph, _ = lower(dag, table)
     return graph, table
 
@@ -61,8 +61,8 @@ def artifacts(circuit, optimize=True):
     """All three lowering outputs, for the tests that need the parameter table too."""
     dag, table = build_lowered(circuit_to_dag(circuit))
     if optimize:
-        merge_collectors(dag)
         absorb_dressing(dag)
+        merge_collectors(dag)
     return lower(dag, table)
 
 

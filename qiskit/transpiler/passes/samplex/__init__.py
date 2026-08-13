@@ -23,17 +23,25 @@ work and the passes below compose in a :class:`~qiskit.transpiler.PassManager`::
 
     PassManager([
         SamplexBuild(),
-        SamplexMergeCollectors(),   # optional; fewer, wider dressing layers
         SamplexAbsorbDressing(),
+        SamplexMergeCollectors(),   # optional; fewer, wider dressing layers
         SamplexLower(),
     ])
 
-Two ordering constraints are real rather than conventional. :class:`SamplexLower` mints the
+Three ordering constraints are real rather than conventional. :class:`SamplexLower` mints the
 template's parameters, so anything that changes how many collectors exist or how wide they are has to
 run before it -- lowering *unmerged* IR2 is correct but uses more dressing layers than it needs,
 while merging after lowering invalidates the labels already assigned. And :class:`SamplexLower`
 consumes the distribution table :class:`SamplexBuild` puts in the property set, so it cannot run
 without it.
+
+The third is between the two optimizations, and it costs rather than breaks:
+:class:`SamplexMergeCollectors` should follow :class:`SamplexAbsorbDressing`. Absorption is what
+*clears* the emissions and foldable gates sitting between two collectors, and merging one collector
+into another is refused while anything sits between them -- so merging first simply finds less to do.
+On a box nested inside another, running it first costs half the dressing layers: four collectors and
+24 template parameters where absorbing first gives two and 12. Both orders produce valid IR2, and
+merging remains freely *omitted*; it is only not freely *reordered*.
 
 These passes are deliberately not re-exported from :mod:`qiskit.transpiler.passes`: samplex has no
 stable Python surface yet, and importing from this module is what keeps that explicit.

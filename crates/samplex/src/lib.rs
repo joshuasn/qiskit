@@ -24,9 +24,15 @@
 //!   --merge_parallel_nodes, prune, set_virtual_types-->
 //! ```
 //!
-//! Each root module holds one stage's vocabulary; each file under [`passes`] is one transform.
-//! `absorb_dressing` must precede `merge_collectors` (merging concatenates collector bodies), and
-//! both must precede `lower` (which mints the template's parameters).
+//! Each root module holds one stage's vocabulary; each file under [`passes`] is one transform. Both
+//! optimizations must precede `lower`, which mints the template's parameters.
+//!
+//! `absorb_dressing` should precede `merge_collectors`, and the reason is what merging needs rather
+//! than what it does to bodies: two collectors merge only with nothing between them, and absorption is
+//! what clears what is — the twirl pairs, frame changes and foldable gates that otherwise sit there.
+//! Run the other way round and merging finds less to do; on a nested box, four collectors and 24
+//! template parameters where this order gives two and 12. Both orders produce valid IR2, so this is a
+//! cost rather than a rule, and merging is freely omitted either way.
 //!
 //! IR3 is plain data: the IR3 passes hold no `Python` token, and lowering pays the GIL once at the
 //! IR2 boundary.

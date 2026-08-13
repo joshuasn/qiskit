@@ -22,14 +22,18 @@ class SamplexMergeCollectors(TransformationPass):
     Build is local, so N boxes in a row arrive with 2N collectors. Where two are adjacent on a shared
     wire with nothing in between, they contract into one collector spanning the union of their qubits
     -- so N boxes need N+1 dressing layers rather than 2N. On the four-qubit notebook circuit that is
-    six collectors and 48 template parameters down to four and 36.
+    six collectors and 48 template parameters down to four and 36. A collector nested inside a box is
+    folded into the one just outside it by the same reasoning, which is a layer per nesting level.
 
     This is an optimization, not a correctness requirement: :class:`.SamplexLower` handles unmerged
     IR2 perfectly well, just with more dressing layers than necessary. It is only invalid the other way
     round -- merging after lowering would invalidate parameter labels already minted -- so the pass is
-    freely switchable but must precede lowering.
+    freely omitted but must precede lowering.
 
-    Runs in place and may be composed either side of :class:`.SamplexAbsorbDressing`.
+    Runs in place, and is best run *after* :class:`.SamplexAbsorbDressing`. Two collectors merge only
+    with nothing between them, and absorption is what clears what is: run first instead and this pass
+    finds less to do -- on a nested box, four collectors and 24 parameters where the other order gives
+    two and 12. Freely omitted, then, but not freely reordered.
     """
 
     def run(self, dag):

@@ -247,58 +247,66 @@ class TestNearestCompatibleCollectorWins(QiskitTestCase):
 
 
 class TestAbsorptionWithMerge(QiskitTestCase):
-    """Absorption composes correctly with merge_collectors."""
+    """Absorption composes with `merge_collectors` either way round, but not equally well.
 
-    def test_absorb_then_merge(self):
+    Both orders produce valid IR2 — an unmerged or unabsorbed circuit is unoptimized, not wrong. What
+    differs is how much merging finds: two collectors merge only with nothing between them, and
+    absorption is what clears what is. So absorbing first can only help, and on a nested box it halves
+    the dressing layers.
+    """
+
+    def two_siblings(self):
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(dressing="right")]):
             circuit.cx(0, 1)
         with circuit.box([Twirl(dressing="left")]):
             circuit.cx(0, 1)
-        dag, _table = build_lowered(circuit_to_dag(circuit))
-        absorb_dressing(dag)
-        merge_collectors(dag)
-        ir2 = dag_to_circuit(dag)
-        # The two adjacent near-half collectors merge into one middle collector.
-        # Outer collectors with no content are elided.
-        colls = collectors(ir2)
-        self.assertGreaterEqual(len(colls), 1)
+        return circuit
 
-    def test_merge_then_absorb(self):
+    def nested(self):
         circuit = QuantumCircuit(2)
-        with circuit.box([Twirl(dressing="right")]):
-            circuit.cx(0, 1)
         with circuit.box([Twirl(dressing="left")]):
-            circuit.cx(0, 1)
+            with circuit.box([Twirl(dressing="left")]):
+                circuit.cx(0, 1)
+        return circuit
+
+    def both_orders(self, circuit):
+        """`(absorb-then-merge, merge-then-absorb)` for the same input."""
         dag, _table = build_lowered(circuit_to_dag(circuit))
-        merge_collectors(dag)
-        absorb_dressing(dag)
-        ir2 = dag_to_circuit(dag)
-        colls = collectors(ir2)
-        self.assertGreaterEqual(len(colls), 1)
+        # The passes mutate in place, so each ordering gets its own copy.
+        first = copy.copy(dag)
+        absorb_dressing(first)
+        merge_collectors(first)
+        second = copy.copy(dag)
+        merge_collectors(second)
+        absorb_dressing(second)
+        return dag_to_circuit(first), dag_to_circuit(second)
 
-    def test_order_independence_emit_count(self):
-        circuit = QuantumCircuit(2)
-        with circuit.box([Twirl(dressing="right")]):
-            circuit.cx(0, 1)
-        with circuit.box([Twirl(dressing="left")]):
-            circuit.cx(0, 1)
-        dag, _table = build_lowered(circuit_to_dag(circuit))
+    def test_the_orders_agree_without_nesting(self):
+        absorbed_first, merged_first = self.both_orders(self.two_siblings())
+        self.assertEqual(len(collectors(absorbed_first)), len(collectors(merged_first)))
 
-        # The passes mutate in place, so each ordering gets its own copy of the same input.
-        am = copy.copy(dag)
-        merge_collectors(am)
-        absorb_dressing(am)
+    def test_absorbing_first_merges_at_least_as_much(self):
+        for name, circuit in (("siblings", self.two_siblings()), ("nested", self.nested())):
+            with self.subTest(shape=name):
+                absorbed_first, merged_first = self.both_orders(circuit)
+                self.assertLessEqual(
+                    len(collectors(absorbed_first)),
+                    len(collectors(merged_first)),
+                    "absorbing first cannot merge less: it only removes things from between collectors",
+                )
 
-        ma = copy.copy(dag)
-        absorb_dressing(ma)
-        merge_collectors(ma)
+    def test_nesting_is_where_the_order_costs_something(self):
+        absorbed_first, merged_first = self.both_orders(self.nested())
+        self.assertEqual(len(collectors(absorbed_first)), 2)
+        self.assertEqual(len(collectors(merged_first)), 4)
 
-        ir2_am = dag_to_circuit(am)
-        ir2_ma = dag_to_circuit(ma)
-
-        # Same number of standalone emits remain either way
-        self.assertEqual(len(emits(ir2_am)), len(emits(ir2_ma)))
+    def test_the_standalone_emission_count_is_order_independent(self):
+        """Merging changes how many collectors there are, never how many emissions still travel."""
+        for name, circuit in (("siblings", self.two_siblings()), ("nested", self.nested())):
+            with self.subTest(shape=name):
+                absorbed_first, merged_first = self.both_orders(circuit)
+                self.assertEqual(len(emits(absorbed_first)), len(emits(merged_first)))
 
 
 class TestAbsorptionPreservesCompositionOrder(QiskitTestCase):

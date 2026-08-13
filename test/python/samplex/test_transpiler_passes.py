@@ -55,19 +55,19 @@ def notebook_circuit():
 
 
 def pipeline(merge=True):
-    passes = [SamplexBuild()]
+    passes = [SamplexBuild(), SamplexAbsorbDressing()]
     if merge:
         passes.append(SamplexMergeCollectors())
-    passes += [SamplexAbsorbDressing(), SamplexLower()]
+    passes.append(SamplexLower())
     return PassManager(passes)
 
 
 def directly(circuit, merge=True):
     """The same lowering, called straight through the Rust entry points."""
     dag, table = build_lowered(circuit_to_dag(circuit))
+    absorb_dressing(dag)
     if merge:
         merge_collectors(dag)
-    absorb_dressing(dag)
     return lower(dag, table)
 
 

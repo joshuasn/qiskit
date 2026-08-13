@@ -64,24 +64,23 @@ def build(circuit):
 
 
 def merged(circuit):
-    """The emission circuit after merging (absorb happens after merge)."""
-    dag, table = build_lowered(circuit_to_dag(circuit))
-    merge_collectors(dag)
-    absorb_dressing(dag)
-    return dag_to_circuit(dag), table
+    """The emission circuit after absorbing and then merging, which is the order to prefer.
 
-
-def dressed_then_merged(circuit):
-    """The emission circuit in the documented pass order: absorb, then merge.
-
-    Promotion works either way round, but it finds more to do in this order — not because it asks whether
-    absorption has run, but because absorption *removes* things from between two collectors. An emission
-    or a foldable gate still sitting there refuses the transfer on adjacency alone, so the same circuit
-    can promote after absorption where it could not before.
+    Merging needs nothing between two collectors, and absorption is what clears what is, so this order
+    finds strictly more to merge. `merge_then_absorbed` is the other way round, for the tests that are
+    about the ordering itself.
     """
     dag, table = build_lowered(circuit_to_dag(circuit))
     absorb_dressing(dag)
     merge_collectors(dag)
+    return dag_to_circuit(dag), table
+
+
+def merge_then_absorbed(circuit):
+    """The reverse order: valid IR2, just less merged."""
+    dag, table = build_lowered(circuit_to_dag(circuit))
+    merge_collectors(dag)
+    absorb_dressing(dag)
     return dag_to_circuit(dag), table
 
 
@@ -255,21 +254,27 @@ class TestMergeBarriers(QiskitTestCase):
 
 
 class TestScopes(QiskitTestCase):
-    """Merging is confined to one box scope."""
+    """The *contraction* is confined to one box scope; crossing a boundary is promotion's job.
 
-    def test_nested_collector_is_not_promoted_out_of_its_box(self):
-        # Cross-boundary merging is deliberately out of scope: it would take the inner box's
-        # absorbed gates off the spine, so the outer factor's propagation through them would have
-        # to be recorded.
+    Two mechanisms, and only one of them contracts. Siblings in one scope fuse into a single node whose
+    qargs are the union of theirs, which is what `DAGCircuit::replace_block` is for and what makes
+    widening possible. A collector nested inside a box cannot be contracted with one outside it — no
+    primitive spans two DAGs — so it is folded in instead: its body moves and it is deleted. See
+    TestPromotion.
+    """
+
+    def test_a_nested_collector_leaves_by_promotion_not_contraction(self):
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl()]):
             with circuit.box([Twirl()]):
                 circuit.cx(0, 1)
         out, _ = merged(circuit)
 
+        # The inner box's collectors are gone, folded into the enclosing pair, and the enclosing pair is
+        # still two nodes rather than one: nothing was contracted across the boundary.
         self.assertEqual(len(collectors(out)), 2)
-        (hard,) = content_boxes(out)
-        self.assertEqual(len(collectors(hard)), 2)
+        (content,) = content_boxes(out)
+        self.assertEqual(len(collectors(content)), 0)
 
     def test_siblings_inside_a_box_still_merge(self):
         circuit = QuantumCircuit(2)
@@ -280,9 +285,11 @@ class TestScopes(QiskitTestCase):
                 circuit.cx(0, 1)
         out, _ = merged(circuit)
 
-        (hard,) = content_boxes(out)
-        # the two inner boxes share a middle collector, just as siblings do at the top level
-        self.assertEqual(len(collectors(hard)), 3)
+        (content,) = content_boxes(out)
+        # The two inner boxes share a middle collector, just as siblings do at the top level. Two rather
+        # than three, because the first box's left collector is flush against the enclosing one and is
+        # promoted out of the box entirely.
+        self.assertEqual(len(collectors(content)), 2)
 
 
 class TestPreservation(QiskitTestCase):
@@ -433,7 +440,7 @@ class TestPromotion(QiskitTestCase):
                 circuit.cx(0, 1)
 
         before, _ = build(circuit)
-        after, _ = dressed_then_merged(circuit)
+        after, _ = merged(circuit)
         # Both sides go: the left one has nothing travelling its way, and the right one has only the inner
         # far half, which retargets to the outer collector rather than losing anything.
         self.assertEqual(len(all_collectors(before)), 4)
@@ -449,7 +456,7 @@ class TestPromotion(QiskitTestCase):
         with circuit.box([ChangeBasis("b", placement="start")]):
             with circuit.box([Twirl()]):
                 circuit.cx(0, 1)
-        after, table = dressed_then_merged(circuit)
+        after, table = merged(circuit)
 
         outer_left = collectors(after)[0]
         locals_ = body_locals(outer_left[1])
@@ -469,7 +476,7 @@ class TestPromotion(QiskitTestCase):
                 circuit.noop(0, 1)
 
         before, _ = build(circuit)
-        after, _ = dressed_then_merged(circuit)
+        after, _ = merged(circuit)
         self.assertEqual(len(all_collectors(before)), 4)
         self.assertEqual(len(all_collectors(after)), 2)
 
@@ -486,7 +493,7 @@ class TestPromotion(QiskitTestCase):
             with circuit.box([Twirl(dressing="left")]):
                 circuit.cx(0, 1)
 
-        after, _ = dressed_then_merged(circuit)
+        after, _ = merged(circuit)
         # The inner box's dressing layers both go: the left collector has nothing travelling its way, and
         # the right one has only the inner far half, which retargets rather than losing a conjugation.
         self.assertEqual(len(all_collectors(after)), 2)
@@ -503,7 +510,7 @@ class TestPromotion(QiskitTestCase):
         with circuit.box([ChangeBasis("b")]):
             with circuit.box([Twirl(dressing="left")]):
                 circuit.cx(0, 1)
-        after, _ = dressed_then_merged(circuit)
+        after, _ = merged(circuit)
 
         self.assertEqual(len(all_collectors(after)), 2)
         # The far half is still travelling — it has further to go now, not less.
@@ -523,7 +530,7 @@ class TestPromotion(QiskitTestCase):
             with circuit.box([Twirl(dressing="left")]):
                 circuit.cx(0, 1)
 
-        after, _ = dressed_then_merged(circuit)
+        after, _ = merged(circuit)
         self.assertEqual(len(all_collectors(after)), 4)
         self.assertEqual(len([e for e in emissions(after) if e.direction != "local"]), 2)
 
@@ -542,7 +549,7 @@ class TestPromotion(QiskitTestCase):
                 circuit.cx(0, 1)
 
         before, _ = build(circuit)
-        after, _ = dressed_then_merged(circuit)
+        after, _ = merged(circuit)
         self.assertEqual(len(all_collectors(before)), 4)
         self.assertEqual(len(all_collectors(after)), 2)
 
@@ -554,7 +561,7 @@ class TestPromotion(QiskitTestCase):
             with circuit.box([Twirl(dressing="left")]):
                 circuit.cx(0, 1)
 
-        after, _ = dressed_then_merged(circuit)
+        after, _ = merged(circuit)
         self.assertEqual(len(all_collectors(after)), 4)
 
     def test_promotion_is_transitive_across_two_levels(self):
@@ -566,7 +573,7 @@ class TestPromotion(QiskitTestCase):
                     circuit.cx(0, 1)
 
         before, _ = build(circuit)
-        after, _ = dressed_then_merged(circuit)
+        after, _ = merged(circuit)
         self.assertEqual(len(all_collectors(before)), 6)
         # Every level's collectors reach the outermost pair, one round per level.
         self.assertEqual(len(all_collectors(after)), 3)
@@ -577,7 +584,7 @@ class TestPromotion(QiskitTestCase):
         Merging an unabsorbed circuit is a valid thing to do, and promotion does fire there: every body is
         empty then, so the transfer is purely structural — delete a collector, let what it was catching
         arrive at the next one out. What it finds is *less*, because absorption is what clears the things
-        that refuse the transfer on adjacency; see `dressed_then_merged`.
+        that refuse the transfer on adjacency; see `merged`.
         """
         circuit = QuantumCircuit(2)
         with circuit.box([ChangeBasis("b", placement="start")]):
