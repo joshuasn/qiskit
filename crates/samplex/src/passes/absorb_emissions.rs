@@ -365,19 +365,29 @@ fn peek(
 /// Whether a gate inside a box is on the dressing side of that box's twirl point, as seen by a
 /// collector walking `direction`.
 ///
-/// Scan on along the gate's own wire, over the absorbable run it belongs to. An emission facing this
-/// collector at the end of that run means the run lies between the collector and the twirl point:
-/// those gates multiply into this dressing and nothing propagating ever crosses them. Anything else —
-/// content, a collector, the end of the body — means the run is on the far side of the twirl point, so
-/// it is content that an emission travelling this way is conjugated by. Folding that in would take it
-/// off the propagation path, which is sound only if the incoming emission is composed on the far side
-/// of it, and nothing implements that yet.
+/// **A box with no emission in it has no twirl point to be on the wrong side of**, so its whole
+/// absorbable run is fair game. That is the ordinary shape of a box carrying only a `ChangeBasis`: the
+/// frame change names the box's edge, so it is written on the spine outside, and nothing propagates
+/// within the body at all. Nothing there can be on an emission's path, so nothing there can be taken
+/// off one. An enclosing box's emission crossing the body is unaffected — this collector is foreign to
+/// it, so the gates are still crossed rather than composed.
+///
+/// Otherwise scan on along the gate's own wire, over the absorbable run it belongs to. An emission
+/// facing this collector at the end of that run means the run lies between the collector and the twirl
+/// point: those gates multiply into this dressing and nothing propagating ever crosses them. Anything
+/// else — content, a collector, the end of the body — means the run is on the far side of the twirl
+/// point, so it is content that an emission travelling this way is conjugated by. Folding that in would
+/// take it off the propagation path, which is sound only if the incoming emission is composed on the far
+/// side of it, and nothing implements that yet.
 fn on_dressing_side(
     dag: &DAGCircuit,
     site: &Site,
     direction: Direction,
     facing: Direction,
 ) -> PyResult<bool> {
+    if !holds_any_emission(dag)? {
+        return Ok(true);
+    }
     let inst = dag.dag()[site.node].unwrap_operation();
     // Absorbable gates are single-qubit, so the run this one belongs to is on one wire.
     let Some(wire) = dag.qargs_interner().get(inst.qubits).first().copied() else {
@@ -395,6 +405,19 @@ fn on_dressing_side(
         at = next;
     }
     Ok(false)
+}
+
+/// Whether this body holds an emission of its own.
+///
+/// This scope only, deliberately. A nested box's emissions are fenced by that box's own collectors —
+/// build writes them before its emissions on either side — so they resolve inside it and never reach a
+/// gate in the enclosing body. Descending would count them anyway and cost the fold: a `ChangeBasis` box
+/// wrapping a twirled one would look occupied by the inner box's twirl point and stop folding its own
+/// absorbable run, which is exactly the case this is here to allow.
+fn holds_any_emission(dag: &DAGCircuit) -> PyResult<bool> {
+    Ok(dag
+        .op_nodes(true)
+        .any(|(_, inst)| emission_spec(inst).is_some()))
 }
 
 /// Lift wires from the scope a site lives in up into the frame of the collector absorbing it.

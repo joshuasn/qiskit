@@ -22,6 +22,8 @@ pub enum LowerError {
     DuplicateAnnotation(AnnotationKind),
     #[error("InjectNoise requires a Twirl on the same box.")]
     InjectNoiseWithoutTwirl,
+    #[error("InjectLocalClifford requires a Twirl on the same box.")]
+    InjectLocalCliffordWithoutTwirl,
     #[error("ChangeBasis and InjectLocalClifford are mutually exclusive on the same box.")]
     ChangeBasisConflict,
 }

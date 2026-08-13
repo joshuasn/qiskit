@@ -376,16 +376,17 @@ class TestBuildShape(QiskitTestCase):
         self.assertTrue(body_locals(right_coll[1]))
 
     def test_inject_local_clifford_resolves_to_a_basis_change(self):
+        # Needs a `Twirl` beside it: an injection happens *to* a twirled box's content, so it means
+        # nothing on its own. What is under test is the resolution, not the pairing.
         circuit = QuantumCircuit(1)
-        with circuit.box([InjectLocalClifford("c3", "before")]):
+        with circuit.box([Twirl(), InjectLocalClifford("c3", "before")]):
             circuit.h(0)
         lowered, table = lower(circuit)
 
-        (emit,) = emissions(lowered)
-        self.assertEqual(emit.source(table), "change_basis")
-        self.assertEqual(emit.direction, "left")
-        self.assertEqual(emit.virtual_type(table), "c1")
-        self.assertIn("local_cliffords.c3", table.entries()[0])
+        injected = next(e for e in emissions(lowered) if e.source(table) == "change_basis")
+        self.assertEqual(injected.direction, "left")  # site="before"
+        self.assertEqual(injected.virtual_type(table), "c1")
+        self.assertTrue(any("local_cliffords.c3" in entry for entry in table.entries()))
 
     def test_tag_only_box_is_transparent(self):
         circuit = QuantumCircuit(1)
@@ -405,6 +406,46 @@ class TestBuildShape(QiskitTestCase):
             circuit.cx(0, 1)
         lowered, _ = lower(circuit)
         self.assertEqual(gate_names(lowered), ["cx"])
+
+
+class TestABoxWithoutATwirlStillHasADressing(QiskitTestCase):
+    """A `ChangeBasis` box folds its absorbable run, and it is the only annotation that stands alone.
+
+    It used to fold nothing. A dressing came only from a `Twirl`, and without one `classify_body` marked
+    every node content, so such a box had two collectors, a body, and no way for the body to reach them.
+    What actually unlocks the folding is that a box with no emission *inside* it has no twirl point to be
+    on the wrong side of, so its whole absorbable run is fair game — and a frame change names the box's
+    edge, so it is written on the spine outside rather than in the body.
+    """
+
+    def test_the_absorbable_run_folds_from_both_ends(self):
+        for placement in ("start", "end"):
+            with self.subTest(placement=placement):
+                circuit = QuantumCircuit(2)
+                with circuit.box([ChangeBasis("b", placement=placement)]):
+                    circuit.h(0)
+                    circuit.cx(0, 1)
+                    circuit.s(1)
+                lowered, _ = lower_absorbed(circuit)
+
+                left, right = collectors(lowered)
+                # Nothing propagates within the box, so both ends fold and only the entangler is left.
+                self.assertEqual(real_gates(left[1]), ["h"])
+                self.assertEqual(real_gates(right[1]), ["s"])
+                (content,) = content_boxes(lowered)
+                self.assertEqual(real_gates(content), ["cx"])
+
+    def test_the_frame_change_lands_on_the_edge_its_placement_names(self):
+        for placement, expect_left in (("start", True), ("end", False)):
+            with self.subTest(placement=placement):
+                circuit = QuantumCircuit(1)
+                with circuit.box([ChangeBasis("b", placement=placement)]):
+                    circuit.h(0)
+                lowered, _ = lower_absorbed(circuit)
+
+                left, right = collectors(lowered)
+                self.assertEqual(bool(body_locals(left[1])), expect_left)
+                self.assertEqual(bool(body_locals(right[1])), not expect_left)
 
 
 class TestEasyHardSplit(QiskitTestCase):
@@ -728,6 +769,18 @@ class TestRejections(QiskitTestCase):
         with circuit.box([InjectNoise("n0")]):
             circuit.h(0)
         with self.assertRaisesRegex(ValueError, "InjectNoise requires a Twirl"):
+            lower(circuit)
+
+    def test_inject_local_clifford_without_twirl_is_rejected(self):
+        """Both injections happen *to* a twirled box's content, so neither stands alone.
+
+        A `ChangeBasis` is the exception, and the difference is what `BasisOrigin` records: it names a
+        frame change for the box as a whole rather than something done to its content.
+        """
+        circuit = QuantumCircuit(1)
+        with circuit.box([InjectLocalClifford("c0")]):
+            circuit.h(0)
+        with self.assertRaisesRegex(ValueError, "InjectLocalClifford requires a Twirl"):
             lower(circuit)
 
     def test_change_basis_and_inject_local_clifford_conflict(self):

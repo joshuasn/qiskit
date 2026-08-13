@@ -501,6 +501,25 @@ class TestPromotion(QiskitTestCase):
         # And the inner far half is still travelling.
         self.assertEqual(len([e for e in emissions(after) if e.direction != "local"]), 1)
 
+    def test_a_foldable_gate_in_between_does_not_block_promotion(self):
+        """A gate between the two collectors blocks promotion only if it is still there.
+
+        The enclosing box carries no twirl, so it has no twirl point for the `h` to be on the wrong side
+        of, and the whole absorbable run folds into its collector. Nothing is left between the two
+        collectors, so the inner one can leave. Before a frame change named its own dressing, that `h`
+        stayed put and refused this.
+        """
+        circuit = QuantumCircuit(2)
+        with circuit.box([ChangeBasis("b", placement="start")]):
+            circuit.h(0)
+            with circuit.box([Twirl()]):
+                circuit.cx(0, 1)
+
+        before, _ = build(circuit)
+        after, _ = dressed_then_merged(circuit)
+        self.assertEqual(len(all_collectors(before)), 4)
+        self.assertEqual(len(all_collectors(after)), 3)
+
     def test_an_emission_in_between_blocks_promotion(self):
         """The outer box's own far half is standalone and sits between the two collectors."""
         circuit = QuantumCircuit(2)

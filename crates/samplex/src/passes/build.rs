@@ -55,8 +55,11 @@ use crate::virtual_flow_graph::Direction;
 
 use super::utils::{IntoPyResult, append, new_dag_body};
 
-/// The synthesizer assumed when a box's annotations do not name one, which only
-/// `InjectLocalClifford` leaves open. Matches every other annotation's own default.
+/// The synthesizer assumed when a box's annotations do not name one.
+///
+/// Unreachable as things stand: `InjectLocalClifford` is the only annotation that names no synthesizer
+/// and it cannot stand without a `Twirl`, which does. Kept as the stated default rather than an
+/// `expect`, so adding an annotation that names none is a silent sensible choice rather than a panic.
 const DEFAULT_SYNTHESIZER: SynthesizerType = SynthesizerType::RzSx;
 
 /// How deeply an emission nests inside its box, `0` being immediately against the content box.

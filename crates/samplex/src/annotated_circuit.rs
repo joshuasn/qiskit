@@ -268,8 +268,15 @@ pub fn resolve_annotations(annotations: &[BoxAnnotation]) -> Result<ResolvedBox,
     {
         return Err(LowerError::ChangeBasisConflict);
     }
+    // Both injections happen *to* a twirled box's content, sitting just outside its twirl point, so
+    // neither means anything without one. A `ChangeBasis` is the only annotation that stands alone: it
+    // names a frame change for the box as a whole.
     if seen.contains(&AnnotationKind::InjectNoise) && !seen.contains(&AnnotationKind::Twirl) {
         return Err(LowerError::InjectNoiseWithoutTwirl);
+    }
+    if seen.contains(&AnnotationKind::InjectLocalClifford) && !seen.contains(&AnnotationKind::Twirl)
+    {
+        return Err(LowerError::InjectLocalCliffordWithoutTwirl);
     }
 
     let mut resolved = ResolvedBox::default();
@@ -303,8 +310,24 @@ pub fn resolve_annotations(annotations: &[BoxAnnotation]) -> Result<ResolvedBox,
         }
     }
 
-    // Only `Twirl` and `ChangeBasis` name a synthesizer; `InjectLocalClifford` does not, so a box
-    // carrying only that one leaves this `None` and the consumer picks its own default.
+    // A dressing is the edge a box's absorbable run folds to. A `Twirl` names it outright, since the
+    // dressing edge is where its pair sits; a `ChangeBasis` standing alone names it by its placement,
+    // which is the only edge such a box has. Without one, nothing in the body could fold anywhere:
+    // `classify_body` treats an undressed box as all content.
+    if resolved.dressing.is_none() {
+        resolved.dressing = resolved
+            .change_basis
+            .as_ref()
+            .map(|basis| match basis.placement {
+                Placement::Start => Dressing::Left,
+                Placement::End => Dressing::Right,
+            });
+    }
+
+    // Only `Twirl` and `ChangeBasis` name a synthesizer; `InjectLocalClifford` does not, which is part
+    // of why it needs a `Twirl` beside it. Every *emitting* box therefore names one — an emission needs
+    // a twirl, a frame change, or a noise injection, and the first two carry a synthesizer while the
+    // third requires a twirl — so a consumer's fallback is unreachable rather than merely unused.
     resolved.synthesizer = annotations
         .iter()
         .find_map(|a| match a {
@@ -547,17 +570,55 @@ mod tests {
 
     #[test]
     fn test_resolve_inject_local_clifford() {
-        let resolved = resolve_annotations(&[BoxAnnotation::InjectLocalClifford(
-            InjectLocalCliffordSpec {
+        // Needs a twirl beside it: an injection happens *to* a twirled box's content.
+        let resolved = resolve_annotations(&[
+            twirl(DistributionType::UniformPauli),
+            BoxAnnotation::InjectLocalClifford(InjectLocalCliffordSpec {
                 reference: "c3".to_string(),
                 site: InjectionSite::Before,
-            },
-        )])
+            }),
+        ])
         .unwrap();
         let cb = resolved.change_basis.unwrap();
         assert_eq!(cb.mode, ChangeBasisMode::LocalClifford);
         assert_eq!(cb.ref_id, "local_cliffords.c3");
         assert_eq!(cb.placement, Placement::Start);
+    }
+
+    #[test]
+    fn test_resolve_inject_local_clifford_without_twirl_errors() {
+        let err = resolve_annotations(&[BoxAnnotation::InjectLocalClifford(
+            InjectLocalCliffordSpec {
+                reference: "c3".to_string(),
+                site: InjectionSite::Before,
+            },
+        )])
+        .unwrap_err();
+        assert_eq!(err, LowerError::InjectLocalCliffordWithoutTwirl);
+    }
+
+    #[test]
+    fn test_resolve_change_basis_alone_dresses_by_placement() {
+        // The one annotation that stands alone, so the one that has to name its own dressing edge.
+        for (placement, expected) in [
+            (Placement::Start, Dressing::Left),
+            (Placement::End, Dressing::Right),
+        ] {
+            let resolved = resolve_annotations(&[change_basis("b", placement)]).unwrap();
+            assert_eq!(resolved.dressing, Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_a_twirl_names_the_dressing_over_any_placement() {
+        let resolved = resolve_annotations(&[
+            twirl(DistributionType::UniformPauli),
+            change_basis("b", Placement::End),
+        ])
+        .unwrap();
+        // The twirl's own edge wins: that is where its pair sits, and the pair is what the dressing is
+        // for. A `ChangeBasis` only names it when there is no twirl to.
+        assert_eq!(resolved.dressing, Some(Dressing::Left));
     }
 
     #[test]
