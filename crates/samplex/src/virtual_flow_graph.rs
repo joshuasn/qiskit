@@ -10,10 +10,10 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
-use pyo3::prelude::*;
-use qiskit_circuit::standard_gate::StandardGate;
 use hashbrown::HashMap;
+use pyo3::prelude::*;
 use qiskit_circuit::operations::Operation;
+use qiskit_circuit::standard_gate::StandardGate;
 use rustworkx_core::petgraph::stable_graph::{NodeIndex, StableDiGraph};
 
 use crate::distributions::{DistEntry, DistKey, DistributionTable};
@@ -77,10 +77,64 @@ impl Edge {
 
 // --- Node structures ---
 
+/// One node of the sampling graph: what happens, and on which circuit qubits.
+///
+/// A node names its qubits itself, unlike the IR2 instructions it came from — there is no qargs list
+/// here to read them off — and its `partition` indexes into that list.
 #[derive(Debug, Clone)]
 pub struct Node {
+    /// The circuit qubits this node acts on.
+    pub qubits: Vec<usize>,
+    /// How those qubits group into jointly-sampled subsystems, by index into `qubits`.
     pub partition: Partition,
     pub kind: NodeKind,
+}
+
+impl Node {
+    /// A node with an explicit grouping of its qubits.
+    ///
+    /// Panics if the partition is not of `qubits.len()` — the two travel together, so a mismatch is a
+    /// bug in whichever pass built them.
+    pub fn new(qubits: Vec<usize>, partition: Partition, kind: NodeKind) -> Self {
+        assert_eq!(
+            qubits.len(),
+            partition.num_qubits(),
+            "a partition of {} qubits cannot describe a node on {:?}",
+            partition.num_qubits(),
+            qubits,
+        );
+        Node {
+            qubits,
+            partition,
+            kind,
+        }
+    }
+
+    /// A node sampling each of its qubits on its own: the common case.
+    pub fn singletons(qubits: Vec<usize>, kind: NodeKind) -> Self {
+        let partition = Partition::singletons(qubits.len());
+        Node {
+            qubits,
+            partition,
+            kind,
+        }
+    }
+
+    /// A node holding all its qubits in one joint subsystem, as a multi-qubit gate's conjugation
+    /// does.
+    pub fn joint(qubits: Vec<usize>, kind: NodeKind) -> Self {
+        let partition = Partition::whole(qubits.len());
+        Node {
+            qubits,
+            partition,
+            kind,
+        }
+    }
+
+    /// This node's subsystems, as circuit qubits.
+    pub fn groups(&self) -> Vec<Vec<usize>> {
+        self.partition.groups(&self.qubits)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -160,10 +214,19 @@ pub struct AbsorbedGate {
 /// It gets no [`Emission`] node, since there is no chain to model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalEmission {
-    /// Circuit qubits, grouped into subsystems.
+    /// The circuit qubits this emission covers.
+    pub qubits: Vec<usize>,
+    /// How those qubits group into subsystems, by index into `qubits`.
     pub partition: Partition,
     /// Per-part descriptors, parallel with `partition.iter()`.
     pub parts: Vec<EmitPart>,
+}
+
+impl LocalEmission {
+    /// This emission's subsystems, as circuit qubits.
+    pub fn groups(&self) -> Vec<Vec<usize>> {
+        self.partition.groups(&self.qubits)
+    }
 }
 
 /// One step in what a collector composes, in the order given by [`Collect::steps`].
@@ -219,7 +282,6 @@ pub struct Measure {
     pub clbit_indices: Vec<usize>,
 }
 
-
 // --- Graph container ---
 
 #[pyclass(module = "qiskit._accelerate.samplex", skip_from_py_object)]
@@ -269,7 +331,9 @@ impl VirtualFlowGraph {
             .node_indices()
             .map(|index| {
                 let node = &self.graph[index];
-                let mut qubits: Vec<usize> = node.partition.all_elements().iter().copied().collect();
+                // Ascending, not the node's own order: this is a flat readout for inspection, so it
+                // should not vary with how a pass happened to lay the qubits out.
+                let mut qubits: Vec<usize> = node.qubits.clone();
                 qubits.sort_unstable();
                 let (kind, params, absorbed) = match &node.kind {
                     NodeKind::Emission(emission) => {
@@ -283,8 +347,7 @@ impl VirtualFlowGraph {
                             .iter()
                             .map(|step| match step {
                                 CollectStep::Local(local) => {
-                                    let mut qs: Vec<usize> =
-                                        local.partition.all_elements().iter().copied().collect();
+                                    let mut qs: Vec<usize> = local.qubits.clone();
                                     qs.sort_unstable();
                                     ("emit".to_string(), qs, Vec::new())
                                 }
@@ -357,10 +420,14 @@ impl VirtualFlowGraph {
         let mut dot = String::new();
         writeln!(dot, "digraph VFG {{").unwrap();
         writeln!(dot, "    rankdir=TB;").unwrap();
-        writeln!(dot, "    node [shape=box, style=filled, fontname=\"Helvetica\"];").unwrap();
+        writeln!(
+            dot,
+            "    node [shape=box, style=filled, fontname=\"Helvetica\"];"
+        )
+        .unwrap();
 
         for (idx, node) in self.graph.node_references() {
-            let (label, color) = node_label_color(&node.kind, &node.partition, table);
+            let (label, color) = node_label_color(&node.kind, &node.qubits, &node.partition, table);
             writeln!(
                 dot,
                 "    n{} [label={}, fillcolor=\"{}\"];",
@@ -396,13 +463,15 @@ fn dot_escape(s: &str) -> String {
     format!("\"{}\"", escaped)
 }
 
-fn format_partition(partition: &Partition) -> String {
-    let parts: Vec<&[usize]> = partition.iter().collect();
-    if parts.iter().all(|p| p.len() == 1) {
-        let flat: Vec<usize> = parts.iter().map(|p| p[0]).collect();
+/// How a grouping of qubits reads in a rendered label: `[0, 1]` when each qubit stands alone, and
+/// `[[0, 1], [2, 3]]` when some are sampled jointly.
+fn format_groups(qubits: &[usize], partition: &Partition) -> String {
+    let groups = partition.groups(qubits);
+    if partition.is_singletons() {
+        let flat: Vec<usize> = groups.iter().map(|group| group[0]).collect();
         format!("{:?}", flat)
     } else {
-        format!("{:?}", parts)
+        format!("{:?}", groups)
     }
 }
 
@@ -440,14 +509,23 @@ fn collect_step_label(step: &CollectStep, table: Option<&DistributionTable>) -> 
                     None => format!("Emit(#{})", part.dist.0),
                 })
                 .unwrap_or_else(|| "Emit".to_string());
-            format!("{} {}", label, format_partition(&local.partition))
+            format!(
+                "{} {}",
+                label,
+                format_groups(&local.qubits, &local.partition)
+            )
         }
         CollectStep::Gate(gate) => {
             let params: Vec<String> = gate.params.iter().map(param_label).collect();
             if params.is_empty() {
                 format!("{} {:?}", gate.gate.name(), gate.qubits)
             } else {
-                format!("{}({}) {:?}", gate.gate.name(), params.join(", "), gate.qubits)
+                format!(
+                    "{}({}) {:?}",
+                    gate.gate.name(),
+                    params.join(", "),
+                    gate.qubits
+                )
             }
         }
     }
@@ -469,10 +547,11 @@ fn emission_label(key: DistKey, table: Option<&DistributionTable>) -> String {
 
 fn node_label_color(
     kind: &NodeKind,
+    node_qubits: &[usize],
     partition: &Partition,
     table: Option<&DistributionTable>,
 ) -> (String, &'static str) {
-    let qubits = format_partition(partition);
+    let qubits = format_groups(node_qubits, partition);
     match kind {
         // One node kind, but distinct colours: which annotation produced an emission is the first
         // thing you look for in a rendered graph.
@@ -488,7 +567,10 @@ fn node_label_color(
                 }
                 None => (format!("Emit(#{})", e.key.0), "#d9d9d9"),
             };
-            (format!("{} {} {}", label, e.direction.mark(), qubits), color)
+            (
+                format!("{} {} {}", label, e.direction.mark(), qubits),
+                color,
+            )
         }
         NodeKind::Collect(c) => {
             let mut label = format!("Collect({:?}) {}", c.synthesizer, qubits);
@@ -502,9 +584,10 @@ fn node_label_color(
             format!("{}{:?} {}", p.direction.mark(), p.gate, qubits),
             "#fffacd",
         ),
-        NodeKind::Measure(m) => {
-            (format!("Measure cl{:?} {}", m.clbit_indices, qubits), "#d5e8d4")
-        }
+        NodeKind::Measure(m) => (
+            format!("Measure cl{:?} {}", m.clbit_indices, qubits),
+            "#d5e8d4",
+        ),
         NodeKind::Reset => (format!("Reset {}", qubits), "#e1d5e7"),
     }
 }
@@ -523,7 +606,7 @@ mod tests {
     use crate::distributions::DistKey;
 
     fn make_partition(parts: &[&[usize]]) -> Partition {
-        Partition::with_parts(parts.iter().map(|p| p.to_vec().into_boxed_slice())).unwrap()
+        Partition::new(parts.iter().map(|p| p.to_vec().into_boxed_slice())).unwrap()
     }
 
     fn emission(key: DistKey, direction: Direction) -> Emission {
@@ -536,12 +619,31 @@ mod tests {
 
     #[test]
     fn test_construct_emission_node() {
-        let node = Node {
-            partition: Partition::from_elements([0, 1]),
-            kind: NodeKind::Emission(emission(DistKey(0), Direction::Right)),
-        };
+        let node = Node::singletons(
+            vec![0, 1],
+            NodeKind::Emission(emission(DistKey(0), Direction::Right)),
+        );
         assert_eq!(node.partition.len(), 2);
+        assert_eq!(node.groups(), vec![vec![0], vec![1]]);
         assert!(matches!(node.kind, NodeKind::Emission(_)));
+    }
+
+    #[test]
+    fn test_a_node_resolves_its_partition_against_its_own_qubits() {
+        // The partition holds indices, so the same one describes different subsystems depending on
+        // which wires the node landed on.
+        let kind = NodeKind::Emission(emission(DistKey(0), Direction::Right));
+        let node = Node::new(vec![4, 7, 2], make_partition(&[&[0], &[2, 1]]), kind);
+        assert_eq!(node.groups(), vec![vec![4], vec![2, 7]]);
+        assert_eq!(node.partition.num_qubits(), 3);
+    }
+
+    #[test]
+    fn test_a_node_rejects_a_partition_of_the_wrong_width() {
+        let kind = NodeKind::Reset;
+        let result =
+            std::panic::catch_unwind(|| Node::new(vec![0, 1], Partition::singletons(3), kind));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -573,13 +675,14 @@ mod tests {
 
     #[test]
     fn test_construct_propagate_node() {
-        let node = Node {
-            partition: make_partition(&[&[0, 1], &[2, 3]]),
-            kind: NodeKind::Propagate(Propagate {
+        let node = Node::new(
+            vec![0, 1, 2, 3],
+            make_partition(&[&[0, 1], &[2, 3]]),
+            NodeKind::Propagate(Propagate {
                 gate: StandardGate::CX,
                 direction: Direction::Right,
             }),
-        };
+        );
         assert_eq!(node.partition.len(), 2);
         if let NodeKind::Propagate(ref p) = node.kind {
             assert_eq!(p.gate, StandardGate::CX);
@@ -591,14 +694,14 @@ mod tests {
 
     #[test]
     fn test_construct_collect_node() {
-        let node = Node {
-            partition: Partition::from_elements([0, 1, 2]),
-            kind: NodeKind::Collect(Collect {
+        let node = Node::singletons(
+            vec![0, 1, 2],
+            NodeKind::Collect(Collect {
                 synthesizer: SynthesizerType::RzSx,
                 param_indices: vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
                 steps: Vec::new(),
             }),
-        };
+        );
         if let NodeKind::Collect(ref c) = node.kind {
             assert_eq!(c.param_indices.len(), 9);
         } else {
@@ -612,7 +715,8 @@ mod tests {
         // the label must name each step rather than only the collector itself.
         let steps = vec![
             CollectStep::Local(LocalEmission {
-                partition: make_partition(&[&[0]]),
+                qubits: vec![0],
+                partition: Partition::singletons(1),
                 parts: vec![EmitPart {
                     dist: DistKey(0),
                     draw: 0,
@@ -635,10 +739,11 @@ mod tests {
             param_indices: vec![0],
             steps,
         });
-        let partition = Partition::from_elements([0, 1, 2]);
+        let qubits = vec![0, 1, 2];
+        let partition = Partition::singletons(3);
 
         // Without a table, the local emission falls back to its raw key.
-        let (label, _color) = node_label_color(&kind, &partition, None);
+        let (label, _color) = node_label_color(&kind, &qubits, &partition, None);
         assert!(label.contains("\n  Emit(#0) [0]"), "label was: {label}");
         assert!(label.contains("\n  rz(3.14"), "label was: {label}");
         // A parameter-free gate gets no empty parens.
@@ -648,27 +753,39 @@ mod tests {
         // With a table, it resolves the same way a still-travelling Emit does.
         let mut table = DistributionTable::new();
         table.intern(DistEntry::Distribution(DistributionType::UniformPauli));
-        let (label, _color) = node_label_color(&kind, &partition, Some(&table));
-        assert!(label.contains("\n  Emit(UniformPauli) [0]"), "label was: {label}");
+        let (label, _color) = node_label_color(&kind, &qubits, &partition, Some(&table));
+        assert!(
+            label.contains("\n  Emit(UniformPauli) [0]"),
+            "label was: {label}"
+        );
+    }
+
+    #[test]
+    fn test_labels_show_joint_subsystems_as_groups() {
+        // A partition that is not all singletons is the whole reason a node carries one, so the label
+        // has to show the grouping rather than a flat qubit list.
+        let kind = NodeKind::Emission(emission(DistKey(0), Direction::Right));
+        let (label, _color) =
+            node_label_color(&kind, &[4, 7, 2], &make_partition(&[&[0, 1], &[2]]), None);
+        assert!(label.contains("[[4, 7], [2]]"), "label was: {label}");
+        let (label, _color) = node_label_color(&kind, &[4, 7], &Partition::singletons(2), None);
+        assert!(label.contains("[4, 7]"), "label was: {label}");
     }
 
     #[test]
     fn test_construct_measure_node() {
-        let node = Node {
-            partition: Partition::from_elements([0, 1]),
-            kind: NodeKind::Measure(Measure {
+        let node = Node::singletons(
+            vec![0, 1],
+            NodeKind::Measure(Measure {
                 clbit_indices: vec![0, 1],
             }),
-        };
+        );
         assert!(matches!(node.kind, NodeKind::Measure(_)));
     }
 
     #[test]
     fn test_construct_reset_node() {
-        let node = Node {
-            partition: Partition::from_elements([3]),
-            kind: NodeKind::Reset,
-        };
+        let node = Node::singletons(vec![3], NodeKind::Reset);
         assert!(matches!(node.kind, NodeKind::Reset));
     }
 
@@ -720,23 +837,22 @@ mod tests {
     fn test_graph_add_nodes_and_edges() {
         let mut vfg = VirtualFlowGraph::new();
 
-        let emit_idx = vfg.graph.add_node(Node {
-            partition: Partition::from_elements([0, 1]),
-            kind: NodeKind::Emission(emission(DistKey(0), Direction::Right)),
-        });
+        let emit_idx = vfg.graph.add_node(Node::singletons(
+            vec![0, 1],
+            NodeKind::Emission(emission(DistKey(0), Direction::Right)),
+        ));
 
-        let propagate_idx = vfg.graph.add_node(Node {
-            partition: make_partition(&[&[0, 1]]),
-            kind: NodeKind::Propagate(Propagate {
+        let propagate_idx = vfg.graph.add_node(Node::joint(
+            vec![0, 1],
+            NodeKind::Propagate(Propagate {
                 gate: StandardGate::CX,
                 direction: Direction::Right,
             }),
-        });
+        ));
 
-        let collect_idx = vfg.graph.add_node(Node {
-            partition: Partition::from_elements([0, 1]),
-            kind: collect_kind(),
-        });
+        let collect_idx = vfg
+            .graph
+            .add_node(Node::singletons(vec![0, 1], collect_kind()));
 
         vfg.graph.add_edge(emit_idx, propagate_idx, Edge::new());
         vfg.graph.add_edge(emit_idx, collect_idx, Edge::new());

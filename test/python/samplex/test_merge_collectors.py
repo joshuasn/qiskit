@@ -35,6 +35,7 @@ from test.python.samplex.test_build import (
     collectors,
     content_boxes,
     emissions,
+    emissions_with_qubits,
     gate_names,
     is_collector,
     real_gates,
@@ -302,18 +303,14 @@ class TestPreservation(QiskitTestCase):
         # Only propagating (standalone) emissions have a position the test can pin down. An absorbed
         # local emission lives in a collector body alongside other content on disjoint qubits, where
         # relative order is deliberately unconstrained — see lower.rs's topological-order argument.
-        self.assertEqual(
-            [
-                (e.source(table), e.direction, tuple(e.qubits))
-                for e in emissions(before)
+        def propagating(circuit):
+            return [
+                (e.source(table), e.direction, tuple(q))
+                for e, q in emissions_with_qubits(circuit)
                 if e.direction != "local"
-            ],
-            [
-                (e.source(table), e.direction, tuple(e.qubits))
-                for e in emissions(after)
-                if e.direction != "local"
-            ],
-        )
+            ]
+
+        self.assertEqual(propagating(before), propagating(after))
 
     def test_emissions_are_preserved_through_merge(self):
         # Whether or not merge runs, the same propagating emissions remain standalone.

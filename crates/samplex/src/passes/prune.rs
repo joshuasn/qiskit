@@ -56,18 +56,13 @@ pub fn prune_unreachable_from_sources(vfg: &mut VirtualFlowGraph) {
 
 /// Remove nodes that cannot reach any sink: a `Collect` or a `Measure`.
 pub fn prune_unreachable_from_sinks(vfg: &mut VirtualFlowGraph) {
-    prune_unreachable(
-        vfg,
-        |kind| kind.is_sink(),
-        |g, n| ancestors(g, n).collect(),
-    );
+    prune_unreachable(vfg, |kind| kind.is_sink(), |g, n| ancestors(g, n).collect());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::distributions::DistKey;
-    use crate::partition::Partition;
     use crate::passes::test_fixtures::*;
     use crate::virtual_flow_graph::*;
 
@@ -177,10 +172,9 @@ mod tests {
     #[test]
     fn test_reset_is_source() {
         let mut vfg = VirtualFlowGraph::new();
-        let r = vfg.graph.add_node(Node {
-            partition: Partition::from_elements([0]),
-            kind: NodeKind::Reset,
-        });
+        let r = vfg
+            .graph
+            .add_node(Node::singletons(vec![0], NodeKind::Reset));
         let c = vfg.graph.add_node(collect_node(&[0]));
         vfg.graph.add_edge(r, c, Edge::new());
 

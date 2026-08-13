@@ -16,8 +16,8 @@ use pyo3::prelude::*;
 
 pub mod absorb_emissions;
 pub mod build;
-pub mod merge_collectors;
 pub mod lower;
+pub mod merge_collectors;
 mod merge_parallel_nodes;
 mod prune;
 mod set_virtual_types;

@@ -332,6 +332,8 @@ fn copy_with_qargs(
 /// One collector, flattened out of the circuit.
 struct CollectorInfo {
     qubits: Vec<usize>,
+    /// How those qubits group into subsystems, by index into `qubits`.
+    partition: Partition,
     synthesizer: SynthesizerType,
     param_indices: Vec<usize>,
     /// Everything this collector composes, in the order `flatten` read it out of the body.
@@ -348,7 +350,7 @@ impl CollectorInfo {
 
 /// The circuit as a flat sequence, which is what makes the propagation walk a simple scan.
 enum Event {
-    Emission(EmitSpec),
+    Emission(EmitSpec, Vec<usize>),
     Collector(usize),
     Gate(StandardGate, Vec<usize>),
     Measure(Vec<usize>, Vec<usize>),
@@ -395,14 +397,15 @@ pub fn build_sampling_graph(
     // Sinks first, so an emission's walk always has a node to terminate at.
     let mut collector_nodes = Vec::with_capacity(infos.len());
     for info in &infos {
-        collector_nodes.push(vfg.graph.add_node(Node {
-            partition: Partition::from_elements(info.qubits.iter().copied()),
-            kind: NodeKind::Collect(Collect {
+        collector_nodes.push(vfg.graph.add_node(Node::new(
+            info.qubits.clone(),
+            info.partition.clone(),
+            NodeKind::Collect(Collect {
                 synthesizer: info.synthesizer,
                 param_indices: info.param_indices.clone(),
                 steps: info.steps.clone(),
             }),
-        }));
+        )));
     }
 
     // One Propagate node per *conjugation*, created lazily and shared by the emissions for which it
@@ -414,26 +417,25 @@ pub fn build_sampling_graph(
 
     for (position, event) in events.iter().enumerate() {
         match event {
-            Event::Emission(spec) => {
-                let node = vfg.graph.add_node(Node {
-                    partition: spec.partition.clone(),
-                    kind: emission_kind(spec, table)?,
-                });
+            Event::Emission(spec, qubits) => {
+                let node = vfg.graph.add_node(Node::new(
+                    qubits.clone(),
+                    spec.partition.clone(),
+                    emission_kind(spec, table)?,
+                ));
                 emission_nodes.insert(position, node);
             }
             Event::Measure(qubits, clbits) => {
-                vfg.graph.add_node(Node {
-                    partition: Partition::from_elements(qubits.iter().copied()),
-                    kind: NodeKind::Measure(Measure {
+                vfg.graph.add_node(Node::singletons(
+                    qubits.clone(),
+                    NodeKind::Measure(Measure {
                         clbit_indices: clbits.clone(),
                     }),
-                });
+                ));
             }
             Event::Reset(qubits) => {
-                vfg.graph.add_node(Node {
-                    partition: Partition::from_elements(qubits.iter().copied()),
-                    kind: NodeKind::Reset,
-                });
+                vfg.graph
+                    .add_node(Node::singletons(qubits.clone(), NodeKind::Reset));
             }
             _ => {}
         }
@@ -443,7 +445,7 @@ pub fn build_sampling_graph(
     // Target resolution is purely positional: scan from the emission in its travel direction to
     // find the nearest compatible collector.
     for (position, event) in events.iter().enumerate() {
-        let Event::Emission(spec) = event else {
+        let Event::Emission(spec, qubits) = event else {
             continue;
         };
         let source = emission_nodes[&position];
@@ -458,13 +460,11 @@ pub fn build_sampling_graph(
         // broken between the two passes or a hand-built circuit has an emission nothing can collect,
         // which would otherwise show up as a randomization that is never undone — so it is reported
         // rather than skipped.
-        let target = scan_for_collector(&events, position, direction, spec, &infos, table)
+        let target = scan_for_collector(&events, position, direction, spec, qubits, &infos, table)
             .ok_or_else(|| {
                 PyValueError::new_err(format!(
-                    "emission on qubits {:?} travelling {:?} has no compatible collector ahead of \
-                     it; its randomization could not be undone",
-                    spec.qubits(),
-                    direction,
+                    "emission on qubits {qubits:?} travelling {direction:?} has no compatible \
+                     collector ahead of it; its randomization could not be undone",
                 ))
             })?;
         walk_emission(
@@ -472,6 +472,7 @@ pub fn build_sampling_graph(
             &events,
             position,
             spec,
+            qubits,
             source,
             target,
             collector_nodes[target],
@@ -489,11 +490,13 @@ pub fn build_sampling_graph(
 /// absorbed gates conjugate the emission on the way past — so an emission travels until it finds one
 /// that can take it, out of the box it started in and on through whatever it passes. Reaching the end
 /// of the circuit is the error case.
+#[allow(clippy::too_many_arguments)]
 fn scan_for_collector(
     events: &[Event],
     start: usize,
     direction: Direction,
     spec: &EmitSpec,
+    qubits: &[usize],
     infos: &[CollectorInfo],
     table: &DistributionTable,
 ) -> Option<usize> {
@@ -503,7 +506,7 @@ fn scan_for_collector(
     };
     for i in range {
         if let Event::Collector(index) = &events[i]
-            && compatible(&infos[*index], spec, table)
+            && compatible(&infos[*index], spec, qubits, table)
         {
             return Some(*index);
         }
@@ -517,7 +520,9 @@ fn scan_for_collector(
 /// Two conditions are in place:
 ///
 /// - It covers every qubit the emission acts on. A collector that covers only part of an emission
-///   could not synthesize the whole of what was emitted.
+///   could not synthesize the whole of what was emitted. The emission's qubits come from the walk
+///   rather than from the spec: a spec groups its *own qargs* by index and is shared by every
+///   placement of it, so it cannot know which wires it landed on.
 /// - Its synthesizer accepts the emission's virtual type, so the value it would have to produce is one
 ///   it can express.
 ///
@@ -534,8 +539,13 @@ fn scan_for_collector(
 /// walking rather than by consulting an id. Until then a nested twirl of the same group is collected
 /// early, and `test_sampling_graph.py::TestNestedPropagation` pins that provisional behaviour so the
 /// change of rule shows up as a test change rather than silently.
-fn compatible(info: &CollectorInfo, spec: &EmitSpec, table: &DistributionTable) -> bool {
-    spec.qubits().iter().all(|q| info.qubits.contains(q))
+fn compatible(
+    info: &CollectorInfo,
+    spec: &EmitSpec,
+    qubits: &[usize],
+    table: &DistributionTable,
+) -> bool {
+    qubits.iter().all(|q| info.qubits.contains(q))
         && info.synthesizer.accepts(spec.virtual_type(table))
 }
 
@@ -616,6 +626,12 @@ fn flatten(
                         "a collector body holds only absorbed gates and absorbed local emissions",
                     );
                     steps.push(CollectStep::Local(LocalEmission {
+                        qubits: body
+                            .qargs_interner()
+                            .get(gate.qubits)
+                            .iter()
+                            .map(|q| qubits[q.index()])
+                            .collect(),
                         partition: local.partition.clone(),
                         parts: local.parts.clone(),
                     }));
@@ -623,6 +639,7 @@ fn flatten(
             }
             events.push(Event::Collector(infos.len()));
             infos.push(CollectorInfo {
+                partition: spec.partition.clone(),
                 qubits,
                 synthesizer: spec.synthesizer(),
                 param_indices: Vec::new(),
@@ -632,7 +649,7 @@ fn flatten(
         }
 
         if let Some(spec) = emission_spec(inst) {
-            events.push(Event::Emission(spec));
+            events.push(Event::Emission(spec, qubits));
             continue;
         }
 
@@ -666,6 +683,7 @@ fn walk_emission(
     events: &[Event],
     from: usize,
     spec: &EmitSpec,
+    emission_qubits: &[usize],
     source: NodeIndex,
     target_index: usize,
     target_node: NodeIndex,
@@ -673,7 +691,7 @@ fn walk_emission(
     gate_nodes: &mut HashMap<GateKey, NodeIndex>,
     table: &DistributionTable,
 ) -> PyResult<()> {
-    let qubits: HashSet<usize> = spec.partition.all_elements().iter().copied().collect();
+    let qubits: HashSet<usize> = emission_qubits.iter().copied().collect();
     let mut frontier: HashMap<usize, NodeIndex> = qubits.iter().map(|q| (*q, source)).collect();
     let direction = spec.direction.expect(
         "a local emission never surfaces as a top-level Event::Emission — it lives inside its \
@@ -767,13 +785,12 @@ fn chain(
     }
     let key = (occurrence.0, occurrence.1, direction, virtual_type);
     let node = *gate_nodes.entry(key).or_insert_with(|| {
-        vfg.graph.add_node(Node {
-            partition: Partition::with_parts(std::iter::once(
-                gate_qubits.to_vec().into_boxed_slice(),
-            ))
-            .unwrap(),
-            kind: NodeKind::Propagate(Propagate { gate, direction }),
-        })
+        // One joint subsystem: a conjugation by a multi-qubit gate mixes its qubits, so they can
+        // only be evaluated together.
+        vfg.graph.add_node(Node::joint(
+            gate_qubits.to_vec(),
+            NodeKind::Propagate(Propagate { gate, direction }),
+        ))
     });
     let predecessors: HashSet<NodeIndex> = gate_qubits
         .iter()

@@ -14,7 +14,6 @@ use qiskit_circuit::standard_gate::StandardGate;
 
 use crate::annotated_circuit::{DistributionType, SynthesizerType};
 use crate::distributions::DistKey;
-use crate::partition::Partition;
 use crate::virtual_flow_graph::*;
 
 pub fn emit_node(qubits: &[usize]) -> Node {
@@ -22,25 +21,25 @@ pub fn emit_node(qubits: &[usize]) -> Node {
 }
 
 pub fn emission_node(qubits: &[usize], key: DistKey) -> Node {
-    Node {
-        partition: Partition::from_elements(qubits.iter().copied()),
-        kind: NodeKind::Emission(Emission {
+    Node::singletons(
+        qubits.to_vec(),
+        NodeKind::Emission(Emission {
             key,
             direction: Direction::Right,
             virtual_type: VirtualType::Pauli,
         }),
-    }
+    )
 }
 
 pub fn typed_emit_node(qubits: &[usize], distribution: DistributionType) -> Node {
-    Node {
-        partition: Partition::from_elements(qubits.iter().copied()),
-        kind: NodeKind::Emission(Emission {
+    Node::singletons(
+        qubits.to_vec(),
+        NodeKind::Emission(Emission {
             key: DistKey(0),
             direction: Direction::Right,
             virtual_type: distribution.virtual_type(),
         }),
-    }
+    )
 }
 
 pub fn propagate_node(qubits: &[usize]) -> Node {
@@ -48,29 +47,28 @@ pub fn propagate_node(qubits: &[usize]) -> Node {
 }
 
 pub fn propagate_node_with(qubits: &[usize], gate: StandardGate, direction: Direction) -> Node {
-    Node {
-        partition: Partition::with_parts(std::iter::once(qubits.to_vec().into_boxed_slice()))
-            .unwrap(),
-        kind: NodeKind::Propagate(Propagate { gate, direction }),
-    }
+    Node::joint(
+        qubits.to_vec(),
+        NodeKind::Propagate(Propagate { gate, direction }),
+    )
 }
 
 pub fn collect_node(qubits: &[usize]) -> Node {
-    Node {
-        partition: Partition::from_elements(qubits.iter().copied()),
-        kind: NodeKind::Collect(Collect {
+    Node::singletons(
+        qubits.to_vec(),
+        NodeKind::Collect(Collect {
             synthesizer: SynthesizerType::RzSx,
             param_indices: vec![],
             steps: Vec::new(),
         }),
-    }
+    )
 }
 
 pub fn measure_node(qubits: &[usize]) -> Node {
-    Node {
-        partition: Partition::from_elements(qubits.iter().copied()),
-        kind: NodeKind::Measure(Measure {
+    Node::singletons(
+        qubits.to_vec(),
+        NodeKind::Measure(Measure {
             clbit_indices: vec![0],
         }),
-    }
+    )
 }

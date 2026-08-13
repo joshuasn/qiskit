@@ -60,8 +60,14 @@ struct Group {
     frontier: HashSet<Qubit>,
     /// Every qubit this group covers, monotonically: the width the contracted box will have.
     span: HashSet<Qubit>,
-    /// Per-part descriptors accumulated from merged contributions.
-    partition: Partition,
+    /// The members' subsystems, as scope-frame qubits, in the order they were contributed.
+    ///
+    /// Qubits rather than indices because the members index into their own qargs, which is a
+    /// different frame each; [`partition`](Self::partition) puts them back into the contracted
+    /// node's.
+    subsystems: Vec<Vec<Qubit>>,
+    /// The descriptors the members share, taken from the first of them. [`find_mergeable`] admits a
+    /// member only if it agrees on the synthesizer, which is all these carry.
     parts: Vec<CollectPart>,
 }
 
@@ -73,6 +79,54 @@ impl Group {
         let mut qubits: Vec<Qubit> = self.span.iter().copied().collect();
         qubits.sort_unstable();
         qubits
+    }
+
+    /// How the contracted collector groups its span, as indices into [`frame`](Self::frame).
+    ///
+    /// Members can overlap, and two subsystems sharing a qubit cannot be told apart afterwards —
+    /// whatever samples them jointly is one draw — so overlapping subsystems coarsen into one part.
+    /// Parts come out in ascending order of their lowest index, so the result does not depend on the
+    /// order the members were visited in.
+    fn partition(&self) -> Partition {
+        let frame = self.frame();
+        let position: HashMap<Qubit, usize> = frame
+            .iter()
+            .enumerate()
+            .map(|(index, qubit)| (*qubit, index))
+            .collect();
+
+        // Union-find over frame positions, each set rooted at its lowest member.
+        fn find(root: &mut [usize], mut index: usize) -> usize {
+            while root[index] != index {
+                root[index] = root[root[index]];
+                index = root[index];
+            }
+            index
+        }
+        let mut root: Vec<usize> = (0..frame.len()).collect();
+        for subsystem in &self.subsystems {
+            let mut members = subsystem.iter().map(|qubit| position[qubit]);
+            let Some(first) = members.next() else {
+                continue;
+            };
+            for member in members {
+                let (left, right) = (find(&mut root, first), find(&mut root, member));
+                root[left.max(right)] = left.min(right);
+            }
+        }
+
+        let mut part_of: HashMap<usize, usize> = HashMap::new();
+        let mut parts: Vec<Vec<usize>> = Vec::new();
+        for index in 0..frame.len() {
+            let set = find(&mut root, index);
+            let part = *part_of.entry(set).or_insert_with(|| {
+                parts.push(Vec::new());
+                parts.len() - 1
+            });
+            parts[part].push(index);
+        }
+        Partition::new(parts.into_iter().map(Vec::into_boxed_slice))
+            .expect("every index of the frame lands in exactly one part")
     }
 }
 
@@ -401,7 +455,7 @@ fn merge_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
                         members: vec![node],
                         frontier: all.iter().copied().collect(),
                         span: qubits.iter().copied().collect(),
-                        partition: spec.partition.clone(),
+                        subsystems: spec.partition.groups(&qubits),
                         parts: spec.parts.clone(),
                     });
                 }
@@ -462,14 +516,7 @@ fn find_mergeable(
 fn join(group: &mut Group, node: NodeIndex, spec: &CollectSpec, qubits: &[Qubit]) {
     group.members.push(node);
     group.span.extend(qubits.iter().copied());
-    group.partition = Partition::union(&[&group.partition, &spec.partition])
-        .unwrap_or_else(|_| spec.partition.clone());
-    // `find_mergeable` has established that every part shares a synthesizer, so replicate uniformly
-    // across the widened partition.
-    let synthesizer = group.parts[0].synthesizer;
-    group.parts = (0..group.partition.len())
-        .map(|_| CollectPart { synthesizer })
-        .collect();
+    group.subsystems.extend(spec.partition.groups(qubits));
 }
 
 /// Take `qubits` off every open group's frontier, so a later collector on them can no longer fuse.
@@ -608,10 +655,14 @@ fn merged_op(
     num_qubits: usize,
     num_clbits: usize,
 ) -> PyResult<PackedOperation> {
-    let spec = CollectSpec {
-        partition: group.partition.clone(),
-        parts: group.parts.clone(),
-    };
+    let partition = group.partition();
+    // `find_mergeable` has established that every member shares one synthesizer, so the merged
+    // descriptors are that one replicated across however many parts the span came out as.
+    let synthesizer = group.parts[0].synthesizer;
+    let parts = (0..partition.len())
+        .map(|_| CollectPart { synthesizer })
+        .collect();
+    let spec = CollectSpec { partition, parts };
     collect_op(py, spec, num_qubits, num_clbits)
 }
 
