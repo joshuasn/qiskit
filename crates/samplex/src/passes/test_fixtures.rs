@@ -64,6 +64,22 @@ pub fn collect_node(qubits: &[usize]) -> Node {
     )
 }
 
+/// A collector with one absorbed gate in its body, so it has angles of its own to synthesize.
+pub fn collect_node_with_gate(qubits: &[usize], gate: StandardGate, gate_qubit: usize) -> Node {
+    Node::singletons(
+        qubits.to_vec(),
+        NodeKind::Collect(Collect {
+            synthesizer: SynthesizerType::RzSx,
+            param_indices: vec![],
+            steps: vec![CollectStep::Gate(AbsorbedGate {
+                gate,
+                qubits: vec![gate_qubit],
+                params: vec![],
+            })],
+        }),
+    )
+}
+
 pub fn measure_node(qubits: &[usize]) -> Node {
     Node::singletons(
         qubits.to_vec(),

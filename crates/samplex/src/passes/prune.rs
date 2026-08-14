@@ -18,6 +18,18 @@ use rustworkx_core::traversal::{ancestors, descendants};
 
 use crate::virtual_flow_graph::{Edge, Node, NodeKind, VirtualFlowGraph};
 
+/// Whether a node has work of its own to do, whatever else reaches it.
+///
+/// A collector with steps composes something: absorbed gates, local emissions, or both. It has
+/// angles to synthesize even with no virtual state arriving from anywhere, so reachability says
+/// nothing about whether it is needed. Only an empty one is a pure junction that pruning may drop.
+fn is_self_sufficient(kind: &NodeKind) -> bool {
+    match kind {
+        NodeKind::Collect(collect) => !collect.steps.is_empty(),
+        _ => false,
+    }
+}
+
 fn prune_unreachable(
     vfg: &mut VirtualFlowGraph,
     is_seed: impl Fn(&NodeKind) -> bool,
@@ -37,7 +49,7 @@ fn prune_unreachable(
     let to_remove: Vec<NodeIndex> = vfg
         .graph
         .node_indices()
-        .filter(|idx| !reachable.contains(idx))
+        .filter(|idx| !reachable.contains(idx) && !is_self_sufficient(&vfg.graph[*idx].kind))
         .collect();
 
     for idx in to_remove {
@@ -46,6 +58,9 @@ fn prune_unreachable(
 }
 
 /// Remove nodes not reachable from any source: an `Emission` or a `Reset`.
+///
+/// A collector with steps is kept whatever reaches it. Absorption leaves collectors that nothing
+/// propagates into, and their steps are still angles to synthesize.
 pub fn prune_unreachable_from_sources(vfg: &mut VirtualFlowGraph) {
     prune_unreachable(
         vfg,
@@ -55,12 +70,17 @@ pub fn prune_unreachable_from_sources(vfg: &mut VirtualFlowGraph) {
 }
 
 /// Remove nodes that cannot reach any sink: a `Collect` or a `Measure`.
+///
+/// A sink is its own seed, so this drops only the nodes upstream of nothing. A collector with steps
+/// is kept here too, for the same reason as in the source pass.
 pub fn prune_unreachable_from_sinks(vfg: &mut VirtualFlowGraph) {
     prune_unreachable(vfg, |kind| kind.is_sink(), |g, n| ancestors(g, n).collect());
 }
 
 #[cfg(test)]
 mod tests {
+    use qiskit_circuit::standard_gate::StandardGate;
+
     use super::*;
     use crate::distributions::DistKey;
     use crate::passes::test_fixtures::*;
@@ -122,6 +142,50 @@ mod tests {
 
         prune_unreachable_from_sinks(&mut vfg);
         assert_eq!(vfg.graph.node_count(), 4);
+    }
+
+    #[test]
+    fn test_collect_with_steps_survives_both_passes() {
+        // Absorption leaves collectors that nothing propagates into. This one has an absorbed `h` to
+        // fold into its angles, so neither pass may drop it however isolated it is.
+        let mut vfg = VirtualFlowGraph::new();
+        vfg.graph
+            .add_node(collect_node_with_gate(&[0, 1], StandardGate::H, 0));
+
+        prune_unreachable_from_sources(&mut vfg);
+        assert_eq!(vfg.graph.node_count(), 1);
+
+        prune_unreachable_from_sinks(&mut vfg);
+        assert_eq!(vfg.graph.node_count(), 1);
+    }
+
+    #[test]
+    fn test_empty_collect_is_still_pruned() {
+        // The exception is only for a collector with work of its own: an empty one is a junction
+        // that leads nowhere, and both passes drop it.
+        let mut vfg = VirtualFlowGraph::new();
+        vfg.graph.add_node(collect_node(&[0, 1]));
+
+        prune_unreachable_from_sources(&mut vfg);
+        assert_eq!(vfg.graph.node_count(), 0);
+    }
+
+    #[test]
+    fn test_source_pass_keeps_only_the_collector_with_steps() {
+        // Both are unreachable from any source, and they part ways on whether they have steps.
+        let mut vfg = VirtualFlowGraph::new();
+        let empty = vfg.graph.add_node(collect_node(&[0, 1]));
+        let stepped = vfg
+            .graph
+            .add_node(collect_node_with_gate(&[2, 3], StandardGate::S, 2));
+
+        prune_unreachable_from_sources(&mut vfg);
+        assert_eq!(vfg.graph.node_count(), 1);
+        assert!(vfg.graph.node_weight(empty).is_none());
+        assert!(matches!(
+            vfg.graph.node_weight(stepped).map(|node| &node.kind),
+            Some(NodeKind::Collect(_))
+        ));
     }
 
     #[test]
