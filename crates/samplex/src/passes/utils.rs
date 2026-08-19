@@ -30,7 +30,7 @@ use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use qiskit_circuit::{Block, Clbit, Qubit};
 
 use crate::emission_circuit::{CollectSpec, EmitSpec, extract_collect};
-use crate::virtual_flow_graph::{Direction, Edge, Node};
+use crate::sampling_graph::{Direction, Edge, Node};
 
 /// Extension trait that converts any `Result<T, E: Display>` into `PyResult<T>` via `PyValueError`.
 pub(super) trait IntoPyResult<T> {

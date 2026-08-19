@@ -18,7 +18,7 @@
 //! IR2  emission circuit     Emit instructions, Collect boxes, hard       emission_circuit
 //!      + DistributionTable  boxes                                        distributions
 //!   --absorb_dressing, merge_collectors-->
-//! IR3  sampling graph       dataflow over virtual state                  virtual_flow_graph
+//! IR3  sampling graph       dataflow over virtual state                  sampling_graph
 //!      + template circuit   parameterized circuit
 //!      + ParameterTable     the symbolic absorbed angles                 parameters
 //!   --merge_parallel_nodes, prune, set_virtual_types-->
@@ -60,7 +60,7 @@ pub mod error;
 pub mod parameters;
 pub mod partition;
 pub mod passes;
-pub mod virtual_flow_graph;
+pub mod sampling_graph;
 pub mod virtual_type;
 
 pub fn samplex_mod(m: &Bound<PyModule>) -> PyResult<()> {
@@ -73,10 +73,10 @@ pub fn samplex_mod(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<distributions::DistributionTable>()?;
     m.add_class::<parameters::ParameterTable>()?;
     m.add_class::<emission_circuit::Emit>()?;
-    m.add_class::<virtual_flow_graph::VirtualFlowGraph>()?;
+    m.add_class::<sampling_graph::SamplingGraph>()?;
     m.add_wrapped(wrap_pyfunction!(passes::build::py_build))?;
     m.add_wrapped(wrap_pyfunction!(
-        passes::absorb_emissions::py_absorb_dressing
+        passes::absorb_dressing::py_absorb_dressing
     ))?;
     m.add_wrapped(wrap_pyfunction!(
         passes::merge_collectors::py_merge_collectors

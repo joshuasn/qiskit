@@ -31,7 +31,7 @@ pub enum PartitionError {
 /// The parts hold **indices into the qubits of whatever carries the partition** — an
 /// [`Emit`](crate::emission_circuit::EmitSpec)'s qargs, a
 /// [`Collect`](crate::emission_circuit::CollectSpec) box's qargs, a sampling-graph
-/// [`Node`](crate::virtual_flow_graph::Node)'s own qubit list. Every one of those already names its
+/// [`Node`](crate::sampling_graph::Node)'s own qubit list. Every one of those already names its
 /// qubits, so recording them here too would be a second copy of that list, free to drift out of
 /// agreement with it and with the instruction's width; indices cannot. Pair them back up with
 /// [`groups`](Self::groups).

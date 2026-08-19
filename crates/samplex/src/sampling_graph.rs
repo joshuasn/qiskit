@@ -173,7 +173,7 @@ impl NodeKind {
 ///
 /// Twirls, basis changes and noise injections share this one kind; the table entry `key` points at
 /// is the source tag. Keyed rather than cloned out of the table, like [`LocalEmission`] — resolving
-/// it (for drawing or [`nodes`](VirtualFlowGraph::nodes)) needs a
+/// it (for drawing or [`nodes`](SamplingGraph::nodes)) needs a
 /// [`DistributionTable`](crate::distributions::DistributionTable) alongside.
 #[derive(Debug, Clone)]
 pub struct Emission {
@@ -286,26 +286,26 @@ pub struct Measure {
 
 #[pyclass(module = "qiskit._accelerate.samplex", skip_from_py_object)]
 #[derive(Debug, Clone)]
-pub struct VirtualFlowGraph {
+pub struct SamplingGraph {
     pub graph: StableDiGraph<Node, Edge>,
 }
 
-impl VirtualFlowGraph {
+impl SamplingGraph {
     pub fn new() -> Self {
-        VirtualFlowGraph {
+        SamplingGraph {
             graph: StableDiGraph::new(),
         }
     }
 }
 
-impl Default for VirtualFlowGraph {
+impl Default for SamplingGraph {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[pymethods]
-impl VirtualFlowGraph {
+impl SamplingGraph {
     #[getter]
     fn num_nodes(&self) -> usize {
         self.graph.node_count()
@@ -402,7 +402,7 @@ impl VirtualFlowGraph {
 
     fn __repr__(&self) -> String {
         format!(
-            "VirtualFlowGraph(nodes={}, edges={})",
+            "SamplingGraph(nodes={}, edges={})",
             self.graph.node_count(),
             self.graph.edge_count()
         )
@@ -418,7 +418,7 @@ impl VirtualFlowGraph {
         use std::fmt::Write;
 
         let mut dot = String::new();
-        writeln!(dot, "digraph VFG {{").unwrap();
+        writeln!(dot, "digraph SamplingGraph {{").unwrap();
         writeln!(dot, "    rankdir=TB;").unwrap();
         writeln!(
             dot,
@@ -835,14 +835,14 @@ mod tests {
 
     #[test]
     fn test_graph_add_nodes_and_edges() {
-        let mut vfg = VirtualFlowGraph::new();
+        let mut sg = SamplingGraph::new();
 
-        let emit_idx = vfg.graph.add_node(Node::singletons(
+        let emit_idx = sg.graph.add_node(Node::singletons(
             vec![0, 1],
             NodeKind::Emission(emission(DistKey(0), Direction::Right)),
         ));
 
-        let propagate_idx = vfg.graph.add_node(Node::joint(
+        let propagate_idx = sg.graph.add_node(Node::joint(
             vec![0, 1],
             NodeKind::Propagate(Propagate {
                 gate: StandardGate::CX,
@@ -850,19 +850,19 @@ mod tests {
             }),
         ));
 
-        let collect_idx = vfg
+        let collect_idx = sg
             .graph
             .add_node(Node::singletons(vec![0, 1], collect_kind()));
 
-        vfg.graph.add_edge(emit_idx, propagate_idx, Edge::new());
-        vfg.graph.add_edge(emit_idx, collect_idx, Edge::new());
-        vfg.graph.add_edge(propagate_idx, collect_idx, Edge::new());
+        sg.graph.add_edge(emit_idx, propagate_idx, Edge::new());
+        sg.graph.add_edge(emit_idx, collect_idx, Edge::new());
+        sg.graph.add_edge(propagate_idx, collect_idx, Edge::new());
 
-        assert_eq!(vfg.graph.node_count(), 3);
-        assert_eq!(vfg.graph.edge_count(), 3);
+        assert_eq!(sg.graph.node_count(), 3);
+        assert_eq!(sg.graph.edge_count(), 3);
         // The reported direction is the source node's, for every edge.
         assert_eq!(
-            vfg.edges(),
+            sg.edges(),
             vec![
                 (0, 1, "right".to_string()),
                 (0, 2, "right".to_string()),

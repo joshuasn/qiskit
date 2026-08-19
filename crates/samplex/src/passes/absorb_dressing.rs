@@ -46,7 +46,7 @@
 //!   descending collector meets an inner box's collector before any of that box's emissions, and can
 //!   only ever take *gates* out of it.
 //!
-//! [`Collect::steps`]: crate::virtual_flow_graph::Collect::steps
+//! [`Collect::steps`]: crate::sampling_graph::Collect::steps
 
 use hashbrown::{HashMap, HashSet};
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
@@ -64,7 +64,7 @@ use super::utils::{
     next_on_wire, params_of, scope_dag, scope_dag_mut, site_instruction,
 };
 use crate::emission_circuit::{Collect, CollectSpec, EmitSpec};
-use crate::virtual_flow_graph::Direction;
+use crate::sampling_graph::Direction;
 
 /// Absorb dressing into every collector, in place.
 #[pyfunction]

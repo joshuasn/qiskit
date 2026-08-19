@@ -26,7 +26,7 @@ use crate::error::LowerError;
 
 use crate::virtual_type::VirtualType;
 
-// --- Annotation-level enums (shared with virtual_flow_graph) ------------------------------------
+// --- Annotation-level enums (shared with sampling_graph) ------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SynthesizerType {
@@ -211,7 +211,7 @@ parse_enum!(parse_injection_site, InjectionSite, "injection site", {
     "after" => After,
 });
 
-impl From<Placement> for crate::virtual_flow_graph::Direction {
+impl From<Placement> for crate::sampling_graph::Direction {
     fn from(placement: Placement) -> Self {
         match placement {
             Placement::Start => Self::Left,
@@ -220,7 +220,7 @@ impl From<Placement> for crate::virtual_flow_graph::Direction {
     }
 }
 
-impl From<InjectionSite> for crate::virtual_flow_graph::Direction {
+impl From<InjectionSite> for crate::sampling_graph::Direction {
     fn from(site: InjectionSite) -> Self {
         match site {
             InjectionSite::Before => Self::Left,

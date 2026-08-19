@@ -24,7 +24,7 @@
 //! Nothing here mutates its input. Both readers traverse in `topological_op_nodes` order, which is
 //! what lets [`build_sampling_graph`] pair its collectors with the template's parameter ranges by
 //! position. Inside a collector body that order must not be reported as circuit order; see
-//! [`Collect::steps`](crate::virtual_flow_graph::Collect::steps).
+//! [`Collect::steps`](crate::sampling_graph::Collect::steps).
 
 use std::sync::Arc;
 
@@ -49,9 +49,9 @@ use crate::distributions::DistributionTable;
 use crate::emission_circuit::EmitSpec;
 use crate::parameters::ParameterTable;
 use crate::partition::Partition;
-use crate::virtual_flow_graph::{
+use crate::sampling_graph::{
     AbsorbedGate, AbsorbedParam, Collect, CollectStep, Direction, Edge, Emission, LocalEmission,
-    Measure, Node, NodeKind, Propagate, VirtualFlowGraph,
+    Measure, Node, NodeKind, Propagate, SamplingGraph,
 };
 use crate::virtual_type::{VirtualType, propagates};
 
@@ -133,7 +133,7 @@ pub fn py_lower(
     py: Python,
     dag: &DAGCircuit,
     table: &DistributionTable,
-) -> PyResult<(PyCircuitData, VirtualFlowGraph, ParameterTable)> {
+) -> PyResult<(PyCircuitData, SamplingGraph, ParameterTable)> {
     let (template, collectors) = build_template(py, dag)?;
     let (graph, parameters) = build_sampling_graph(py, dag, table, &collectors)?;
     Ok((PyCircuitData { inner: template }, graph, parameters))
@@ -344,7 +344,7 @@ impl CollectorInfo {
     /// The absorbed gates alone, for an enclosing emission crossing this collector: it conjugates
     /// by the gates and ignores what the collector consumes.
     fn gates(&self) -> impl Iterator<Item = &AbsorbedGate> {
-        crate::virtual_flow_graph::collect_step_gates(&self.steps)
+        crate::sampling_graph::collect_step_gates(&self.steps)
     }
 }
 
@@ -373,7 +373,7 @@ pub fn build_sampling_graph(
     dag: &DAGCircuit,
     table: &DistributionTable,
     collectors: &[CollectorParams],
-) -> PyResult<(VirtualFlowGraph, ParameterTable)> {
+) -> PyResult<(SamplingGraph, ParameterTable)> {
     let mut events = Vec::new();
     let mut infos = Vec::new();
     let mut parameters = ParameterTable::new();
@@ -392,12 +392,12 @@ pub fn build_sampling_graph(
         info.param_indices = params.param_indices.clone();
     }
 
-    let mut vfg = VirtualFlowGraph::new();
+    let mut sg = SamplingGraph::new();
 
     // Sinks first, so an emission's walk always has a node to terminate at.
     let mut collector_nodes = Vec::with_capacity(infos.len());
     for info in &infos {
-        collector_nodes.push(vfg.graph.add_node(Node::new(
+        collector_nodes.push(sg.graph.add_node(Node::new(
             info.qubits.clone(),
             info.partition.clone(),
             NodeKind::Collect(Collect {
@@ -418,7 +418,7 @@ pub fn build_sampling_graph(
     for (position, event) in events.iter().enumerate() {
         match event {
             Event::Emission(spec, qubits) => {
-                let node = vfg.graph.add_node(Node::new(
+                let node = sg.graph.add_node(Node::new(
                     qubits.clone(),
                     spec.partition.clone(),
                     emission_kind(spec, table)?,
@@ -426,7 +426,7 @@ pub fn build_sampling_graph(
                 emission_nodes.insert(position, node);
             }
             Event::Measure(qubits, clbits) => {
-                vfg.graph.add_node(Node::singletons(
+                sg.graph.add_node(Node::singletons(
                     qubits.clone(),
                     NodeKind::Measure(Measure {
                         clbit_indices: clbits.clone(),
@@ -434,7 +434,7 @@ pub fn build_sampling_graph(
                 ));
             }
             Event::Reset(qubits) => {
-                vfg.graph
+                sg.graph
                     .add_node(Node::singletons(qubits.clone(), NodeKind::Reset));
             }
             _ => {}
@@ -468,7 +468,7 @@ pub fn build_sampling_graph(
                 ))
             })?;
         walk_emission(
-            &mut vfg,
+            &mut sg,
             &events,
             position,
             spec,
@@ -481,7 +481,7 @@ pub fn build_sampling_graph(
             table,
         )?;
     }
-    Ok((vfg, parameters))
+    Ok((sg, parameters))
 }
 
 /// Scan from `start` in `direction` for the first collector that can take this emission.
@@ -679,7 +679,7 @@ fn flatten(
 /// Wire one emission's path: every gate between it and its collector, chained per qubit.
 #[allow(clippy::too_many_arguments)]
 fn walk_emission(
-    vfg: &mut VirtualFlowGraph,
+    sg: &mut SamplingGraph,
     events: &[Event],
     from: usize,
     spec: &EmitSpec,
@@ -721,7 +721,7 @@ fn walk_emission(
                 for offset in order {
                     let gate = &absorbed[offset];
                     chain(
-                        vfg,
+                        sg,
                         &mut frontier,
                         &qubits,
                         direction,
@@ -734,7 +734,7 @@ fn walk_emission(
                 }
             }
             Event::Gate(gate, gate_qubits) => chain(
-                vfg,
+                sg,
                 &mut frontier,
                 &qubits,
                 direction,
@@ -751,7 +751,7 @@ fn walk_emission(
     // Whatever each wire's virtual state ended up as is what the collector synthesizes.
     let ends: HashSet<NodeIndex> = frontier.values().copied().collect();
     for end in ends {
-        vfg.graph.add_edge(end, target_node, Edge::new());
+        sg.graph.add_edge(end, target_node, Edge::new());
     }
     Ok(())
 }
@@ -759,7 +759,7 @@ fn walk_emission(
 /// Add or reuse the node for one gate and advance the frontier over its qubits.
 #[allow(clippy::too_many_arguments)]
 fn chain(
-    vfg: &mut VirtualFlowGraph,
+    sg: &mut SamplingGraph,
     frontier: &mut HashMap<usize, NodeIndex>,
     tracked: &HashSet<usize>,
     direction: Direction,
@@ -787,7 +787,7 @@ fn chain(
     let node = *gate_nodes.entry(key).or_insert_with(|| {
         // One joint subsystem: a conjugation by a multi-qubit gate mixes its qubits, so they can
         // only be evaluated together.
-        vfg.graph.add_node(Node::joint(
+        sg.graph.add_node(Node::joint(
             gate_qubits.to_vec(),
             NodeKind::Propagate(Propagate { gate, direction }),
         ))
@@ -797,7 +797,7 @@ fn chain(
         .filter_map(|q| frontier.get(q).copied())
         .collect();
     for predecessor in predecessors {
-        vfg.graph.add_edge(predecessor, node, Edge::new());
+        sg.graph.add_edge(predecessor, node, Edge::new());
     }
     for q in gate_qubits.iter().filter(|q| tracked.contains(*q)) {
         frontier.insert(*q, node);

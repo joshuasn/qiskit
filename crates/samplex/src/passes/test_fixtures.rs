@@ -14,7 +14,7 @@ use qiskit_circuit::standard_gate::StandardGate;
 
 use crate::annotated_circuit::{DistributionType, SynthesizerType};
 use crate::distributions::DistKey;
-use crate::virtual_flow_graph::*;
+use crate::sampling_graph::*;
 
 pub fn emit_node(qubits: &[usize]) -> Node {
     emission_node(qubits, DistKey(0))

@@ -23,7 +23,7 @@ use rustworkx_core::petgraph::visit::EdgeRef;
 use qiskit_circuit::standard_gate::StandardGate;
 
 use crate::partition::Partition;
-use crate::virtual_flow_graph::{Direction, Measure, Node, NodeKind, Propagate, VirtualFlowGraph};
+use crate::sampling_graph::{Direction, Measure, Node, NodeKind, Propagate, SamplingGraph};
 
 use super::utils::topological_generations;
 
@@ -52,13 +52,13 @@ fn merge_key(kind: &NodeKind) -> Option<MergeKey> {
 }
 
 /// Merge parallel nodes throughout a sampling graph, in place.
-pub fn merge_parallel_nodes(vfg: &mut VirtualFlowGraph) {
-    let generations = topological_generations(&vfg.graph);
+pub fn merge_parallel_nodes(sg: &mut SamplingGraph) {
+    let generations = topological_generations(&sg.graph);
 
     for generation in generations {
         let mut key_groups: HashMap<MergeKey, Vec<NodeIndex>> = HashMap::new();
         for &idx in &generation {
-            if let Some(key) = merge_key(&vfg.graph[idx].kind) {
+            if let Some(key) = merge_key(&sg.graph[idx].kind) {
                 key_groups.entry(key).or_default().push(idx);
             }
         }
@@ -74,14 +74,14 @@ pub fn merge_parallel_nodes(vfg: &mut VirtualFlowGraph) {
             let mut cluster_predecessors: Vec<HashSet<NodeIndex>> = Vec::new();
 
             for &idx in &group {
-                let node_elements: HashSet<usize> = vfg.graph[idx].qubits.iter().copied().collect();
-                let preds: HashSet<NodeIndex> = vfg
+                let node_elements: HashSet<usize> = sg.graph[idx].qubits.iter().copied().collect();
+                let preds: HashSet<NodeIndex> = sg
                     .graph
                     .neighbors_directed(idx, PetDirection::Incoming)
                     .collect();
 
                 let is_predecessorless_reset =
-                    preds.is_empty() && matches!(vfg.graph[idx].kind, NodeKind::Reset);
+                    preds.is_empty() && matches!(sg.graph[idx].kind, NodeKind::Reset);
 
                 let mut merged = false;
                 for (ci, cluster) in clusters.iter_mut().enumerate() {
@@ -114,29 +114,29 @@ pub fn merge_parallel_nodes(vfg: &mut VirtualFlowGraph) {
                 let merged_node = build_merged_node(
                     &cluster
                         .iter()
-                        .map(|&idx| &vfg.graph[idx])
+                        .map(|&idx| &sg.graph[idx])
                         .collect::<Vec<_>>(),
                 );
 
-                let merged_idx = vfg.graph.add_node(merged_node);
+                let merged_idx = sg.graph.add_node(merged_node);
 
-                rewire_edges(vfg, &cluster, merged_idx);
+                rewire_edges(sg, &cluster, merged_idx);
 
                 // Remove old nodes
                 for &old_idx in &cluster {
-                    vfg.graph.remove_node(old_idx);
+                    sg.graph.remove_node(old_idx);
                 }
             }
         }
     }
 }
 
-fn rewire_edges(vfg: &mut VirtualFlowGraph, cluster: &[NodeIndex], merged_idx: NodeIndex) {
+fn rewire_edges(sg: &mut SamplingGraph, cluster: &[NodeIndex], merged_idx: NodeIndex) {
     let mut seen_incoming: HashSet<NodeIndex> = HashSet::new();
     let mut seen_outgoing: HashSet<NodeIndex> = HashSet::new();
 
     for &old_idx in cluster {
-        let incoming: Vec<_> = vfg
+        let incoming: Vec<_> = sg
             .graph
             .edges_directed(old_idx, PetDirection::Incoming)
             .map(|e| (e.source(), *e.weight()))
@@ -146,11 +146,11 @@ fn rewire_edges(vfg: &mut VirtualFlowGraph, cluster: &[NodeIndex], merged_idx: N
                 continue;
             }
             if seen_incoming.insert(src) {
-                vfg.graph.add_edge(src, merged_idx, edge);
+                sg.graph.add_edge(src, merged_idx, edge);
             }
         }
 
-        let outgoing: Vec<_> = vfg
+        let outgoing: Vec<_> = sg
             .graph
             .edges_directed(old_idx, PetDirection::Outgoing)
             .map(|e| (e.target(), *e.weight()))
@@ -160,7 +160,7 @@ fn rewire_edges(vfg: &mut VirtualFlowGraph, cluster: &[NodeIndex], merged_idx: N
                 continue;
             }
             if seen_outgoing.insert(tgt) {
-                vfg.graph.add_edge(merged_idx, tgt, edge);
+                sg.graph.add_edge(merged_idx, tgt, edge);
             }
         }
     }
@@ -217,7 +217,7 @@ fn build_merged_node(nodes: &[&Node]) -> Node {
 mod tests {
     use super::*;
     use crate::passes::test_fixtures::*;
-    use crate::virtual_flow_graph::*;
+    use crate::sampling_graph::*;
 
     fn propagate_node_with_gate(qubits: &[usize], gate: StandardGate) -> Node {
         propagate_node_with(qubits, gate, Direction::Right)
@@ -225,168 +225,168 @@ mod tests {
 
     #[test]
     fn test_parallel_propagates_merge() {
-        let mut vfg = VirtualFlowGraph::new();
-        let e = vfg.graph.add_node(emit_node(&[0, 1, 2, 3]));
-        let pa = vfg.graph.add_node(propagate_node(&[0, 1]));
-        let pb = vfg.graph.add_node(propagate_node(&[2, 3]));
-        let c = vfg.graph.add_node(collect_node(&[0, 1, 2, 3]));
-        vfg.graph.add_edge(e, pa, Edge::new());
-        vfg.graph.add_edge(e, pb, Edge::new());
-        vfg.graph.add_edge(pa, c, Edge::new());
-        vfg.graph.add_edge(pb, c, Edge::new());
+        let mut sg = SamplingGraph::new();
+        let e = sg.graph.add_node(emit_node(&[0, 1, 2, 3]));
+        let pa = sg.graph.add_node(propagate_node(&[0, 1]));
+        let pb = sg.graph.add_node(propagate_node(&[2, 3]));
+        let c = sg.graph.add_node(collect_node(&[0, 1, 2, 3]));
+        sg.graph.add_edge(e, pa, Edge::new());
+        sg.graph.add_edge(e, pb, Edge::new());
+        sg.graph.add_edge(pa, c, Edge::new());
+        sg.graph.add_edge(pb, c, Edge::new());
 
-        merge_parallel_nodes(&mut vfg);
+        merge_parallel_nodes(&mut sg);
 
-        assert_eq!(vfg.graph.node_count(), 3);
+        assert_eq!(sg.graph.node_count(), 3);
 
-        let prop_nodes: Vec<_> = vfg
+        let prop_nodes: Vec<_> = sg
             .graph
             .node_indices()
-            .filter(|&idx| matches!(vfg.graph[idx].kind, NodeKind::Propagate(_)))
+            .filter(|&idx| matches!(sg.graph[idx].kind, NodeKind::Propagate(_)))
             .collect();
         assert_eq!(prop_nodes.len(), 1);
-        assert_eq!(vfg.graph[prop_nodes[0]].partition.len(), 2);
+        assert_eq!(sg.graph[prop_nodes[0]].partition.len(), 2);
     }
 
     #[test]
     fn test_different_gates_no_merge() {
-        let mut vfg = VirtualFlowGraph::new();
-        let e = vfg.graph.add_node(emit_node(&[0, 1, 2, 3]));
-        let pa = vfg
+        let mut sg = SamplingGraph::new();
+        let e = sg.graph.add_node(emit_node(&[0, 1, 2, 3]));
+        let pa = sg
             .graph
             .add_node(propagate_node_with_gate(&[0, 1], StandardGate::CX));
-        let pb = vfg
+        let pb = sg
             .graph
             .add_node(propagate_node_with_gate(&[2, 3], StandardGate::H));
-        let c = vfg.graph.add_node(collect_node(&[0, 1, 2, 3]));
-        vfg.graph.add_edge(e, pa, Edge::new());
-        vfg.graph.add_edge(e, pb, Edge::new());
-        vfg.graph.add_edge(pa, c, Edge::new());
-        vfg.graph.add_edge(pb, c, Edge::new());
+        let c = sg.graph.add_node(collect_node(&[0, 1, 2, 3]));
+        sg.graph.add_edge(e, pa, Edge::new());
+        sg.graph.add_edge(e, pb, Edge::new());
+        sg.graph.add_edge(pa, c, Edge::new());
+        sg.graph.add_edge(pb, c, Edge::new());
 
-        merge_parallel_nodes(&mut vfg);
+        merge_parallel_nodes(&mut sg);
 
-        assert_eq!(vfg.graph.node_count(), 4);
+        assert_eq!(sg.graph.node_count(), 4);
     }
 
     #[test]
     fn test_opposite_directions_no_merge() {
         // Conjugating the same gate leftward and rightward are different operations, so fusing them
         // into one wider node would make it unevaluable.
-        let mut vfg = VirtualFlowGraph::new();
-        let e = vfg.graph.add_node(emit_node(&[0, 1, 2, 3]));
-        let pa = vfg.graph.add_node(propagate_node_with(
+        let mut sg = SamplingGraph::new();
+        let e = sg.graph.add_node(emit_node(&[0, 1, 2, 3]));
+        let pa = sg.graph.add_node(propagate_node_with(
             &[0, 1],
             StandardGate::CX,
             Direction::Right,
         ));
-        let pb = vfg.graph.add_node(propagate_node_with(
+        let pb = sg.graph.add_node(propagate_node_with(
             &[2, 3],
             StandardGate::CX,
             Direction::Left,
         ));
-        let c = vfg.graph.add_node(collect_node(&[0, 1, 2, 3]));
-        vfg.graph.add_edge(e, pa, Edge::new());
-        vfg.graph.add_edge(e, pb, Edge::new());
-        vfg.graph.add_edge(pa, c, Edge::new());
-        vfg.graph.add_edge(pb, c, Edge::new());
+        let c = sg.graph.add_node(collect_node(&[0, 1, 2, 3]));
+        sg.graph.add_edge(e, pa, Edge::new());
+        sg.graph.add_edge(e, pb, Edge::new());
+        sg.graph.add_edge(pa, c, Edge::new());
+        sg.graph.add_edge(pb, c, Edge::new());
 
-        merge_parallel_nodes(&mut vfg);
+        merge_parallel_nodes(&mut sg);
 
-        assert_eq!(vfg.graph.node_count(), 4);
+        assert_eq!(sg.graph.node_count(), 4);
     }
 
     #[test]
     fn test_overlapping_partitions_no_merge() {
-        let mut vfg = VirtualFlowGraph::new();
-        let e = vfg.graph.add_node(emit_node(&[0, 1, 2]));
-        let pa = vfg.graph.add_node(propagate_node(&[0, 1]));
-        let pb = vfg.graph.add_node(propagate_node(&[1, 2]));
-        let c = vfg.graph.add_node(collect_node(&[0, 1, 2]));
-        vfg.graph.add_edge(e, pa, Edge::new());
-        vfg.graph.add_edge(e, pb, Edge::new());
-        vfg.graph.add_edge(pa, c, Edge::new());
-        vfg.graph.add_edge(pb, c, Edge::new());
+        let mut sg = SamplingGraph::new();
+        let e = sg.graph.add_node(emit_node(&[0, 1, 2]));
+        let pa = sg.graph.add_node(propagate_node(&[0, 1]));
+        let pb = sg.graph.add_node(propagate_node(&[1, 2]));
+        let c = sg.graph.add_node(collect_node(&[0, 1, 2]));
+        sg.graph.add_edge(e, pa, Edge::new());
+        sg.graph.add_edge(e, pb, Edge::new());
+        sg.graph.add_edge(pa, c, Edge::new());
+        sg.graph.add_edge(pb, c, Edge::new());
 
-        merge_parallel_nodes(&mut vfg);
+        merge_parallel_nodes(&mut sg);
 
-        assert_eq!(vfg.graph.node_count(), 4);
+        assert_eq!(sg.graph.node_count(), 4);
     }
 
     #[test]
     fn test_no_shared_predecessor_no_merge() {
-        let mut vfg = VirtualFlowGraph::new();
-        let ea = vfg.graph.add_node(emit_node(&[0, 1]));
-        let eb = vfg.graph.add_node(emit_node(&[2, 3]));
-        let pa = vfg.graph.add_node(propagate_node(&[0, 1]));
-        let pb = vfg.graph.add_node(propagate_node(&[2, 3]));
-        let c = vfg.graph.add_node(collect_node(&[0, 1, 2, 3]));
-        vfg.graph.add_edge(ea, pa, Edge::new());
-        vfg.graph.add_edge(eb, pb, Edge::new());
-        vfg.graph.add_edge(pa, c, Edge::new());
-        vfg.graph.add_edge(pb, c, Edge::new());
+        let mut sg = SamplingGraph::new();
+        let ea = sg.graph.add_node(emit_node(&[0, 1]));
+        let eb = sg.graph.add_node(emit_node(&[2, 3]));
+        let pa = sg.graph.add_node(propagate_node(&[0, 1]));
+        let pb = sg.graph.add_node(propagate_node(&[2, 3]));
+        let c = sg.graph.add_node(collect_node(&[0, 1, 2, 3]));
+        sg.graph.add_edge(ea, pa, Edge::new());
+        sg.graph.add_edge(eb, pb, Edge::new());
+        sg.graph.add_edge(pa, c, Edge::new());
+        sg.graph.add_edge(pb, c, Edge::new());
 
-        merge_parallel_nodes(&mut vfg);
+        merge_parallel_nodes(&mut sg);
 
-        assert_eq!(vfg.graph.node_count(), 5);
+        assert_eq!(sg.graph.node_count(), 5);
     }
 
     #[test]
     fn test_predecessorless_resets_merge() {
-        let mut vfg = VirtualFlowGraph::new();
-        let ra = vfg
+        let mut sg = SamplingGraph::new();
+        let ra = sg
             .graph
             .add_node(Node::singletons(vec![0], NodeKind::Reset));
-        let rb = vfg
+        let rb = sg
             .graph
             .add_node(Node::singletons(vec![1], NodeKind::Reset));
-        let c = vfg.graph.add_node(collect_node(&[0, 1]));
-        vfg.graph.add_edge(ra, c, Edge::new());
-        vfg.graph.add_edge(rb, c, Edge::new());
+        let c = sg.graph.add_node(collect_node(&[0, 1]));
+        sg.graph.add_edge(ra, c, Edge::new());
+        sg.graph.add_edge(rb, c, Edge::new());
 
-        merge_parallel_nodes(&mut vfg);
+        merge_parallel_nodes(&mut sg);
 
-        assert_eq!(vfg.graph.node_count(), 2);
+        assert_eq!(sg.graph.node_count(), 2);
 
-        let reset_nodes: Vec<_> = vfg
+        let reset_nodes: Vec<_> = sg
             .graph
             .node_indices()
-            .filter(|&idx| matches!(vfg.graph[idx].kind, NodeKind::Reset))
+            .filter(|&idx| matches!(sg.graph[idx].kind, NodeKind::Reset))
             .collect();
         assert_eq!(reset_nodes.len(), 1);
-        assert_eq!(vfg.graph[reset_nodes[0]].partition.len(), 2);
+        assert_eq!(sg.graph[reset_nodes[0]].partition.len(), 2);
     }
 
     #[test]
     fn test_measures_merge() {
-        let mut vfg = VirtualFlowGraph::new();
-        let e = vfg.graph.add_node(emit_node(&[0, 1, 2, 3]));
-        let ma = vfg.graph.add_node(Node::singletons(
+        let mut sg = SamplingGraph::new();
+        let e = sg.graph.add_node(emit_node(&[0, 1, 2, 3]));
+        let ma = sg.graph.add_node(Node::singletons(
             vec![0, 1],
             NodeKind::Measure(Measure {
                 clbit_indices: vec![0, 1],
             }),
         ));
-        let mb = vfg.graph.add_node(Node::singletons(
+        let mb = sg.graph.add_node(Node::singletons(
             vec![2, 3],
             NodeKind::Measure(Measure {
                 clbit_indices: vec![2, 3],
             }),
         ));
-        vfg.graph.add_edge(e, ma, Edge::new());
-        vfg.graph.add_edge(e, mb, Edge::new());
+        sg.graph.add_edge(e, ma, Edge::new());
+        sg.graph.add_edge(e, mb, Edge::new());
 
-        merge_parallel_nodes(&mut vfg);
+        merge_parallel_nodes(&mut sg);
 
-        assert_eq!(vfg.graph.node_count(), 2);
+        assert_eq!(sg.graph.node_count(), 2);
 
-        let meas_nodes: Vec<_> = vfg
+        let meas_nodes: Vec<_> = sg
             .graph
             .node_indices()
-            .filter(|&idx| matches!(vfg.graph[idx].kind, NodeKind::Measure(_)))
+            .filter(|&idx| matches!(sg.graph[idx].kind, NodeKind::Measure(_)))
             .collect();
         assert_eq!(meas_nodes.len(), 1);
-        if let NodeKind::Measure(m) = &vfg.graph[meas_nodes[0]].kind {
+        if let NodeKind::Measure(m) = &sg.graph[meas_nodes[0]].kind {
             assert_eq!(m.clbit_indices.len(), 4);
         } else {
             panic!("expected Measure");
@@ -395,18 +395,18 @@ mod tests {
 
     #[test]
     fn test_edge_deduplication() {
-        let mut vfg = VirtualFlowGraph::new();
-        let e = vfg.graph.add_node(emit_node(&[0, 1, 2, 3]));
-        let pa = vfg.graph.add_node(propagate_node(&[0, 1]));
-        let pb = vfg.graph.add_node(propagate_node(&[2, 3]));
-        let c = vfg.graph.add_node(collect_node(&[0, 1, 2, 3]));
-        vfg.graph.add_edge(e, pa, Edge::new());
-        vfg.graph.add_edge(e, pb, Edge::new());
-        vfg.graph.add_edge(pa, c, Edge::new());
-        vfg.graph.add_edge(pb, c, Edge::new());
+        let mut sg = SamplingGraph::new();
+        let e = sg.graph.add_node(emit_node(&[0, 1, 2, 3]));
+        let pa = sg.graph.add_node(propagate_node(&[0, 1]));
+        let pb = sg.graph.add_node(propagate_node(&[2, 3]));
+        let c = sg.graph.add_node(collect_node(&[0, 1, 2, 3]));
+        sg.graph.add_edge(e, pa, Edge::new());
+        sg.graph.add_edge(e, pb, Edge::new());
+        sg.graph.add_edge(pa, c, Edge::new());
+        sg.graph.add_edge(pb, c, Edge::new());
 
-        merge_parallel_nodes(&mut vfg);
+        merge_parallel_nodes(&mut sg);
 
-        assert_eq!(vfg.graph.edge_count(), 2);
+        assert_eq!(sg.graph.edge_count(), 2);
     }
 }

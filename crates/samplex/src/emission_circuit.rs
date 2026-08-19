@@ -33,7 +33,7 @@ use smallvec::SmallVec;
 use crate::annotated_circuit::{SynthesizerType, parse_decomposition};
 use crate::distributions::{DistEntry, DistKey, DistributionTable};
 use crate::partition::Partition;
-use crate::virtual_flow_graph::Direction;
+use crate::sampling_graph::Direction;
 use crate::virtual_type::VirtualType;
 
 /// The instruction name reported to Qiskit for every emission, regardless of kind. Which kind an

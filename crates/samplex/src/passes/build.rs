@@ -51,7 +51,7 @@ use crate::annotated_circuit::{
 use crate::distributions::{DistEntry, DistKey, DistributionTable};
 use crate::emission_circuit::{Collect, CollectPart, CollectSpec, EmitPart, EmitSpec};
 use crate::partition::Partition;
-use crate::virtual_flow_graph::Direction;
+use crate::sampling_graph::Direction;
 
 use super::utils::{IntoPyResult, append, new_dag_body};
 
@@ -318,7 +318,7 @@ impl Build {
         // Partition emissions into groups for each edge. Only the *outer* ones stay on the spine: a
         // basis change names the box's own edge, so that is where it belongs. Everything nearer the
         // content than the dressing goes inside the content box, in this order per edge:
-        //   easy run | inner emissions (facing the collector) | propagating (facing away) | content
+        //   easy run | inner emissions (facing the collector) | propagating (facing away) | hard content
         // An emission's `depth` is its distance from the content, which is what fixes both that order
         // and each collector's composition order.
         //
@@ -595,7 +595,7 @@ fn classify_body(
     // ancestors were, and since absorbable gates all move to the dressing edge keeping their relative
     // order, such a gate can move there too. So a single-qubit gate on an untouched wire folds into
     // the dressing even if an entangler sits before it elsewhere in the body, while poison
-    // spreading transitively leaves the `s` in `cx(0,1); cx(1,2); s(2)` as content.
+    // spreading transitively leaves the `s` in `cx(0,1); cx(1,2); s(2)` as hard content.
     let nodes: Vec<_> = body.topological_op_nodes(false).collect();
     // Sweeping from the right means visiting in reverse, then restoring circuit order.
     let right = matches!(dressing, Some(Dressing::Right));

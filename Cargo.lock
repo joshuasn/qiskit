@@ -2526,7 +2526,7 @@ dependencies = [
  "qiskit-util",
  "rustworkx-core",
  "smallvec",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

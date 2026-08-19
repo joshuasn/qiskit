@@ -14,7 +14,7 @@
 //! bind.
 //!
 //! Bound angles are not here — they travel inline on
-//! [`AbsorbedGate`](crate::virtual_flow_graph::AbsorbedGate). This table answers the question no
+//! [`AbsorbedGate`](crate::sampling_graph::AbsorbedGate). This table answers the question no
 //! individual gate can: **what must the caller supply before drawing.** [`ParameterTable::free`] is
 //! that list.
 //!
@@ -54,7 +54,7 @@ fn ordering(symbol: &Symbol) -> (String, u128) {
 /// The symbolic angles absorbed into collectors, and the symbols the caller must bind.
 ///
 /// Every entry has at least one free symbol, since a fully bound expression is folded to
-/// [`AbsorbedParam::Bound`](crate::virtual_flow_graph::AbsorbedParam::Bound) as it is read. So an
+/// [`AbsorbedParam::Bound`](crate::sampling_graph::AbsorbedParam::Bound) as it is read. So an
 /// empty [`free`](Self::free) means there is nothing to bind, not that nothing was checked.
 ///
 /// Holds *only* the user's own parameters. The `p0000…` angles lowering mints for the synth

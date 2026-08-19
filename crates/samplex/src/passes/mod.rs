@@ -14,7 +14,7 @@
 
 use pyo3::prelude::*;
 
-pub mod absorb_emissions;
+pub mod absorb_dressing;
 pub mod build;
 pub mod lower;
 pub mod merge_collectors;
@@ -30,24 +30,24 @@ pub use merge_parallel_nodes::merge_parallel_nodes;
 pub use prune::{prune_unreachable_from_sinks, prune_unreachable_from_sources};
 pub use set_virtual_types::set_virtual_types;
 
-use crate::virtual_flow_graph::VirtualFlowGraph;
+use crate::sampling_graph::SamplingGraph;
 
 #[pyfunction]
-pub fn py_merge_parallel(vfg: &mut VirtualFlowGraph) {
-    merge_parallel_nodes(vfg);
+pub fn py_merge_parallel(sg: &mut SamplingGraph) {
+    merge_parallel_nodes(sg);
 }
 
 #[pyfunction]
-pub fn py_prune_from_sources(vfg: &mut VirtualFlowGraph) {
-    prune_unreachable_from_sources(vfg);
+pub fn py_prune_from_sources(sg: &mut SamplingGraph) {
+    prune_unreachable_from_sources(sg);
 }
 
 #[pyfunction]
-pub fn py_prune_from_sinks(vfg: &mut VirtualFlowGraph) {
-    prune_unreachable_from_sinks(vfg);
+pub fn py_prune_from_sinks(sg: &mut SamplingGraph) {
+    prune_unreachable_from_sinks(sg);
 }
 
 #[pyfunction]
-pub fn py_set_virtual_types(vfg: &mut VirtualFlowGraph) {
-    set_virtual_types(vfg);
+pub fn py_set_virtual_types(sg: &mut SamplingGraph) {
+    set_virtual_types(sg);
 }

@@ -15,23 +15,23 @@
 //! Two ways for two collectors to become one, and they need different machinery.
 //!
 //! **Siblings, in one scope.** Adjacent boxes that share a synthesizer come to share a *middle*
-//! collector, so N boxes in a row need N+1 dressing layers rather than 2N. One
+//! collector, so N boxes in a row need N+1 collector layers rather than 2N. One
 //! [`DAGCircuit::replace_block`] contraction per group, which takes the union of its members' qargs
 //! and derives its position from their edges. Two rules govern what may fuse, both per qubit: a
 //! candidate must overlap a group's `span`, and every one of its qubits must still be at that group's
 //! `frontier`. Each scope is walked with its own state.
 //!
-//! **A collector leaving its box**, folded into the one just outside it — one dressing layer fewer per
+//! **A collector leaving its box**, folded into the one just outside it — one collector layer fewer per
 //! nesting level. This is *not* a contraction: a nested collector covers a subset of its box's qubits,
 //! which are a subset of the enclosing collector's, so nothing is ever widened. `replace_block` cannot
 //! contract across DAGs anyway. It is a body transfer plus a node deletion, and it runs to a fixed
-//! point before the sibling sweep, since promoting one collector out exposes the next level down.
+//! point before the sibling sweep, since one collector escaping exposes the next level down.
 //!
-//! Promotion refuses on hazards, not on which pass has run. Before absorption every collector body is
-//! empty, so promoting is purely structural then — delete a collector, re-point whatever it was
+//! An escape refuses on hazards, not on which pass has run. Before absorption every collector body is
+//! empty, so an escape is purely structural then — delete a collector, re-point whatever it was
 //! catching — and an unabsorbed circuit is a valid IR2 rather than an unfinished one. What geometry
 //! *does* differ by pass order is adjacency: absorption removes content from between two collectors, so
-//! a promotion it refuses before may be available after.
+//! an escape it refuses before may be available after.
 
 use hashbrown::{HashMap, HashSet};
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
@@ -51,7 +51,7 @@ use super::utils::{
 use crate::annotated_circuit::SynthesizerType;
 use crate::emission_circuit::{Collect, CollectPart, CollectSpec};
 use crate::partition::Partition;
-use crate::virtual_flow_graph::Direction;
+use crate::sampling_graph::Direction;
 
 /// Collectors that will fuse into one, and the state deciding what else may join them.
 struct Group {
@@ -145,17 +145,17 @@ pub fn py_merge_collectors(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
 
 /// Merge adjacent collectors throughout an emission circuit, in place.
 pub fn merge_collectors(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
-    // Promotion first, to a fixed point: taking one collector out of its box can leave the next level
+    // Escapes first, to a fixed point: taking one collector out of its box can leave the next level
     // down as its box's new head. Each round re-plans against the rewritten circuit rather than reusing
     // sites, and rounds are bounded by nesting depth.
-    while promote_round(py, dag)? {}
+    while escape_round(py, dag)? {}
     merge_scope(py, dag)
 }
 
-// --- Promotion: a collector leaving its box -----------------------------------------------------
+// --- Escape: a collector leaving its box --------------------------------------------------------
 
 /// One collector folding into the collector just outside its box.
-struct Promotion {
+struct Escape {
     /// The collector that stays, and gains a body. Its width and spec do not change: its partition
     /// already covers the qubits of anything nested inside its box.
     outer: Site,
@@ -166,32 +166,32 @@ struct Promotion {
     direction: Direction,
 }
 
-/// Do one round of promotions, reporting whether anything moved.
-fn promote_round(py: Python, dag: &mut DAGCircuit) -> PyResult<bool> {
-    let plans = plan_promotions(py, dag)?;
+/// Do one round of escapes, reporting whether anything moved.
+fn escape_round(py: Python, dag: &mut DAGCircuit) -> PyResult<bool> {
+    let plans = plan_escapes(py, dag)?;
     for plan in &plans {
-        promote(py, dag, plan)?;
+        escape(py, dag, plan)?;
     }
     Ok(!plans.is_empty())
 }
 
-/// Find every promotion available in the circuit as it stands.
+/// Find every escape available in the circuit as it stands.
 ///
-/// A collector takes part in at most one promotion per round, in either role: a middle collector in a
+/// A collector takes part in at most one escape per round, in either role: a middle collector in a
 /// two-level nest is both somebody's `inner` and somebody else's `outer`, and doing both at once would
 /// substitute a node this round also deletes. The fixed-point loop picks up the rest.
-fn plan_promotions(py: Python, root: &DAGCircuit) -> PyResult<Vec<Promotion>> {
-    let mut plans: Vec<Promotion> = Vec::new();
+fn plan_escapes(py: Python, root: &DAGCircuit) -> PyResult<Vec<Escape>> {
+    let mut plans: Vec<Escape> = Vec::new();
     let mut claimed: HashSet<Site> = HashSet::new();
-    plan_promotions_in(py, root, &mut Vec::new(), &mut plans, &mut claimed)?;
+    plan_escapes_in(py, root, &mut Vec::new(), &mut plans, &mut claimed)?;
     Ok(plans)
 }
 
-fn plan_promotions_in(
+fn plan_escapes_in(
     py: Python,
     root: &DAGCircuit,
     path: &mut Vec<NodeIndex>,
-    plans: &mut Vec<Promotion>,
+    plans: &mut Vec<Escape>,
     claimed: &mut HashSet<Site>,
 ) -> PyResult<()> {
     let nodes: Vec<NodeIndex> = scope_dag(root, path)?.topological_op_nodes(false).collect();
@@ -210,7 +210,7 @@ fn plan_promotions_in(
             continue;
         }
         for direction in [Direction::Left, Direction::Right] {
-            let Some(inner) = promotable(py, root, &outer, direction)? else {
+            let Some(inner) = escapable(py, root, &outer, direction)? else {
                 continue;
             };
             if claimed.contains(&inner) {
@@ -218,7 +218,7 @@ fn plan_promotions_in(
             }
             claimed.insert(outer.clone());
             claimed.insert(inner.clone());
-            plans.push(Promotion {
+            plans.push(Escape {
                 outer: outer.clone(),
                 inner,
                 direction,
@@ -235,14 +235,14 @@ fn plan_promotions_in(
             continue;
         }
         path.push(*node);
-        plan_promotions_in(py, root, path, plans, claimed)?;
+        plan_escapes_in(py, root, path, plans, claimed)?;
         path.pop();
     }
     Ok(())
 }
 
 /// The collector that may leave its box and fold into `outer`, walking `direction`, if any.
-fn promotable(
+fn escapable(
     py: Python,
     root: &DAGCircuit,
     outer: &Site,
@@ -346,7 +346,7 @@ fn first_site(
 /// How many emissions in this body, at any depth, are still travelling in `direction`.
 ///
 /// These are the ones that end up at the collector being folded into, since the transfer deletes the
-/// collector that was catching them. The count is what separates promotion's two hazards from each
+/// collector that was catching them. The count is what separates an escape's two hazards from each
 /// other: one of them needs any such emission plus content to move, the other needs two of them.
 ///
 /// A local emission is not counted — it has resolved in place and travels nowhere.
@@ -368,7 +368,7 @@ fn count_emissions_towards(dag: &DAGCircuit, direction: Direction) -> PyResult<u
 
 /// Whether a collector has nothing in its body to move.
 ///
-/// Before absorption every body is empty, which is why promotion pre-absorption is purely structural:
+/// Before absorption every body is empty, which is why an escape pre-absorption is purely structural:
 /// it deletes a collector and re-points whatever that collector was catching, moving no content at all.
 fn body_is_empty(dag: &DAGCircuit, inst: &PackedInstruction) -> PyResult<bool> {
     Ok(block_body(dag, inst)?.is_none_or(|body| body.num_ops() == 0))
@@ -387,7 +387,7 @@ fn lift_to(
 }
 
 /// Move one collector's body into the collector outside its box, and delete it.
-fn promote(py: Python, root: &mut DAGCircuit, plan: &Promotion) -> PyResult<()> {
+fn escape(py: Python, root: &mut DAGCircuit, plan: &Escape) -> PyResult<()> {
     // Everything is read before anything is written: the merged body is built while both collectors
     // are still in place.
     let (op, body) = {
@@ -641,7 +641,7 @@ fn merged_body(
 /// Append one collector's body to a merged body, remapping its wires into `frame`.
 ///
 /// `wires` maps the contribution's body-local wires into the frame `frame` is expressed in: a sibling's
-/// own qargs, or a promoted collector's qargs lifted out through the boxes between.
+/// own qargs, or an escaped collector's qargs lifted out through the boxes between.
 ///
 /// In written order, not topological order: a collector body is a *sequence*. A body is built once and
 /// never edited, so its node indices are already in the order they were appended.
