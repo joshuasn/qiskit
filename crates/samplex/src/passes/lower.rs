@@ -72,10 +72,7 @@ pub struct CollectorParams {
 /// Build the template circuit for an emission circuit.
 ///
 /// Returns the template plus one [`CollectorParams`] per collector, in circuit order.
-pub fn build_template(
-    py: Python,
-    dag: &DAGCircuit,
-) -> PyResult<(CircuitData, Vec<CollectorParams>)> {
+pub fn build_template(dag: &DAGCircuit) -> PyResult<(CircuitData, Vec<CollectorParams>)> {
     let mut out = CircuitData::with_capacity(
         dag.num_qubits() as u32,
         dag.num_clbits() as u32,
@@ -90,7 +87,6 @@ pub fn build_template(
     // output frame and the global frame coincide.
     let identity: Vec<usize> = (0..dag.num_qubits()).collect();
     write_scope(
-        py,
         dag,
         &mut out,
         &identity,
@@ -107,11 +103,8 @@ type CollectorSummary = (Vec<usize>, String, Vec<usize>);
 /// Python-facing entry point: returns the template and the collector parameter map.
 #[pyfunction]
 #[pyo3(name = "build_template")]
-pub fn py_build_template(
-    py: Python,
-    dag: &DAGCircuit,
-) -> PyResult<(PyCircuitData, Vec<CollectorSummary>)> {
-    let (template, collectors) = build_template(py, dag)?;
+pub fn py_build_template(dag: &DAGCircuit) -> PyResult<(PyCircuitData, Vec<CollectorSummary>)> {
+    let (template, collectors) = build_template(dag)?;
     let summary = collectors
         .into_iter()
         .map(|c| {
@@ -130,12 +123,11 @@ pub fn py_build_template(
 #[pyfunction]
 #[pyo3(name = "lower")]
 pub fn py_lower(
-    py: Python,
     dag: &DAGCircuit,
     table: &DistributionTable,
 ) -> PyResult<(PyCircuitData, SamplingGraph, ParameterTable)> {
-    let (template, collectors) = build_template(py, dag)?;
-    let (graph, parameters) = build_sampling_graph(py, dag, table, &collectors)?;
+    let (template, collectors) = build_template(dag)?;
+    let (graph, parameters) = build_sampling_graph(dag, table, &collectors)?;
     Ok((PyCircuitData { inner: template }, graph, parameters))
 }
 
@@ -145,7 +137,6 @@ pub fn py_lower(
 /// scope is nested; `global` maps them to circuit qubits, which is the frame a [`CollectorParams`] is
 /// always reported in. At the top level the two coincide.
 fn write_scope(
-    py: Python,
     src: &DAGCircuit,
     out: &mut CircuitData,
     frame: &[usize],
@@ -159,7 +150,7 @@ fn write_scope(
         let inst = src.dag()[node].unwrap_operation();
 
         // A collector becomes the parametric fragment its angles drive.
-        if let Some(spec) = collect_annotation(py, inst) {
+        if let Some(spec) = collect_annotation(inst) {
             let locals = src.qargs_interner().get(inst.qubits);
             let written: Vec<usize> = locals.iter().map(|q| frame[q.index()]).collect();
             let qubits: Vec<usize> = locals.iter().map(|q| global[q.index()]).collect();
@@ -199,7 +190,6 @@ fn write_scope(
             )
             .into_py_result()?;
             write_scope(
-                py,
                 body,
                 &mut inner_out,
                 &inner_frame,
@@ -369,7 +359,6 @@ type GateKey = (usize, usize, Direction, VirtualType);
 ///
 /// `collectors` must come from [`build_template`] over the same circuit.
 pub fn build_sampling_graph(
-    py: Python,
     dag: &DAGCircuit,
     table: &DistributionTable,
     collectors: &[CollectorParams],
@@ -378,7 +367,7 @@ pub fn build_sampling_graph(
     let mut infos = Vec::new();
     let mut parameters = ParameterTable::new();
     let identity: Vec<usize> = (0..dag.num_qubits()).collect();
-    flatten(py, dag, &identity, &mut events, &mut infos, &mut parameters)?;
+    flatten(dag, &identity, &mut events, &mut infos, &mut parameters)?;
 
     if infos.len() != collectors.len() {
         return Err(PyValueError::new_err(format!(
@@ -577,7 +566,6 @@ fn absorbed_param(table: &mut ParameterTable, param: &Param) -> PyResult<Absorbe
 
 /// Flatten a scope into events, inlining hard boxes and reducing each collector to one event.
 fn flatten(
-    py: Python,
     src: &DAGCircuit,
     frame: &[usize],
     events: &mut Vec<Event>,
@@ -594,7 +582,7 @@ fn flatten(
             .map(|q| frame[q.index()])
             .collect();
 
-        if let Some(spec) = collect_annotation(py, inst) {
+        if let Some(spec) = collect_annotation(inst) {
             // This read yields *a* linear extension of the body, not the order the absorption walk
             // appended in. Harmless — a local emission spans every qubit it covers, so it stays a
             // barrier — but it must not be reported as circuit order. See `Collect::steps`.
@@ -655,7 +643,7 @@ fn flatten(
 
         // A hard box is a grouping: inline it so its gates sit on the same spine.
         if let Some(body) = plain_box_body(src, inst)? {
-            flatten(py, body, &qubits, events, infos, parameters)?;
+            flatten(body, &qubits, events, infos, parameters)?;
             continue;
         }
 

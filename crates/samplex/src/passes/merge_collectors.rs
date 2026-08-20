@@ -37,19 +37,17 @@ use hashbrown::{HashMap, HashSet};
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
 
 use pyo3::prelude::*;
-use qiskit_circuit::annotation::PyAnnotation;
 use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder};
 use qiskit_circuit::instruction::Parameters;
-use qiskit_circuit::operations::{ControlFlow, ControlFlowInstruction, OperationRef};
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use qiskit_circuit::{Clbit, Qubit};
 
 use super::utils::{
-    IntoPyResult, Site, WireCursor, block_body, collect_annotation, emission_spec, lift_wires,
-    new_dag_body, params_of, scope_dag, scope_dag_mut,
+    IntoPyResult, Site, WireCursor, block_body, collect_annotation, collect_op, emission_spec,
+    is_box, is_collector, lift_wires, new_dag_body, params_of, scope_dag, scope_dag_mut,
 };
 use crate::annotated_circuit::SynthesizerType;
-use crate::emission_circuit::{Collect, CollectPart, CollectSpec};
+use crate::emission_circuit::{CollectPart, CollectSpec};
 use crate::partition::Partition;
 use crate::sampling_graph::Direction;
 
@@ -139,17 +137,17 @@ impl Group {
 /// Merge adjacent collectors throughout an emission circuit, in place.
 #[pyfunction]
 #[pyo3(name = "merge_collectors")]
-pub fn py_merge_collectors(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
-    merge_collectors(py, dag)
+pub fn py_merge_collectors(dag: &mut DAGCircuit) -> PyResult<()> {
+    merge_collectors(dag)
 }
 
 /// Merge adjacent collectors throughout an emission circuit, in place.
-pub fn merge_collectors(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
+pub fn merge_collectors(dag: &mut DAGCircuit) -> PyResult<()> {
     // Escapes first, to a fixed point: taking one collector out of its box can leave the next level
     // down as its box's new head. Each round re-plans against the rewritten circuit rather than reusing
     // sites, and rounds are bounded by nesting depth.
-    while escape_round(py, dag)? {}
-    merge_scope(py, dag)
+    while escape_round(dag)? {}
+    merge_scope(dag)
 }
 
 // --- Escape: a collector leaving its box --------------------------------------------------------
@@ -167,10 +165,10 @@ struct Escape {
 }
 
 /// Do one round of escapes, reporting whether anything moved.
-fn escape_round(py: Python, dag: &mut DAGCircuit) -> PyResult<bool> {
-    let plans = plan_escapes(py, dag)?;
+fn escape_round(dag: &mut DAGCircuit) -> PyResult<bool> {
+    let plans = plan_escapes(dag)?;
     for plan in &plans {
-        escape(py, dag, plan)?;
+        escape(dag, plan)?;
     }
     Ok(!plans.is_empty())
 }
@@ -180,15 +178,14 @@ fn escape_round(py: Python, dag: &mut DAGCircuit) -> PyResult<bool> {
 /// A collector takes part in at most one escape per round, in either role: a middle collector in a
 /// two-level nest is both somebody's `inner` and somebody else's `outer`, and doing both at once would
 /// substitute a node this round also deletes. The fixed-point loop picks up the rest.
-fn plan_escapes(py: Python, root: &DAGCircuit) -> PyResult<Vec<Escape>> {
+fn plan_escapes(root: &DAGCircuit) -> PyResult<Vec<Escape>> {
     let mut plans: Vec<Escape> = Vec::new();
     let mut claimed: HashSet<Site> = HashSet::new();
-    plan_escapes_in(py, root, &mut Vec::new(), &mut plans, &mut claimed)?;
+    plan_escapes_in(root, &mut Vec::new(), &mut plans, &mut claimed)?;
     Ok(plans)
 }
 
 fn plan_escapes_in(
-    py: Python,
     root: &DAGCircuit,
     path: &mut Vec<NodeIndex>,
     plans: &mut Vec<Escape>,
@@ -199,7 +196,7 @@ fn plan_escapes_in(
     for node in &nodes {
         let dag = scope_dag(root, path)?;
         let inst = dag.dag()[*node].unwrap_operation();
-        if collect_annotation(py, inst).is_none() {
+        if !is_collector(inst) {
             continue;
         }
         let outer = Site {
@@ -210,7 +207,7 @@ fn plan_escapes_in(
             continue;
         }
         for direction in [Direction::Left, Direction::Right] {
-            let Some(inner) = escapable(py, root, &outer, direction)? else {
+            let Some(inner) = escapable(root, &outer, direction)? else {
                 continue;
             };
             if claimed.contains(&inner) {
@@ -231,26 +228,21 @@ fn plan_escapes_in(
     for node in &nodes {
         let dag = scope_dag(root, path)?;
         let inst = dag.dag()[*node].unwrap_operation();
-        if !is_box(inst) || collect_annotation(py, inst).is_some() {
+        if !is_box(inst) || is_collector(inst) {
             continue;
         }
         path.push(*node);
-        plan_escapes_in(py, root, path, plans, claimed)?;
+        plan_escapes_in(root, path, plans, claimed)?;
         path.pop();
     }
     Ok(())
 }
 
 /// The collector that may leave its box and fold into `outer`, walking `direction`, if any.
-fn escapable(
-    py: Python,
-    root: &DAGCircuit,
-    outer: &Site,
-    direction: Direction,
-) -> PyResult<Option<Site>> {
+fn escapable(root: &DAGCircuit, outer: &Site, direction: Direction) -> PyResult<Option<Site>> {
     let dag = scope_dag(root, &outer.scope)?;
     let inst = dag.dag()[outer.node].unwrap_operation();
-    let spec = collect_annotation(py, inst).expect("only asked of a collector");
+    let spec = collect_annotation(inst).expect("only asked of a collector");
     let wires: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();
 
     // Every distinct collector-inside-a-box any of `outer`'s wires reaches first. More than one is
@@ -258,7 +250,7 @@ fn escapable(
     // and the first that qualifies wins; a later round can take the others.
     let mut candidates: Vec<Site> = Vec::new();
     for wire in &wires {
-        let Some(site) = first_site(py, root, outer, *wire, direction)? else {
+        let Some(site) = first_site(root, outer, *wire, direction)? else {
             continue;
         };
         // A collector in the same scope is a sibling, which the contraction sweep handles.
@@ -266,7 +258,7 @@ fn escapable(
             continue;
         }
         let reached = scope_dag(root, &site.scope)?.dag()[site.node].unwrap_operation();
-        if collect_annotation(py, reached).is_none() {
+        if !is_collector(reached) {
             continue;
         }
         if !candidates.contains(&site) {
@@ -277,7 +269,7 @@ fn escapable(
     for inner in candidates {
         let inner_dag = scope_dag(root, &inner.scope)?;
         let inner_inst = inner_dag.dag()[inner.node].unwrap_operation();
-        let inner_spec = collect_annotation(py, inner_inst).expect("checked above");
+        let inner_spec = collect_annotation(inner_inst).expect("checked above");
         // Every part of both, not just the first: the two are about to become one layer, and a part
         // that synthesizes differently could not be expressed by it. Same test `find_mergeable` makes.
         let synthesizer = spec.synthesizer();
@@ -299,7 +291,7 @@ fn escapable(
         // it may reach anything at all; they carry none of the content being moved.
         let mut adjacent = true;
         for wire in &inner_wires {
-            if first_site(py, root, outer, *wire, direction)? != Some(inner.clone()) {
+            if first_site(root, outer, *wire, direction)? != Some(inner.clone()) {
                 adjacent = false;
                 break;
             }
@@ -332,13 +324,12 @@ fn escapable(
 
 /// The first site one of a collector's wires reaches, descending into boxes but not into collectors.
 fn first_site(
-    py: Python,
     root: &DAGCircuit,
     from: &Site,
     wire: Qubit,
     direction: Direction,
 ) -> PyResult<Option<Site>> {
-    let descend = |inst: &PackedInstruction| is_box(inst) && collect_annotation(py, inst).is_none();
+    let descend = |inst: &PackedInstruction| is_box(inst) && !is_collector(inst);
     let mut cursor = WireCursor::new(from.scope.clone(), from.node, wire);
     cursor.advance(root, direction, &descend)
 }
@@ -387,7 +378,7 @@ fn lift_to(
 }
 
 /// Move one collector's body into the collector outside its box, and delete it.
-fn escape(py: Python, root: &mut DAGCircuit, plan: &Escape) -> PyResult<()> {
+fn escape(root: &mut DAGCircuit, plan: &Escape) -> PyResult<()> {
     // Everything is read before anything is written: the merged body is built while both collectors
     // are still in place.
     let (op, body) = {
@@ -395,7 +386,7 @@ fn escape(py: Python, root: &mut DAGCircuit, plan: &Escape) -> PyResult<()> {
         let outer_inst = outer_dag.dag()[plan.outer.node].unwrap_operation();
         let frame: Vec<Qubit> = outer_dag.qargs_interner().get(outer_inst.qubits).to_vec();
         let num_clbits = outer_dag.cargs_interner().get(outer_inst.clbits).len();
-        let spec = collect_annotation(py, outer_inst).expect("planned from a collector");
+        let spec = collect_annotation(outer_inst).expect("planned from a collector");
         let outer_body = block_body(outer_dag, outer_inst)?;
 
         let inner_dag = scope_dag(root, &plan.inner.scope)?;
@@ -418,7 +409,7 @@ fn escape(py: Python, root: &mut DAGCircuit, plan: &Escape) -> PyResult<()> {
                 append_contribution(&mut body, contribution, wires, &frame)?;
             }
         }
-        let op = collect_op(py, spec, frame.len(), num_clbits)?;
+        let op = collect_op(spec, frame.len(), num_clbits);
         (op, body.build())
     };
 
@@ -450,7 +441,7 @@ fn order_contributions<'a>(
 }
 
 /// Merge collectors within one scope, then recurse into box bodies with fresh state.
-fn merge_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
+fn merge_scope(dag: &mut DAGCircuit) -> PyResult<()> {
     let all: Vec<Qubit> = (0..dag.num_qubits() as u32).map(Qubit).collect();
     let mut groups: Vec<Group> = Vec::new();
     let mut bodies: Vec<qiskit_circuit::Block> = Vec::new();
@@ -461,7 +452,7 @@ fn merge_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
         let inst = dag.dag()[node].unwrap_operation();
         let qubits: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();
 
-        if let Some(spec) = collect_annotation(py, inst) {
+        if let Some(spec) = collect_annotation(inst) {
             match find_mergeable(&groups, &qubits, spec.synthesizer()) {
                 // Fuse into the open group, which keeps its position and gains this collector's
                 // content and qubits. Nothing is released: a merged contribution has no position of
@@ -497,21 +488,16 @@ fn merge_scope(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
 
     for group in &groups {
         if group.members.len() > 1 {
-            fuse(py, dag, group)?;
+            fuse(dag, group)?;
         }
     }
 
     // Recurse with fresh state, so a nested scope's collectors merge among themselves but never
     // across the boundary.
     for block in bodies {
-        merge_scope(py, dag.view_block_mut(block))?;
+        merge_scope(dag.view_block_mut(block))?;
     }
     Ok(())
-}
-
-/// Whether an instruction is a `box`.
-fn is_box(inst: &PackedInstruction) -> bool {
-    matches!(inst.op.view(), OperationRef::ControlFlow(cf) if matches!(cf.control_flow, ControlFlow::Box { .. }))
 }
 
 /// The open group this collector may fuse into, if any. First match wins, which keeps the result
@@ -554,11 +540,11 @@ fn release(groups: &mut [Group], qubits: &[Qubit]) {
 }
 
 /// Contract one group into a single collector over its full span.
-fn fuse(py: Python, dag: &mut DAGCircuit, group: &Group) -> PyResult<()> {
+fn fuse(dag: &mut DAGCircuit, group: &Group) -> PyResult<()> {
     let frame = group.frame();
     let clbits = merged_clbits(dag, group);
     let body = merged_body(dag, group, &frame, clbits.len())?;
-    let op = merged_op(py, group, frame.len(), clbits.len())?;
+    let op = merged_op(group, frame.len(), clbits.len());
 
     // `replace_block` orders the contracted node's qargs by these maps, so mapping every wire to
     // its own index makes it agree with `frame` by construction.
@@ -671,12 +657,7 @@ fn append_contribution(
 }
 
 /// The collector operation carrying the merged descriptors.
-fn merged_op(
-    py: Python,
-    group: &Group,
-    num_qubits: usize,
-    num_clbits: usize,
-) -> PyResult<PackedOperation> {
+fn merged_op(group: &Group, num_qubits: usize, num_clbits: usize) -> PackedOperation {
     let partition = group.partition();
     // `find_mergeable` has established that every member shares one synthesizer, so the merged
     // descriptors are that one replicated across however many parts the span came out as.
@@ -685,25 +666,92 @@ fn merged_op(
         .map(|_| CollectPart { synthesizer })
         .collect();
     let spec = CollectSpec { partition, parts };
-    collect_op(py, spec, num_qubits, num_clbits)
+    collect_op(spec, num_qubits, num_clbits)
 }
 
-/// A collect box of the given width, carrying this spec.
-fn collect_op(
-    py: Python,
-    spec: CollectSpec,
-    num_qubits: usize,
-    num_clbits: usize,
-) -> PyResult<PackedOperation> {
-    let annotation = Py::new(py, (Collect::new_from_spec(spec), PyAnnotation))?;
-    Ok(PackedOperation::from_control_flow(Box::new(
-        ControlFlowInstruction {
-            control_flow: ControlFlow::Box {
-                duration: None,
-                annotations: vec![annotation.into_any()],
-            },
-            num_qubits: num_qubits as u32,
-            num_clbits: num_clbits as u32,
-        },
-    )))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::annotated_circuit::{DistributionType, Dressing, TwirlSpec};
+    use qiskit_circuit::annotation::Annotation;
+    use qiskit_circuit::operations::StandardGate;
+    use std::sync::Arc;
+
+    use super::super::build::build;
+    use super::super::utils::{append, is_box, new_dag_body, write_box};
+
+    fn twirl() -> Arc<dyn Annotation> {
+        Arc::new(TwirlSpec {
+            distribution: DistributionType::UniformPauli,
+            dressing: Dressing::Left,
+            decomposition: SynthesizerType::RzSx,
+        })
+    }
+
+    /// A one-qubit annotated circuit of `count` twirled boxes in a row, each holding one gate.
+    fn twirled_chain(count: usize) -> DAGCircuit {
+        Python::initialize();
+        let mut out = new_dag_body(1, 0, count * 2).unwrap().into_builder();
+        for _ in 0..count {
+            let mut body = new_dag_body(1, 0, 1).unwrap().into_builder();
+            append(&mut body, StandardGate::H.into(), None, &[Qubit(0)], &[]).unwrap();
+            write_box(
+                &mut out,
+                body.build(),
+                vec![twirl()],
+                None,
+                &[Qubit(0)],
+                &[],
+            )
+            .unwrap();
+        }
+        out.build()
+    }
+
+    fn collector_count(dag: &DAGCircuit) -> usize {
+        dag.topological_op_nodes(false)
+            .map(|node| dag.dag()[node].unwrap_operation())
+            .filter(|inst| is_collector(inst))
+            .count()
+    }
+
+    fn box_count(dag: &DAGCircuit) -> usize {
+        dag.topological_op_nodes(false)
+            .map(|node| dag.dag()[node].unwrap_operation())
+            .filter(|inst| is_box(inst))
+            .count()
+    }
+
+    #[test]
+    fn test_merge_joins_adjacent_collectors_sharing_synthesizer() {
+        // `build` is deliberately local: it writes a collector on each edge of each box and never looks
+        // sideways. Two twirled boxes in a row therefore meet back to back with two collectors between
+        // them, and joining that pair into one is this pass's whole reason to exist.
+        let (mut dag, _table) = build(&twirled_chain(2)).unwrap();
+        assert_eq!(collector_count(&dag), 4, "build collects on all four edges");
+        assert_eq!(box_count(&dag), 6, "two content boxes among them");
+
+        merge_collectors(&mut dag).unwrap();
+
+        assert_eq!(
+            collector_count(&dag),
+            3,
+            "the two collectors that met in the middle fuse into one"
+        );
+        assert_eq!(
+            box_count(&dag),
+            5,
+            "the content boxes are untouched: merging joins collectors, not content"
+        );
+    }
+
+    #[test]
+    fn test_merge_leaves_a_lone_pair_alone() {
+        // Nothing to fuse, so nothing may change. Guards against a merge that widens or drops a
+        // collector just because it walked past one.
+        let (mut dag, _table) = build(&twirled_chain(1)).unwrap();
+        let before = (collector_count(&dag), box_count(&dag));
+        merge_collectors(&mut dag).unwrap();
+        assert_eq!((collector_count(&dag), box_count(&dag)), before);
+    }
 }

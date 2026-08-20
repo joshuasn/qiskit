@@ -15,6 +15,8 @@
 
 use std::collections::VecDeque;
 
+use std::sync::Arc;
+
 use hashbrown::HashMap;
 use rustworkx_core::petgraph::Direction as PetDirection;
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
@@ -22,14 +24,15 @@ use rustworkx_core::petgraph::visit::EdgeRef;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use qiskit_circuit::annotation::Annotation;
 use qiskit_circuit::bit::{ShareableClbit, ShareableQubit};
 use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder, NodeType, Wire};
 use qiskit_circuit::instruction::Parameters;
-use qiskit_circuit::operations::{ControlFlow, OperationRef};
+use qiskit_circuit::operations::{BoxDuration, ControlFlow, ControlFlowInstruction, OperationRef};
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use qiskit_circuit::{Block, Clbit, Qubit};
 
-use crate::emission_circuit::{CollectSpec, EmitSpec, extract_collect};
+use crate::emission_circuit::{CollectSpec, EmitSpec};
 use crate::sampling_graph::{Direction, Edge, Node};
 
 /// Extension trait that converts any `Result<T, E: Display>` into `PyResult<T>` via `PyValueError`.
@@ -91,15 +94,60 @@ pub(super) fn params_of(inst: &PackedInstruction) -> Option<Parameters<qiskit_ci
     (!inst.params_view().is_empty())
         .then(|| Parameters::Params(inst.params_view().iter().cloned().collect()))
 }
-/// The `Collect` annotation on this instruction, if it is a collector.
-pub(super) fn collect_annotation(py: Python, inst: &PackedInstruction) -> Option<CollectSpec> {
+/// The [`CollectSpec`] on this instruction, if it is a collector.
+pub(super) fn collect_annotation(inst: &PackedInstruction) -> Option<CollectSpec> {
+    box_collect_spec(inst).cloned()
+}
+
+/// Whether this instruction is a collect box.
+///
+/// The borrowing half of [`collect_annotation`], for the many walk sites that only need to know
+/// whether to descend, not what the collector holds.
+pub(super) fn is_collector(inst: &PackedInstruction) -> bool {
+    box_collect_spec(inst).is_some()
+}
+
+/// Whether an instruction is a `box`.
+pub(super) fn is_box(inst: &PackedInstruction) -> bool {
+    matches!(inst.op.view(), OperationRef::ControlFlow(cf) if matches!(cf.control_flow, ControlFlow::Box { .. }))
+}
+
+/// Borrow the collect spec off a box's annotations.
+///
+/// The crate's only read of a box's annotations for its own vocabulary, and the reason none of the
+/// IR2 walks need a `Python` token: a native annotation is a Rust value, so asking what a box
+/// declares is a `TypeId` comparison rather than an attribute lookup.
+fn box_collect_spec(inst: &PackedInstruction) -> Option<&CollectSpec> {
     let OperationRef::ControlFlow(cf) = inst.op.view() else {
         return None;
     };
     let ControlFlow::Box { annotations, .. } = &cf.control_flow else {
         return None;
     };
-    annotations.iter().find_map(|a| extract_collect(a.bind(py)))
+    annotations
+        .iter()
+        .find_map(|a| a.as_ref().downcast_ref::<CollectSpec>())
+}
+
+/// A collect box of the given width, carrying this spec.
+///
+/// Any other annotation and any duration on the box being replaced are dropped, which is sound only
+/// because `build::write_collect` is the sole minter of collect boxes and gives them exactly one
+/// annotation and no duration. A collect box that ever needs to carry a second annotation has to
+/// revisit this.
+pub(super) fn collect_op(
+    spec: CollectSpec,
+    num_qubits: usize,
+    num_clbits: usize,
+) -> PackedOperation {
+    PackedOperation::from_control_flow(Box::new(ControlFlowInstruction {
+        control_flow: ControlFlow::Box {
+            duration: None,
+            annotations: vec![Arc::new(spec)],
+        },
+        num_qubits: num_qubits as u32,
+        num_clbits: num_clbits as u32,
+    }))
 }
 pub(super) fn is_emission(inst: &PackedInstruction) -> bool {
     matches!(
@@ -362,6 +410,31 @@ pub(super) fn append(
     Ok(())
 }
 
+/// Append a `box` with this body and these annotations.
+///
+/// The one place a box is written, so the one place its annotations become `Arc<dyn Annotation>`. Its
+/// counterpart is [`box_collect_spec`]: together they are the whole of how samplex puts a declaration
+/// on a box and gets it back, and neither needs a `Python` token to do it.
+pub(super) fn write_box(
+    out: &mut DAGCircuitBuilder,
+    body: DAGCircuit,
+    annotations: Vec<Arc<dyn Annotation>>,
+    duration: Option<BoxDuration>,
+    qargs: &[Qubit],
+    cargs: &[Clbit],
+) -> PyResult<()> {
+    let op = PackedOperation::from_control_flow(Box::new(ControlFlowInstruction {
+        control_flow: ControlFlow::Box {
+            duration,
+            annotations,
+        },
+        num_qubits: qargs.len() as u32,
+        num_clbits: cargs.len() as u32,
+    }));
+    let block = out.add_block(body);
+    append(out, op, Some(Parameters::Blocks(vec![block])), qargs, cargs)
+}
+
 /// Create an empty `DAGCircuit` body with the given dimensions and anonymous wires.
 pub(super) fn new_dag_body(
     num_qubits: usize,
@@ -382,4 +455,132 @@ pub(super) fn new_dag_body(
             .into_py_result()?;
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::annotated_circuit::{DistributionType, Dressing, SynthesizerType, TwirlSpec};
+    use crate::emission_circuit::CollectPart;
+    use crate::partition::Partition;
+    use qiskit_circuit::annotation::Annotation;
+    use qiskit_circuit::operations::StandardGate;
+
+    /// An annotation from outside samplex's vocabulary.
+    ///
+    /// It never materializes into Python here, which is the point: these readers only compare
+    /// `TypeId`s, so a foreign annotation costs them nothing and needs no interpreter.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Foreign;
+
+    impl Annotation for Foreign {
+        fn namespace(&self) -> &str {
+            "someone.else"
+        }
+
+        fn create_py_annotation(&self, _py: Python) -> PyResult<Py<PyAny>> {
+            unimplemented!("these tests never cross into Python")
+        }
+    }
+
+    /// A one-qubit `box` carrying exactly these annotations.
+    ///
+    /// The interner keys are the default empty-slice ones and the block list is empty: these readers
+    /// only look at `inst.op`, so anything else would be fixture that no assertion depends on.
+    fn box_instruction(annotations: Vec<Arc<dyn Annotation>>) -> PackedInstruction {
+        PackedInstruction::from_control_flow(
+            ControlFlowInstruction {
+                control_flow: ControlFlow::Box {
+                    duration: None,
+                    annotations,
+                },
+                num_qubits: 1,
+                num_clbits: 0,
+            },
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+            None,
+        )
+    }
+
+    fn collect_spec() -> CollectSpec {
+        CollectSpec {
+            partition: Partition::singletons(1),
+            parts: vec![CollectPart {
+                synthesizer: SynthesizerType::RzSx,
+            }],
+        }
+    }
+
+    fn twirl_spec() -> TwirlSpec {
+        TwirlSpec {
+            distribution: DistributionType::UniformPauli,
+            dressing: Dressing::Left,
+            decomposition: SynthesizerType::RzSx,
+        }
+    }
+
+    #[test]
+    fn test_collect_annotation_reads_spec() {
+        let spec = collect_spec();
+        let inst = box_instruction(vec![Arc::new(spec.clone())]);
+        assert_eq!(collect_annotation(&inst), Some(spec));
+        assert!(is_collector(&inst));
+        assert!(is_box(&inst));
+    }
+
+    #[test]
+    fn test_is_collector_rejects_content_box() {
+        // A content box is still a box, and it still carries a samplex annotation. What it is not is a
+        // collector — the distinction every IR2 walk descends on.
+        let inst = box_instruction(vec![Arc::new(twirl_spec())]);
+        assert!(is_box(&inst));
+        assert!(!is_collector(&inst));
+        assert_eq!(collect_annotation(&inst), None);
+    }
+
+    #[test]
+    fn test_collect_annotation_ignores_foreign_annotation() {
+        // A stranger's annotation riding along on a collector must not hide the collector, and on its
+        // own must not fabricate one.
+        let spec = collect_spec();
+        let shared = box_instruction(vec![Arc::new(Foreign), Arc::new(spec.clone())]);
+        assert_eq!(collect_annotation(&shared), Some(spec));
+
+        let foreign_only = box_instruction(vec![Arc::new(Foreign)]);
+        assert!(is_box(&foreign_only));
+        assert!(!is_collector(&foreign_only));
+    }
+
+    #[test]
+    fn test_is_box_rejects_a_gate() {
+        let gate = PackedInstruction::from_standard_gate(StandardGate::H, None, Default::default());
+        assert!(!is_box(&gate));
+        assert!(!is_collector(&gate));
+        assert_eq!(collect_annotation(&gate), None);
+    }
+
+    #[test]
+    fn test_collect_op_writes_one_annotation_and_no_duration() {
+        // Pins what `collect_op`'s doc comment claims, and what both callers rely on when they replace
+        // a collector wholesale: exactly one annotation, no duration, the width it was asked for.
+        let spec = collect_spec();
+        let op = collect_op(spec.clone(), 2, 1);
+        let OperationRef::ControlFlow(cf) = op.view() else {
+            panic!("collect_op must produce a control-flow operation");
+        };
+        assert_eq!(cf.num_qubits, 2);
+        assert_eq!(cf.num_clbits, 1);
+        let ControlFlow::Box {
+            duration,
+            annotations,
+        } = &cf.control_flow
+        else {
+            panic!("collect_op must produce a box");
+        };
+        assert!(duration.is_none());
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].downcast_ref::<CollectSpec>(), Some(&spec));
+    }
 }

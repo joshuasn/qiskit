@@ -34,26 +34,26 @@ use smallvec::SmallVec;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use qiskit_circuit::annotation::PyAnnotation;
+use qiskit_circuit::annotation::Annotation;
 use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder, NodeIndex};
 use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{
-    BoxDuration, ControlFlow, ControlFlowInstruction, ControlFlowView, Operation, OperationRef,
-    Param,
+    BoxDuration, ControlFlow, ControlFlowView, Operation, OperationRef, Param,
 };
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
+
 use qiskit_circuit::{BlocksMode, Clbit, Qubit, VarsMode};
+use std::sync::Arc;
 
 use crate::annotated_circuit::{
-    BasisOrigin, BoxAnnotation, Dressing, ResolvedBox, SynthesizerType, extract_annotation,
-    resolve_annotations,
+    BasisOrigin, Dressing, ResolvedBox, SynthesizerType, annotation_kind, resolve_annotations,
 };
 use crate::distributions::{DistEntry, DistKey, DistributionTable};
-use crate::emission_circuit::{Collect, CollectPart, CollectSpec, EmitPart, EmitSpec};
+use crate::emission_circuit::{CollectPart, CollectSpec, EmitPart, EmitSpec};
 use crate::partition::Partition;
 use crate::sampling_graph::Direction;
 
-use super::utils::{IntoPyResult, append, new_dag_body};
+use super::utils::{IntoPyResult, append, new_dag_body, write_box};
 
 /// The synthesizer assumed when a box's annotations do not name one.
 ///
@@ -169,12 +169,12 @@ struct Build {
 /// Build the emission circuit for an annotated circuit.
 #[pyfunction]
 #[pyo3(name = "build_lowered")]
-pub fn py_build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, DistributionTable)> {
-    build(py, dag)
+pub fn py_build(dag: &DAGCircuit) -> PyResult<(DAGCircuit, DistributionTable)> {
+    build(dag)
 }
 
 /// Build the emission circuit for an annotated circuit.
-pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, DistributionTable)> {
+pub fn build(dag: &DAGCircuit) -> PyResult<(DAGCircuit, DistributionTable)> {
     let num_qubits = dag.num_qubits();
     let num_clbits = dag.num_clbits();
     let identity_q: Vec<usize> = (0..num_qubits).collect();
@@ -194,7 +194,7 @@ pub fn build(py: Python, dag: &DAGCircuit) -> PyResult<(DAGCircuit, Distribution
         global: &identity_q,
         clbits: &identity_c,
     };
-    build.walk(py, dag, &mut out, &scope)?;
+    build.walk(dag, &mut out, &scope)?;
     for (key, count) in &build.draw_counts {
         build.table.set_draw_count(*key, *count);
     }
@@ -213,7 +213,6 @@ impl Build {
     /// Emit the IR2 form of every op in `dag` into `out`.
     fn walk(
         &mut self,
-        py: Python,
         dag: &DAGCircuit,
         out: &mut DAGCircuitBuilder,
         scope: &Scope,
@@ -229,7 +228,7 @@ impl Build {
                             cf.name()
                         )));
                     }
-                    self.walk_box(py, dag, inst, out, scope)?;
+                    self.walk_box(dag, inst, out, scope)?;
                 }
                 _ => copy_instruction(dag, inst, out, scope)?,
             }
@@ -240,13 +239,12 @@ impl Build {
     /// Lower one annotated box, or flatten it if it emits nothing.
     fn walk_box(
         &mut self,
-        py: Python,
         dag: &DAGCircuit,
         inst: &PackedInstruction,
         out: &mut DAGCircuitBuilder,
         scope: &Scope,
     ) -> PyResult<()> {
-        let (annotations, foreign) = box_annotations(py, inst)?;
+        let (annotations, foreign) = box_annotations(inst);
         let resolved = resolve_annotations(&annotations).into_py_result()?;
         let duration = box_duration(inst);
 
@@ -280,11 +278,10 @@ impl Build {
                     global: &global,
                     clbits: &flat_c,
                 };
-                return self.walk(py, body, out, &inner);
+                return self.walk(body, out, &inner);
             }
             // Nothing is emitted, so there is no twirl point to place and nothing to classify.
             let content = self.content_body(
-                py,
                 body,
                 width,
                 body_clbits.len(),
@@ -367,7 +364,6 @@ impl Build {
         // twirl point and its emissions written *inside* it, and nested annotated boxes lowered in
         // place so an outer emission crossing this box sees their real gates.
         let content = self.content_body(
-            py,
             body,
             width,
             body_clbits.len(),
@@ -378,7 +374,7 @@ impl Build {
 
         // Write the left edge: the collector, then the emissions that name the box's own edge. The
         // rest are inside the content box, at the twirl point.
-        write_collect(py, out, left, empty_body.clone(), &out_qargs, &out_cargs)?;
+        write_collect(out, left, empty_body.clone(), &out_qargs, &out_cargs)?;
         let left_outer = sorted(
             &|p| p.edge == Direction::Left && is_outer(p),
             Direction::Left,
@@ -393,7 +389,7 @@ impl Build {
             Direction::Right,
         );
         write_emissions(out, &right_outer, &out_qargs)?;
-        write_collect(py, out, right, empty_body, &out_qargs, &out_cargs)?;
+        write_collect(out, right, empty_body, &out_qargs, &out_cargs)?;
         Ok(())
     }
 
@@ -415,7 +411,6 @@ impl Build {
     #[allow(clippy::too_many_arguments)]
     fn content_body(
         &mut self,
-        py: Python,
         body: &DAGCircuit,
         width: usize,
         num_clbits: usize,
@@ -440,15 +435,15 @@ impl Build {
         // A right dressing sweeps the absorbable run to the other end, so it is a suffix there.
         let easy_first = !matches!(dressing, Some(Dressing::Right));
         if easy_first {
-            self.copy_nodes(py, body, &easy_nodes, &mut builder, &inner)?;
+            self.copy_nodes(body, &easy_nodes, &mut builder, &inner)?;
         }
         write_emissions(&mut builder, &inside.left_facing, &body_qargs)?;
         write_emissions(&mut builder, &inside.left_propagating, &body_qargs)?;
-        self.copy_nodes(py, body, &hard_nodes, &mut builder, &inner)?;
+        self.copy_nodes(body, &hard_nodes, &mut builder, &inner)?;
         write_emissions(&mut builder, &inside.right_propagating, &body_qargs)?;
         write_emissions(&mut builder, &inside.right_facing, &body_qargs)?;
         if !easy_first {
-            self.copy_nodes(py, body, &easy_nodes, &mut builder, &inner)?;
+            self.copy_nodes(body, &easy_nodes, &mut builder, &inner)?;
         }
         Ok(builder.build())
     }
@@ -456,7 +451,6 @@ impl Build {
     /// Copy a run of a body's nodes, lowering a nested annotated box in place.
     fn copy_nodes(
         &mut self,
-        py: Python,
         body: &DAGCircuit,
         nodes: &[NodeIndex],
         out: &mut DAGCircuitBuilder,
@@ -474,7 +468,7 @@ impl Build {
                     }
                     // A nested annotated box is lowered in place, so its collect boxes and emissions
                     // land inside this content box, where an outer emission's walk crosses them.
-                    self.walk_box(py, body, inst, out, inner)?;
+                    self.walk_box(body, inst, out, inner)?;
                 }
                 _ => copy_instruction(body, inst, out, inner)?,
             }
@@ -639,25 +633,22 @@ fn is_absorbable(dag: &DAGCircuit, inst: &PackedInstruction) -> bool {
 ///
 /// The second half is not ours to interpret, so it rides along on the content box rather than being
 /// dropped: whatever it means to the consumer, it still means it about this box's content.
+#[allow(clippy::type_complexity)]
 fn box_annotations(
-    py: Python,
     inst: &PackedInstruction,
-) -> PyResult<(Vec<BoxAnnotation>, Vec<Py<PyAny>>)> {
+) -> (Vec<Arc<dyn Annotation>>, Vec<Arc<dyn Annotation>>) {
     let OperationRef::ControlFlow(cf) = inst.op.view() else {
-        return Ok((Vec::new(), Vec::new()));
+        return (Vec::new(), Vec::new());
     };
     let ControlFlow::Box { annotations, .. } = &cf.control_flow else {
-        return Ok((Vec::new(), Vec::new()));
+        return (Vec::new(), Vec::new());
     };
-    let mut ours = Vec::new();
-    let mut foreign = Vec::new();
-    for annotation in annotations {
-        match extract_annotation(annotation.bind(py)) {
-            Ok(parsed) => ours.push(parsed),
-            Err(_) => foreign.push(annotation.clone_ref(py)),
-        }
-    }
-    Ok((ours, foreign))
+    // Retaining either half is an `Arc::clone`, a refcount bump — so splitting a box's annotations
+    // costs nothing and needs no token, even for the foreign ones.
+    annotations
+        .iter()
+        .cloned()
+        .partition(|a| annotation_kind(a.as_ref()).is_some())
 }
 
 /// A box's duration, which the content box carries for the same reason as a foreign annotation.
@@ -721,15 +712,13 @@ fn write_emissions(
 
 /// Write a collect box, with an empty body for `absorb_dressing` to fill in.
 fn write_collect(
-    py: Python,
     out: &mut DAGCircuitBuilder,
     spec: CollectSpec,
     body: DAGCircuit,
     qargs: &[Qubit],
     cargs: &[Clbit],
 ) -> PyResult<()> {
-    let annotation = Py::new(py, (Collect::new_from_spec(spec), PyAnnotation))?;
-    write_box(out, body, vec![annotation.into_any()], None, qargs, cargs)
+    write_box(out, body, vec![Arc::new(spec)], None, qargs, cargs)
 }
 
 /// Write the box holding this box's content, and whatever else rode along on it.
@@ -739,30 +728,123 @@ fn write_collect(
 fn write_content_box(
     out: &mut DAGCircuitBuilder,
     body: DAGCircuit,
-    annotations: Vec<Py<PyAny>>,
+    annotations: Vec<Arc<dyn Annotation>>,
     duration: Option<BoxDuration>,
     qargs: &[Qubit],
     cargs: &[Clbit],
 ) -> PyResult<()> {
     write_box(out, body, annotations, duration, qargs, cargs)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::annotated_circuit::{DistributionType, TwirlSpec};
+    use crate::partition::Partition;
+    use qiskit_circuit::operations::StandardGate;
 
-fn write_box(
-    out: &mut DAGCircuitBuilder,
-    body: DAGCircuit,
-    annotations: Vec<Py<PyAny>>,
-    duration: Option<BoxDuration>,
-    qargs: &[Qubit],
-    cargs: &[Clbit],
-) -> PyResult<()> {
-    let op = PackedOperation::from_control_flow(Box::new(ControlFlowInstruction {
-        control_flow: ControlFlow::Box {
-            duration,
-            annotations,
-        },
-        num_qubits: qargs.len() as u32,
-        num_clbits: cargs.len() as u32,
-    }));
-    let block = out.add_block(body);
-    append(out, op, Some(Parameters::Blocks(vec![block])), qargs, cargs)
+    use super::super::utils::{append, collect_annotation, is_box, is_collector, new_dag_body};
+
+    /// An annotation from outside samplex's vocabulary, of the kind a box may carry alongside ours.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Foreign;
+
+    impl Annotation for Foreign {
+        fn namespace(&self) -> &str {
+            "someone.else"
+        }
+
+        fn create_py_annotation(&self, _py: Python) -> PyResult<Py<PyAny>> {
+            unimplemented!("build never materializes an annotation into Python")
+        }
+    }
+
+    fn twirl() -> TwirlSpec {
+        TwirlSpec {
+            distribution: DistributionType::UniformPauli,
+            dressing: Dressing::Left,
+            decomposition: SynthesizerType::RzSx,
+        }
+    }
+
+    /// A one-qubit annotated circuit: a single `box` holding one gate, carrying these annotations.
+    ///
+    /// This is the smallest thing `build` accepts. The interpreter is needed not for the annotations —
+    /// those are Rust values now — but by `DAGCircuit`'s own `apply_operation_back`, which reaches
+    /// through `get_classical_resources`. Constructing a DAG is still a GIL-bound operation upstream;
+    /// reading what a box declares is not, which is what makes these tests possible at all.
+    fn annotated(annotations: Vec<Arc<dyn Annotation>>) -> DAGCircuit {
+        Python::initialize();
+        let mut body = new_dag_body(1, 0, 1).unwrap().into_builder();
+        append(&mut body, StandardGate::H.into(), None, &[Qubit(0)], &[]).unwrap();
+        let mut out = new_dag_body(1, 0, 2).unwrap().into_builder();
+        write_box(&mut out, body.build(), annotations, None, &[Qubit(0)], &[]).unwrap();
+        out.build()
+    }
+
+    /// Every top-level instruction of a built circuit, in order.
+    fn instructions(dag: &DAGCircuit) -> Vec<&PackedInstruction> {
+        dag.topological_op_nodes(false)
+            .map(|node| dag.dag()[node].unwrap_operation())
+            .collect()
+    }
+
+    #[test]
+    fn test_build_writes_paired_collectors() {
+        // A twirl is a pair, so its collectors come in one: a near half and a far half, with the
+        // content box between them. This is the shape every later IR2 pass walks.
+        let (out, _table) = build(&annotated(vec![Arc::new(twirl())])).unwrap();
+        let boxes: Vec<&PackedInstruction> = instructions(&out)
+            .into_iter()
+            .filter(|i| is_box(i))
+            .collect();
+        let collectors: Vec<&&PackedInstruction> =
+            boxes.iter().filter(|i| is_collector(i)).collect();
+        assert_eq!(collectors.len(), 2, "a twirled box collects on both edges");
+        assert_eq!(
+            boxes.len(),
+            3,
+            "two collectors around exactly one content box"
+        );
+        assert!(
+            !is_collector(boxes[1]),
+            "the content box sits between the pair"
+        );
+        for collector in collectors {
+            let spec = collect_annotation(collector).unwrap();
+            assert_eq!(spec.synthesizer(), SynthesizerType::RzSx);
+            assert_eq!(spec.partition, Partition::singletons(1));
+        }
+    }
+
+    #[test]
+    fn test_build_carries_foreign_annotations() {
+        // Samplex consumes its own annotations and passes on everything else. A stranger's annotation
+        // has to survive to the content box, and ours has to not — the content box is what remains
+        // after samplex has taken its instructions out.
+        let (out, _table) = build(&annotated(vec![Arc::new(twirl()), Arc::new(Foreign)])).unwrap();
+        let content = instructions(&out)
+            .into_iter()
+            .find(|i| is_box(i) && !is_collector(i))
+            .expect("a content box is written even when nothing is left in it");
+        let OperationRef::ControlFlow(cf) = content.op.view() else {
+            unreachable!("is_box already checked this");
+        };
+        let ControlFlow::Box { annotations, .. } = &cf.control_flow else {
+            unreachable!("is_box already checked this");
+        };
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].downcast_ref::<Foreign>(), Some(&Foreign));
+        assert!(
+            annotations[0].downcast_ref::<TwirlSpec>().is_none(),
+            "a consumed twirl must not ride along into IR2"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_duplicate_annotation() {
+        // Two twirls on one box is not a richer request, it is an ambiguous one, and `build` is where
+        // the ambiguity has to stop.
+        let dag = annotated(vec![Arc::new(twirl()), Arc::new(twirl())]);
+        assert!(build(&dag).is_err());
+    }
 }

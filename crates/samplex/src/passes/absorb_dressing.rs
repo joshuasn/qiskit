@@ -53,35 +53,34 @@ use rustworkx_core::petgraph::stable_graph::NodeIndex;
 
 use pyo3::prelude::*;
 use qiskit_circuit::Qubit;
-use qiskit_circuit::annotation::PyAnnotation;
 use qiskit_circuit::dag_circuit::DAGCircuit;
 use qiskit_circuit::instruction::Parameters;
-use qiskit_circuit::operations::{ControlFlow, ControlFlowInstruction, OperationRef};
+use qiskit_circuit::operations::OperationRef;
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 
 use super::utils::{
-    IntoPyResult, Site, WireCursor, collect_annotation, emission_spec, lift_wires, new_dag_body,
-    next_on_wire, params_of, scope_dag, scope_dag_mut, site_instruction,
+    IntoPyResult, Site, WireCursor, collect_annotation, emission_spec, is_box, is_collector,
+    lift_wires, new_dag_body, next_on_wire, params_of, scope_dag, scope_dag_mut, site_instruction,
 };
-use crate::emission_circuit::{Collect, CollectSpec, EmitSpec};
+use crate::emission_circuit::{CollectSpec, EmitSpec};
 use crate::sampling_graph::Direction;
 
 /// Absorb dressing into every collector, in place.
 #[pyfunction]
 #[pyo3(name = "absorb_dressing")]
-pub fn py_absorb_dressing(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
-    absorb_dressing(py, dag)
+pub fn py_absorb_dressing(dag: &mut DAGCircuit) -> PyResult<()> {
+    absorb_dressing(dag)
 }
 
 /// Absorb dressing into every collector, in place.
 ///
 /// Planning reads the whole circuit and rewriting mutates it, so the two are separate sweeps: every
 /// plan is made against the original, and `StableDiGraph` keeps the sites carried between them valid.
-pub fn absorb_dressing(py: Python, dag: &mut DAGCircuit) -> PyResult<()> {
-    let plans = plan_absorptions(py, dag)?;
+pub fn absorb_dressing(dag: &mut DAGCircuit) -> PyResult<()> {
+    let plans = plan_absorptions(dag)?;
     for plan in &plans {
         let body = build_body(dag, plan)?;
-        let op = collect_op(dag, plan, py)?;
+        let op = collect_op(dag, plan)?;
         let scope = scope_dag_mut(dag, &plan.collector.scope)?;
         let block = scope.add_block(body);
         scope
@@ -135,10 +134,10 @@ struct Walk {
 ///
 /// First come, first served: a claimed site is a barrier to the next collector, so nothing is
 /// absorbed twice.
-fn plan_absorptions(py: Python, root: &DAGCircuit) -> PyResult<Vec<Absorption>> {
+fn plan_absorptions(root: &DAGCircuit) -> PyResult<Vec<Absorption>> {
     let mut plans: Vec<Absorption> = Vec::new();
     let mut claimed: HashSet<Site> = HashSet::new();
-    plan_scope(py, root, &mut Vec::new(), &mut plans, &mut claimed)?;
+    plan_scope(root, &mut Vec::new(), &mut plans, &mut claimed)?;
     Ok(plans)
 }
 
@@ -148,7 +147,6 @@ fn plan_absorptions(py: Python, root: &DAGCircuit) -> PyResult<Vec<Absorption>> 
 /// nearer to that content than anything outside, and an outer collector reaching in would starve it.
 /// Within one scope, topological order decides, which makes the winner deterministic.
 fn plan_scope(
-    py: Python,
     root: &DAGCircuit,
     path: &mut Vec<NodeIndex>,
     plans: &mut Vec<Absorption>,
@@ -160,18 +158,18 @@ fn plan_scope(
         let inst = scope_dag(root, path)?.dag()[*node].unwrap_operation();
         // A collector's body holds only what was just absorbed into it, so there is nothing in there
         // to absorb — and descending into one would take content that already belongs to it.
-        if !is_box(inst) || collect_annotation(py, inst).is_some() {
+        if !is_box(inst) || is_collector(inst) {
             continue;
         }
         path.push(*node);
-        plan_scope(py, root, path, plans, claimed)?;
+        plan_scope(root, path, plans, claimed)?;
         path.pop();
     }
 
     for node in &nodes {
         let dag = scope_dag(root, path)?;
         let inst = dag.dag()[*node].unwrap_operation();
-        let Some(spec) = collect_annotation(py, inst) else {
+        let Some(spec) = collect_annotation(inst) else {
             continue;
         };
         let qubits: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();
@@ -181,9 +179,9 @@ fn plan_scope(
         };
 
         // Walking leftward visits the outermost content last, so it comes back reversed.
-        let mut left = walk_absorb(py, root, &collector, Direction::Left, &qubits, claimed)?;
+        let mut left = walk_absorb(root, &collector, Direction::Left, &qubits, claimed)?;
         left.content.reverse();
-        let right = walk_absorb(py, root, &collector, Direction::Right, &qubits, claimed)?;
+        let right = walk_absorb(root, &collector, Direction::Right, &qubits, claimed)?;
 
         let mut content = left.content;
         content.extend(right.content);
@@ -199,11 +197,6 @@ fn plan_scope(
         });
     }
     Ok(())
-}
-
-/// Whether an instruction is a `box`.
-fn is_box(inst: &PackedInstruction) -> bool {
-    matches!(inst.op.view(), OperationRef::ControlFlow(cf) if matches!(cf.control_flow, ControlFlow::Box { .. }))
 }
 
 /// Whether a collector can absorb this instruction: a single-qubit standard gate.
@@ -222,7 +215,6 @@ fn is_absorbable_gate(dag: &DAGCircuit, inst: &PackedInstruction) -> bool {
 /// not. Each round drains the adjacent single-qubit gates then takes at most one emission layer; the
 /// walk ends when no layer is available.
 fn walk_absorb(
-    py: Python,
     root: &DAGCircuit,
     collector: &Site,
     direction: Direction,
@@ -236,7 +228,7 @@ fn walk_absorb(
     };
     // A collect box is a barrier, not something to walk into; anything else with a body is content
     // the walk may reach through.
-    let descend = |inst: &PackedInstruction| is_box(inst) && collect_annotation(py, inst).is_none();
+    let descend = |inst: &PackedInstruction| is_box(inst) && !is_collector(inst);
     let mut cursors: HashMap<Qubit, WireCursor> = qubits
         .iter()
         .map(|qubit| {
@@ -472,7 +464,7 @@ fn build_body(root: &DAGCircuit, plan: &Absorption) -> PyResult<DAGCircuit> {
 }
 
 /// The collector operation carrying the newly absorbed body.
-fn collect_op(root: &DAGCircuit, plan: &Absorption, py: Python) -> PyResult<PackedOperation> {
+fn collect_op(root: &DAGCircuit, plan: &Absorption) -> PyResult<PackedOperation> {
     let scope = scope_dag(root, &plan.collector.scope)?;
     let inst = scope.dag()[plan.collector.node].unwrap_operation();
     let spec = CollectSpec {
@@ -480,15 +472,9 @@ fn collect_op(root: &DAGCircuit, plan: &Absorption, py: Python) -> PyResult<Pack
         partition: plan.spec.partition.clone(),
         parts: plan.spec.parts.clone(),
     };
-    let annotation = Py::new(py, (Collect::new_from_spec(spec), PyAnnotation))?;
-    Ok(PackedOperation::from_control_flow(Box::new(
-        ControlFlowInstruction {
-            control_flow: ControlFlow::Box {
-                duration: None,
-                annotations: vec![annotation.into_any()],
-            },
-            num_qubits: scope.qargs_interner().get(inst.qubits).len() as u32,
-            num_clbits: scope.cargs_interner().get(inst.clbits).len() as u32,
-        },
-    )))
+    Ok(super::utils::collect_op(
+        spec,
+        scope.qargs_interner().get(inst.qubits).len(),
+        scope.cargs_interner().get(inst.clbits).len(),
+    ))
 }

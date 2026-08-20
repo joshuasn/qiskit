@@ -22,11 +22,13 @@
 //! read-only view, built on demand by [`EmitSpec::create_py_op`] whenever Python asks a circuit for
 //! the operation — which is what keeps a lowered circuit inspectable and drawable.
 
+use std::sync::Arc;
+
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::PyString;
-use qiskit_circuit::annotation::PyAnnotation;
+use qiskit_circuit::annotation::{Annotation, PyAnnotation};
 use qiskit_circuit::operations::{CustomOperation, Operation, Param};
 use smallvec::SmallVec;
 
@@ -270,9 +272,10 @@ pub fn ensure_registered(py: Python) -> PyResult<()> {
 
 // --- Collect ------------------------------------------------------------------------------------
 //
-// `Collect` is deliberately not a `BoxAnnotation` variant: that enum is the *input* vocabulary,
-// while this is written by the build pass. Keeping them apart is what makes a lowered circuit
-// distinguishable from an annotated one.
+// `Collect` is deliberately kept out of the IR1 vocabulary: those five annotations are what a user
+// writes, while this one is written by the build pass. Keeping them apart is what makes a lowered
+// circuit distinguishable from an annotated one, and it is why `Collect` declares a child namespace
+// rather than the flat `samplex` the input annotations share.
 
 /// Per-part descriptor for a collector, parallel with its partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,17 +306,38 @@ impl CollectSpec {
     }
 }
 
+/// The namespace a collector declares. A child of the IR1 namespace, so a single `samplex` handler
+/// still catches it by the dispatch chain's parent fallback, while a handler that only cares about
+/// what samplex *emitted* can name it exactly.
+const NAMESPACE: &str = "samplex.collect";
+
+impl Annotation for CollectSpec {
+    fn namespace(&self) -> &str {
+        NAMESPACE
+    }
+
+    fn create_py_annotation(&self, py: Python) -> PyResult<Py<PyAny>> {
+        Ok(Py::new(py, Collect::init(self.clone()))?.into_any())
+    }
+}
+
 /// Marks a box whose body holds what a dressing absorbed, to be replaced by a synthesizer template
 /// during lowering.
 #[pyclass(module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
 pub struct Collect {
-    pub(crate) inner: CollectSpec,
+    inner: Arc<CollectSpec>,
 }
 
 impl Collect {
-    /// Wrap a spec.
-    pub fn new_from_spec(inner: CollectSpec) -> Self {
-        Collect { inner }
+    /// Build the initializer, base and subclass sharing one allocation.
+    ///
+    /// The base *must* carry the native value: without it a Python round trip comes back as an
+    /// opaque `PythonAnnotation`, `utils::collect_annotation` stops seeing the box as a collector,
+    /// and the pass walks quietly treat it as ordinary content. This is the same hazard the `Emit`
+    /// note above records, and it fails silently in exactly the same way.
+    fn init(spec: CollectSpec) -> PyClassInitializer<Self> {
+        let inner = Arc::new(spec);
+        PyClassInitializer::from(PyAnnotation::new(inner.clone())).add_subclass(Collect { inner })
     }
 }
 
@@ -328,19 +352,15 @@ impl Collect {
     #[pyo3(signature = (synthesizer="rzsx"))]
     fn new(synthesizer: &str) -> PyResult<PyClassInitializer<Self>> {
         let synth = parse_decomposition(synthesizer)?;
-        Ok(
-            PyClassInitializer::from(PyAnnotation).add_subclass(Collect {
-                inner: CollectSpec {
-                    partition: Partition::singletons(0),
-                    parts: vec![CollectPart { synthesizer: synth }],
-                },
-            }),
-        )
+        Ok(Collect::init(CollectSpec {
+            partition: Partition::singletons(0),
+            parts: vec![CollectPart { synthesizer: synth }],
+        }))
     }
 
     #[classattr]
     fn namespace(py: Python) -> Py<PyString> {
-        intern!(py, "samplex").clone().unbind()
+        intern!(py, NAMESPACE).clone().unbind()
     }
 
     #[getter]
@@ -356,7 +376,70 @@ impl Collect {
     }
 }
 
-/// Try to extract a [`CollectSpec`] from a Python annotation object.
-pub fn extract_collect(obj: &Bound<'_, PyAny>) -> Option<CollectSpec> {
-    obj.cast::<Collect>().ok().map(|c| c.get().inner.clone())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qiskit_circuit::annotation::extract_annotation;
+
+    fn spec() -> CollectSpec {
+        CollectSpec {
+            partition: Partition::singletons(2),
+            parts: vec![
+                CollectPart {
+                    synthesizer: SynthesizerType::RzSx,
+                },
+                CollectPart {
+                    synthesizer: SynthesizerType::RzSx,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_collect_round_trips_through_python() {
+        // The collector is the one annotation samplex both writes and reads back, so this round trip
+        // is the one that keeps the IR2 passes able to recognise their own output.
+        let original = spec();
+        Python::initialize();
+        Python::attach(|py| {
+            let object = original.create_py_annotation(py).unwrap();
+            let recovered = extract_annotation(object.bind(py));
+            assert_eq!(recovered.downcast_ref::<CollectSpec>(), Some(&original));
+        });
+    }
+
+    #[test]
+    fn test_python_constructed_collect_is_native() {
+        // `Collect(...)` from Python goes through `#[new]`, a different path to `create_py_annotation`.
+        // If that path left the base empty, a user-written collector would be invisible to every Rust
+        // reader while looking perfectly correct from Python.
+        Python::initialize();
+        Python::attach(|py| {
+            let object = Py::new(py, Collect::new("rzrx").unwrap()).unwrap();
+            let recovered = extract_annotation(object.bind(py).as_any());
+            let spec = recovered
+                .downcast_ref::<CollectSpec>()
+                .expect("a Python-constructed collector must still be a native one");
+            assert_eq!(spec.synthesizer(), SynthesizerType::RzRx);
+        });
+    }
+
+    #[test]
+    fn test_collect_declares_a_child_namespace() {
+        // Samplex's *output* vocabulary, so a namespace of its own — but a child of the input one, so a
+        // single `samplex` handler still catches it by parent fallback.
+        assert_eq!(spec().namespace(), "samplex.collect");
+        assert!(
+            spec()
+                .namespace()
+                .starts_with(crate::annotated_circuit::NAMESPACE)
+        );
+        Python::initialize();
+        Python::attach(|py| {
+            assert_eq!(
+                Collect::namespace(py).extract::<String>(py).unwrap(),
+                NAMESPACE
+            );
+        });
+    }
 }
