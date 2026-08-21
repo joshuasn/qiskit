@@ -38,7 +38,7 @@ use qiskit_circuit::packed_instruction::PackedInstruction;
 use qiskit_circuit::parameter::parameter_expression::ParameterExpression;
 use qiskit_circuit::parameter::symbol_expr::{Symbol, Value};
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
 
 use qiskit_circuit::operations::StandardInstruction;
@@ -48,12 +48,11 @@ use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::DistributionTable;
 use crate::emission_circuit::Emit;
 use crate::parameters::ParameterTable;
-use crate::partition::Partition;
 use crate::sampling_graph::{
-    AbsorbedGate, AbsorbedParam, Collect, CollectStep, Direction, Edge, Emission, LocalEmission,
-    Measure, Node, NodeKind, Propagate, SamplingGraph,
+    AbsorbedGate, AbsorbedParam, Collect, CollectStep, Emission, LocalEmission, Measure, Node,
+    NodeKind, SamplingGraph,
 };
-use crate::virtual_type::{VirtualType, propagates};
+use crate::spine::{self, Spine};
 
 /// How many angles a synthesizer needs per qubit; both are three-angle Euler decompositions.
 const PARAMS_PER_QUBIT: usize = 3;
@@ -319,42 +318,6 @@ fn copy_with_qargs(
 //
 // The template says *what to execute*; the graph says *how to compute the angles*.
 
-/// One collector, flattened out of the circuit.
-struct CollectorInfo {
-    qubits: Vec<usize>,
-    /// How those qubits group into subsystems, by index into `qubits`.
-    partition: Partition,
-    synthesizer: SynthesizerType,
-    param_indices: Vec<usize>,
-    /// Everything this collector composes, in the order `flatten` read it out of the body.
-    steps: Vec<CollectStep>,
-}
-
-impl CollectorInfo {
-    /// The absorbed gates alone, for an enclosing emission crossing this collector: it conjugates
-    /// by the gates and ignores what the collector consumes.
-    fn gates(&self) -> impl Iterator<Item = &AbsorbedGate> {
-        crate::sampling_graph::collect_step_gates(&self.steps)
-    }
-}
-
-/// The circuit as a flat sequence, which is what makes the propagation walk a simple scan.
-enum Event {
-    Emission(Emit, Vec<usize>),
-    Collector(usize),
-    Gate(StandardGate, Vec<usize>),
-    Measure(Vec<usize>, Vec<usize>),
-    Reset(Vec<usize>),
-    /// A real operation with no virtual effect, kept so positions line up with the template.
-    Opaque,
-}
-
-/// What identifies one conjugation node: a gate occurrence together with the flow crossing it.
-///
-/// The occurrence is `(event position, offset)`, the offset being the position within a collector's
-/// absorbed run and zero for a gate that stands on its own.
-type GateKey = (usize, usize, Direction, VirtualType);
-
 /// Build the sampling graph for an emission circuit, and the parameter table it refers into.
 ///
 /// `collectors` must come from [`build_template`] over the same circuit.
@@ -363,29 +326,28 @@ pub fn build_sampling_graph(
     table: &DistributionTable,
     collectors: &[CollectorParams],
 ) -> PyResult<(SamplingGraph, ParameterTable)> {
-    let mut events = Vec::new();
-    let mut infos = Vec::new();
+    let mut spine = Spine::default();
     let mut parameters = ParameterTable::new();
     let identity: Vec<usize> = (0..dag.num_qubits()).collect();
-    flatten(dag, &identity, &mut events, &mut infos, &mut parameters)?;
+    flatten(dag, &identity, &mut spine, &mut parameters)?;
 
-    if infos.len() != collectors.len() {
+    if spine.collectors.len() != collectors.len() {
         return Err(PyValueError::new_err(format!(
             "the template found {} collectors but the graph walk found {}; they must be built from \
              the same circuit",
             collectors.len(),
-            infos.len()
+            spine.collectors.len()
         )));
     }
-    for (info, params) in infos.iter_mut().zip(collectors) {
+    for (info, params) in spine.collectors.iter_mut().zip(collectors) {
         info.param_indices = params.param_indices.clone();
     }
 
     let mut sg = SamplingGraph::new();
 
     // Sinks first, so an emission's walk always has a node to terminate at.
-    let mut collector_nodes = Vec::with_capacity(infos.len());
-    for info in &infos {
+    let mut collector_nodes = Vec::with_capacity(spine.collectors.len());
+    for info in &spine.collectors {
         collector_nodes.push(sg.graph.add_node(Node::new(
             info.qubits.clone(),
             info.partition.clone(),
@@ -401,12 +363,12 @@ pub fn build_sampling_graph(
     // is the same conjugation. Direction and virtual type are in the key because they change what
     // the node computes, so sharing across them would fuse operations that cannot be evaluated as
     // one.
-    let mut gate_nodes: HashMap<GateKey, NodeIndex> = HashMap::new();
+    let mut gate_nodes: HashMap<spine::GateKey, NodeIndex> = HashMap::new();
     let mut emission_nodes: HashMap<usize, NodeIndex> = HashMap::new();
 
-    for (position, event) in events.iter().enumerate() {
-        match event {
-            Event::Emission(spec, qubits) => {
+    for (position, item) in spine.items.iter().enumerate() {
+        match item {
+            spine::Item::Emission(spec, qubits) => {
                 let node = sg.graph.add_node(Node::new(
                     qubits.clone(),
                     spec.partition.clone(),
@@ -414,7 +376,7 @@ pub fn build_sampling_graph(
                 ));
                 emission_nodes.insert(position, node);
             }
-            Event::Measure(qubits, clbits) => {
+            spine::Item::Measure(qubits, clbits) => {
                 sg.graph.add_node(Node::singletons(
                     qubits.clone(),
                     NodeKind::Measure(Measure {
@@ -422,7 +384,7 @@ pub fn build_sampling_graph(
                     }),
                 ));
             }
-            Event::Reset(qubits) => {
+            spine::Item::Reset(qubits) => {
                 sg.graph
                     .add_node(Node::singletons(qubits.clone(), NodeKind::Reset));
             }
@@ -433,15 +395,15 @@ pub fn build_sampling_graph(
     // Walk each emission to its target collector, wiring the conjugation chain in between.
     // Target resolution is purely positional: scan from the emission in its travel direction to
     // find the nearest compatible collector.
-    for (position, event) in events.iter().enumerate() {
-        let Event::Emission(spec, qubits) = event else {
+    for (position, item) in spine.items.iter().enumerate() {
+        let spine::Item::Emission(spec, qubits) = item else {
             continue;
         };
         let source = emission_nodes[&position];
         // A local emission is resolved in place inside its collector's body, so it never reaches
-        // the top-level event list; anything here is still travelling.
+        // the top-level spine; anything here is still travelling.
         let direction = spec.direction.expect(
-            "a local emission never surfaces as a top-level Event::Emission — it lives inside its \
+            "a local emission never surfaces as a top-level Item::Emission — it lives inside its \
              collector's body",
         );
         // Unreachable in well-formed IR2: build writes both of a box's collectors, so an emission
@@ -449,93 +411,27 @@ pub fn build_sampling_graph(
         // broken between the two passes or a hand-built circuit has an emission nothing can collect,
         // which would otherwise show up as a randomization that is never undone — so it is reported
         // rather than skipped.
-        let target = scan_for_collector(&events, position, direction, spec, qubits, &infos, table)
+        let target = spine
+            .resolve_collector(position, direction, spec, qubits, table)
             .ok_or_else(|| {
                 PyValueError::new_err(format!(
                     "emission on qubits {qubits:?} travelling {direction:?} has no compatible \
                      collector ahead of it; its randomization could not be undone",
                 ))
             })?;
-        walk_emission(
+        spine.propagate(
             &mut sg,
-            &events,
             position,
             spec,
             qubits,
             source,
             target,
             collector_nodes[target],
-            &infos,
             &mut gate_nodes,
             table,
         )?;
     }
     Ok((sg, parameters))
-}
-
-/// Scan from `start` in `direction` for the first collector that can take this emission.
-///
-/// Proximity decides, filtered by [`compatible`]. A collector that declines is simply crossed — its
-/// absorbed gates conjugate the emission on the way past — so an emission travels until it finds one
-/// that can take it, out of the box it started in and on through whatever it passes. Reaching the end
-/// of the circuit is the error case.
-#[allow(clippy::too_many_arguments)]
-fn scan_for_collector(
-    events: &[Event],
-    start: usize,
-    direction: Direction,
-    spec: &Emit,
-    qubits: &[usize],
-    infos: &[CollectorInfo],
-    table: &DistributionTable,
-) -> Option<usize> {
-    let range: Box<dyn Iterator<Item = usize>> = match direction {
-        Direction::Right => Box::new((start + 1)..events.len()),
-        Direction::Left => Box::new((0..start).rev()),
-    };
-    for i in range {
-        if let Event::Collector(index) = &events[i]
-            && compatible(&infos[*index], spec, qubits, table)
-        {
-            return Some(*index);
-        }
-    }
-    None
-}
-
-/// Whether this collector can take this emission.
-///
-/// **This is the seam where "whose emission is this" is decided, and it is deliberately incomplete.**
-/// Two conditions are in place:
-///
-/// - It covers every qubit the emission acts on. A collector that covers only part of an emission
-///   could not synthesize the whole of what was emitted. The emission's qubits come from the walk
-///   rather than from the spec: a spec groups its *own qargs* by index and is shared by every
-///   placement of it, so it cannot know which wires it landed on.
-/// - Its synthesizer accepts the emission's virtual type, so the value it would have to produce is one
-///   it can express.
-///
-/// Nothing here asks which annotated box the emission came from — position and these two conditions
-/// are all of it. So a collector nested inside an enclosing box will take that box's propagating
-/// emission if it happens to be the first one the walk reaches, terminating the enclosing
-/// randomization at the inner dressing with none of the enclosing content in between. That is
-/// invisible to a round-trip test, since the circuit still evaluates to the same unitary.
-///
-/// **TO DO: make this a type question.** The intended shape is that an emission carries a type a
-/// collector either accepts or declines — a basis change becoming a distinct type rather than a Pauli
-/// that looks like any other, an inner twirl marked as unable to collect it — so that a collector that
-/// should not have it declines, the emission propagates on, and it reaches its own collector by
-/// walking rather than by consulting an id. Until then a nested twirl of the same group is collected
-/// early, and `test_sampling_graph.py::TestNestedPropagation` pins that provisional behaviour so the
-/// change of rule shows up as a test change rather than silently.
-fn compatible(
-    info: &CollectorInfo,
-    spec: &Emit,
-    qubits: &[usize],
-    table: &DistributionTable,
-) -> bool {
-    qubits.iter().all(|q| info.qubits.contains(q))
-        && info.synthesizer.accepts(spec.virtual_type(table))
 }
 
 /// Read one absorbed gate parameter, interning it only if it is genuinely symbolic.
@@ -564,12 +460,14 @@ fn absorbed_param(table: &mut ParameterTable, param: &Param) -> PyResult<Absorbe
     }
 }
 
-/// Flatten a scope into events, inlining hard boxes and reducing each collector to one event.
+/// Read a scope onto the spine, inlining hard boxes and reducing each collector to one position.
+///
+/// This is the adapter between IR2 and [`Spine`], and the only place the DAG is read: everything the
+/// propagation walk needs is flat data by the time it sees it.
 fn flatten(
     src: &DAGCircuit,
     frame: &[usize],
-    events: &mut Vec<Event>,
-    infos: &mut Vec<CollectorInfo>,
+    spine: &mut Spine,
     parameters: &mut ParameterTable,
 ) -> PyResult<()> {
     // The same order `write_scope` uses, so the collectors line up with the template's ranges.
@@ -625,8 +523,7 @@ fn flatten(
                     }));
                 }
             }
-            events.push(Event::Collector(infos.len()));
-            infos.push(CollectorInfo {
+            spine.push_collector(spine::Collector {
                 partition: spec.partition.clone(),
                 qubits,
                 synthesizer: spec.synthesizer(),
@@ -637,158 +534,33 @@ fn flatten(
         }
 
         if let Some(spec) = emission_spec(inst) {
-            events.push(Event::Emission(spec, qubits));
+            spine.items.push(spine::Item::Emission(spec, qubits));
             continue;
         }
 
         // A hard box is a grouping: inline it so its gates sit on the same spine.
         if let Some(body) = plain_box_body(src, inst)? {
-            flatten(body, &qubits, events, infos, parameters)?;
+            flatten(body, &qubits, spine, parameters)?;
             continue;
         }
 
-        events.push(match inst.op.view() {
-            OperationRef::StandardGate(gate) => Event::Gate(gate, qubits),
-            OperationRef::StandardInstruction(StandardInstruction::Measure) => Event::Measure(
-                qubits,
-                src.cargs_interner()
-                    .get(inst.clbits)
-                    .iter()
-                    .map(|c| c.index())
-                    .collect(),
-            ),
-            OperationRef::StandardInstruction(StandardInstruction::Reset) => Event::Reset(qubits),
-            _ => Event::Opaque,
-        });
-    }
-    Ok(())
-}
-
-/// Wire one emission's path: every gate between it and its collector, chained per qubit.
-#[allow(clippy::too_many_arguments)]
-fn walk_emission(
-    sg: &mut SamplingGraph,
-    events: &[Event],
-    from: usize,
-    spec: &Emit,
-    emission_qubits: &[usize],
-    source: NodeIndex,
-    target_index: usize,
-    target_node: NodeIndex,
-    infos: &[CollectorInfo],
-    gate_nodes: &mut HashMap<GateKey, NodeIndex>,
-    table: &DistributionTable,
-) -> PyResult<()> {
-    let qubits: HashSet<usize> = emission_qubits.iter().copied().collect();
-    let mut frontier: HashMap<usize, NodeIndex> = qubits.iter().map(|q| (*q, source)).collect();
-    let direction = spec.direction.expect(
-        "a local emission never surfaces as a top-level Event::Emission — it lives inside its \
-         collector's body",
-    );
-    let virtual_type = spec.virtual_type(table);
-
-    // Walking in the emission's own direction is what makes propagation derivable rather than
-    // recorded.
-    let indices: Vec<usize> = match direction {
-        Direction::Right => (from + 1..events.len()).collect(),
-        Direction::Left => (0..from).rev().collect(),
-    };
-
-    for index in indices {
-        match &events[index] {
-            Event::Collector(collector) if *collector == target_index => break,
-            Event::Collector(collector) => {
-                // A foreign collector's absorbed gates are still real gates on this emission's
-                // path, so they conjugate it, even though that collector also multiplies them into
-                // its own layer.
-                let absorbed: Vec<&AbsorbedGate> = infos[*collector].gates().collect();
-                let order: Vec<usize> = match direction {
-                    Direction::Right => (0..absorbed.len()).collect(),
-                    Direction::Left => (0..absorbed.len()).rev().collect(),
-                };
-                for offset in order {
-                    let gate = &absorbed[offset];
-                    chain(
-                        sg,
-                        &mut frontier,
-                        &qubits,
-                        direction,
-                        gate_nodes,
-                        (index, offset),
-                        gate.gate,
-                        &gate.qubits,
-                        virtual_type,
-                    )?;
-                }
+        spine.items.push(match inst.op.view() {
+            OperationRef::StandardGate(gate) => spine::Item::Gate(gate, qubits),
+            OperationRef::StandardInstruction(StandardInstruction::Measure) => {
+                spine::Item::Measure(
+                    qubits,
+                    src.cargs_interner()
+                        .get(inst.clbits)
+                        .iter()
+                        .map(|c| c.index())
+                        .collect(),
+                )
             }
-            Event::Gate(gate, gate_qubits) => chain(
-                sg,
-                &mut frontier,
-                &qubits,
-                direction,
-                gate_nodes,
-                (index, 0),
-                *gate,
-                gate_qubits,
-                virtual_type,
-            )?,
-            _ => {}
-        }
-    }
-
-    // Whatever each wire's virtual state ended up as is what the collector synthesizes.
-    let ends: HashSet<NodeIndex> = frontier.values().copied().collect();
-    for end in ends {
-        sg.graph.add_edge(end, target_node, Edge::new());
-    }
-    Ok(())
-}
-
-/// Add or reuse the node for one gate and advance the frontier over its qubits.
-#[allow(clippy::too_many_arguments)]
-fn chain(
-    sg: &mut SamplingGraph,
-    frontier: &mut HashMap<usize, NodeIndex>,
-    tracked: &HashSet<usize>,
-    direction: Direction,
-    gate_nodes: &mut HashMap<GateKey, NodeIndex>,
-    occurrence: (usize, usize),
-    gate: StandardGate,
-    gate_qubits: &[usize],
-    virtual_type: VirtualType,
-) -> PyResult<()> {
-    if !gate_qubits.iter().any(|q| tracked.contains(q)) {
-        return Ok(());
-    }
-    // Refuse rather than emit a node that cannot be evaluated: conjugating this virtual type by
-    // this gate leaves its group, so there is no rule to apply.
-    if !propagates(virtual_type, gate) {
-        return Err(PyValueError::new_err(format!(
-            "cannot propagate a {} virtual gate through '{}': no propagation rule exists for that \
-             combination, so the randomization could not be undone. Only Cliffords (and RZZ) admit \
-             Pauli and local-C1 propagation; a local U2 element admits single-qubit gates only.",
-            virtual_type.name(),
-            gate.name(),
-        )));
-    }
-    let key = (occurrence.0, occurrence.1, direction, virtual_type);
-    let node = *gate_nodes.entry(key).or_insert_with(|| {
-        // One joint subsystem: a conjugation by a multi-qubit gate mixes its qubits, so they can
-        // only be evaluated together.
-        sg.graph.add_node(Node::joint(
-            gate_qubits.to_vec(),
-            NodeKind::Propagate(Propagate { gate, direction }),
-        ))
-    });
-    let predecessors: HashSet<NodeIndex> = gate_qubits
-        .iter()
-        .filter_map(|q| frontier.get(q).copied())
-        .collect();
-    for predecessor in predecessors {
-        sg.graph.add_edge(predecessor, node, Edge::new());
-    }
-    for q in gate_qubits.iter().filter(|q| tracked.contains(*q)) {
-        frontier.insert(*q, node);
+            OperationRef::StandardInstruction(StandardInstruction::Reset) => {
+                spine::Item::Reset(qubits)
+            }
+            _ => spine::Item::Opaque,
+        });
     }
     Ok(())
 }
@@ -804,7 +576,7 @@ fn emission_kind(spec: &Emit, table: &DistributionTable) -> PyResult<NodeKind> {
     Ok(NodeKind::Emission(Emission {
         key: spec.dist(),
         direction: spec.direction.expect(
-            "a local emission never surfaces as a top-level Event::Emission — it lives inside its \
+            "a local emission never surfaces as a top-level Item::Emission — it lives inside its \
              collector's body",
         ),
         virtual_type: entry.virtual_type(),

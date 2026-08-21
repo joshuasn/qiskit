@@ -61,6 +61,7 @@ pub mod parameters;
 pub mod partition;
 pub mod passes;
 pub mod sampling_graph;
+pub mod spine;
 pub mod virtual_type;
 
 pub fn samplex_mod(m: &Bound<PyModule>) -> PyResult<()> {
