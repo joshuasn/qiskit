@@ -21,9 +21,12 @@
 //! **Parameters are minted here and nowhere earlier**, so every pass that changes the number or
 //! width of collectors must already have run.
 //!
-//! Nothing here mutates its input. Both readers traverse in `topological_op_nodes` order, which is
-//! what lets [`build_sampling_graph`] pair its collectors with the template's parameter ranges by
-//! position. Inside a collector body that order must not be reported as circuit order; see
+//! Nothing here mutates its input. Two readers walk the same emission circuit — one writing the
+//! template, one reading the spine — and each records the [`Site`] of every collector it sees, so
+//! [`build_sampling_graph`] pairs a graph collector with its template parameter range by identity
+//! rather than by the order the two walks happened to arrive in. A collector one reader sees and the
+//! other does not is then a failed lookup rather than a shifted range. Inside a collector body the
+//! traversal order must not be reported as circuit order; see
 //! [`Collect::steps`](crate::sampling_graph::Collect::steps).
 
 use std::sync::Arc;
@@ -47,7 +50,7 @@ use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::DistributionTable;
 use crate::emission_circuit::Emit;
 use crate::emission_circuit_navigation::{
-    block_body, collect_annotation, emission_spec, is_box, is_emission,
+    Site, block_body, collect_annotation, emission_spec, is_box, is_emission,
 };
 use crate::error::IntoPyResult;
 use crate::parameters::ParameterTable;
@@ -63,6 +66,10 @@ const PARAMS_PER_QUBIT: usize = 3;
 /// Where one collector's angles live in the template's parameter vector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectorParams {
+    /// The collect box these angles were minted for. This is the join key: it is what lets
+    /// [`build_sampling_graph`] find the range belonging to a given graph collector without relying
+    /// on the two walks reporting their collectors in the same order.
+    pub site: Site,
     /// The collector's qubits, ascending.
     pub qubits: Vec<usize>,
     pub synthesizer: SynthesizerType,
@@ -73,7 +80,9 @@ pub struct CollectorParams {
 
 /// Build the template circuit for an emission circuit.
 ///
-/// Returns the template plus one [`CollectorParams`] per collector, in circuit order.
+/// Returns the template plus one [`CollectorParams`] per collector, each naming the collect box it
+/// came from. The order is circuit order, but nothing downstream depends on that: the site is what
+/// identifies a range.
 pub fn build_template(dag: &DAGCircuit) -> PyResult<(CircuitData, Vec<CollectorParams>)> {
     let mut out = CircuitData::with_capacity(
         dag.num_qubits() as u32,
@@ -91,6 +100,7 @@ pub fn build_template(dag: &DAGCircuit) -> PyResult<(CircuitData, Vec<CollectorP
     write_scope(
         dag,
         &mut out,
+        &[],
         &identity,
         &identity,
         &mut collectors,
@@ -137,17 +147,19 @@ pub fn py_lower(
 ///
 /// `frame` maps scope-local qubits to indices in `out`, which is the enclosing box's body when this
 /// scope is nested; `global` maps them to circuit qubits, which is the frame a [`CollectorParams`] is
-/// always reported in. At the top level the two coincide.
+/// always reported in. At the top level the two coincide. `scope` is the path of box nodes descended
+/// through to reach `src`, which is what lets a collector here be named by its [`Site`].
 fn write_scope(
     src: &DAGCircuit,
     out: &mut CircuitData,
+    scope: &[NodeIndex],
     frame: &[usize],
     global: &[usize],
     collectors: &mut Vec<CollectorParams>,
     next_param: &mut usize,
 ) -> PyResult<()> {
-    // Topological order, which is the order parameters are minted in and hence the order
-    // `CollectorParams` are reported in. `flatten` walks the same order, so the two line up.
+    // Topological order, which is the order parameters are minted in. `flatten` walks the same order,
+    // but neither walk relies on that any more: each collector is reported under its own site.
     for node in src.topological_op_nodes(false) {
         let inst = src.dag()[node].unwrap_operation();
 
@@ -162,6 +174,10 @@ fn write_scope(
 
             write_synth_template(out, spec.synthesizer(), &written, &param_indices)?;
             collectors.push(CollectorParams {
+                site: Site {
+                    scope: scope.to_vec(),
+                    node,
+                },
                 qubits,
                 synthesizer: spec.synthesizer(),
                 param_indices,
@@ -194,6 +210,7 @@ fn write_scope(
             write_scope(
                 body,
                 &mut inner_out,
+                &descend(scope, node),
                 &inner_frame,
                 &inner_global,
                 collectors,
@@ -275,6 +292,17 @@ fn fresh_parameter(index: usize) -> Param {
     Param::ParameterExpression(Arc::new(ParameterExpression::from_symbol(symbol)))
 }
 
+/// The scope one level down: the path to `src` extended by the box node being entered.
+///
+/// Both readers descend through exactly the same boxes, so the paths they build agree, and hence so
+/// do the [`Site`]s they name their collectors by.
+fn descend(scope: &[NodeIndex], node: NodeIndex) -> Vec<NodeIndex> {
+    let mut inner = Vec::with_capacity(scope.len() + 1);
+    inner.extend_from_slice(scope);
+    inner.push(node);
+    inner
+}
+
 /// The body of an unannotated box, or `None` if this is not one.
 fn plain_box_body<'a>(
     src: &'a DAGCircuit,
@@ -317,7 +345,9 @@ fn copy_with_qargs(
 
 /// Build the sampling graph for an emission circuit, and the parameter table it refers into.
 ///
-/// `collectors` must come from [`build_template`] over the same circuit.
+/// `collectors` must come from [`build_template`] over the same circuit. Each is matched to the graph
+/// collector standing at the same [`Site`], so the two walks agreeing on *which* collect boxes exist
+/// is what is required of them, not agreeing on the order they report them in.
 pub fn build_sampling_graph(
     dag: &DAGCircuit,
     table: &DistributionTable,
@@ -326,19 +356,8 @@ pub fn build_sampling_graph(
     let mut spine = Spine::default();
     let mut parameters = ParameterTable::new();
     let identity: Vec<usize> = (0..dag.num_qubits()).collect();
-    flatten(dag, &identity, &mut spine, &mut parameters)?;
-
-    if spine.collectors.len() != collectors.len() {
-        return Err(PyValueError::new_err(format!(
-            "the template found {} collectors but the graph walk found {}; they must be built from \
-             the same circuit",
-            collectors.len(),
-            spine.collectors.len()
-        )));
-    }
-    for (info, params) in spine.collectors.iter_mut().zip(collectors) {
-        info.param_indices = params.param_indices.clone();
-    }
+    flatten(dag, &[], &identity, &mut spine, &mut parameters)?;
+    attach_param_indices(&mut spine.collectors, collectors)?;
 
     let mut sg = SamplingGraph::new();
 
@@ -431,6 +450,52 @@ pub fn build_sampling_graph(
     Ok((sg, parameters))
 }
 
+/// Give each graph collector the parameter range the template minted for the same collect box.
+///
+/// The join is on [`Site`] and not on position. The two readings of the emission circuit are
+/// deliberately different walks — the template keeps a content box and recurses into it, this side
+/// inlines a hard box onto the spine — so a shared arrival order is a convention neither walk is in a
+/// position to check, and comparing counts catches a collector that went missing but not one that
+/// moved. Keyed on identity a move is simply resolved, and the failure that remains is a collect box
+/// only one walk saw, which is reported: the alternative is a range landing on the wrong synth
+/// template, which mis-randomizes a circuit that still executes and still round-trips.
+fn attach_param_indices(
+    collectors: &mut [spine::Collector],
+    params: &[CollectorParams],
+) -> PyResult<()> {
+    let mut by_site: HashMap<&Site, &CollectorParams> = HashMap::with_capacity(params.len());
+    for entry in params {
+        // A site names one collect box, so two ranges under one site means a walk visited a node
+        // twice — the join would have no defined answer, so it is refused rather than resolved.
+        if by_site.insert(&entry.site, entry).is_some() {
+            return Err(PyValueError::new_err(format!(
+                "the template reported two parameter ranges for the collector at {:?}",
+                entry.site
+            )));
+        }
+    }
+    for info in collectors.iter_mut() {
+        let entry = by_site.remove(&info.site).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "the graph walk found a collector at {:?} that the template did not; the two must be \
+                 built from the same circuit",
+                info.site
+            ))
+        })?;
+        info.param_indices = entry.param_indices.clone();
+    }
+    // The other direction: parameters minted for a collector no graph collector claimed. Those angles
+    // would be in the template with nothing computing them.
+    if let Some(site) = by_site.keys().next() {
+        return Err(PyValueError::new_err(format!(
+            "the template minted parameters for {} collector(s) the graph walk did not find, one at \
+             {site:?}; the two must be built from the same circuit",
+            by_site.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Read one absorbed gate parameter, interning it only if it is genuinely symbolic.
 ///
 /// A fully bound expression folds to [`AbsorbedParam::Bound`]. A [`Param::Obj`] is refused
@@ -463,11 +528,15 @@ fn absorbed_param(table: &mut ParameterTable, param: &Param) -> PyResult<Absorbe
 /// propagation walk needs is flat data by the time it sees it.
 fn flatten(
     src: &DAGCircuit,
+    scope: &[NodeIndex],
     frame: &[usize],
     spine: &mut Spine,
     parameters: &mut ParameterTable,
 ) -> PyResult<()> {
-    // The same order `write_scope` uses, so the collectors line up with the template's ranges.
+    // `scope` is the path of box nodes descended through to reach `src`, so that a collector read out
+    // here carries the same site `write_scope` gave it. It is the join key, and it is the reason this
+    // walk and the template's are free to differ in every other respect — as they already do, this one
+    // inlining a hard box where the other keeps it.
     for node in src.topological_op_nodes(false) {
         let inst = src.dag()[node].unwrap_operation();
         let qubits: Vec<usize> = src
@@ -521,6 +590,10 @@ fn flatten(
                 }
             }
             spine.push_collector(spine::Collector {
+                site: Site {
+                    scope: scope.to_vec(),
+                    node,
+                },
                 partition: spec.partition.clone(),
                 qubits,
                 synthesizer: spec.synthesizer(),
@@ -537,7 +610,7 @@ fn flatten(
 
         // A hard box is a grouping: inline it so its gates sit on the same spine.
         if let Some(body) = plain_box_body(src, inst)? {
-            flatten(body, &qubits, spine, parameters)?;
+            flatten(body, &descend(scope, node), &qubits, spine, parameters)?;
             continue;
         }
 
@@ -578,4 +651,220 @@ fn emission_kind(spec: &Emit, table: &DistributionTable) -> PyResult<NodeKind> {
         ),
         virtual_type: entry.virtual_type(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use hashbrown::HashSet;
+    use qiskit_circuit::annotation::Annotation;
+
+    use super::super::build::build;
+    use crate::annotated_circuit::{DistributionType, Dressing, Twirl};
+    use crate::emission_circuit_navigation::{append, new_dag_body, write_box};
+    use crate::partition::Partition;
+
+    // --- The join, on the two sides built by hand ------------------------------------------------
+    //
+    // None of these needs a circuit: a `Site` is a path of node indices and both sides of the join are
+    // plain data, so what the join does with them can be pinned directly. Errors are only ever checked
+    // with `is_err` — reading a `PyErr`'s message would normalize it, which does need Python.
+
+    /// A site at `node`, reached through the boxes `scope` names.
+    fn site(scope: &[usize], node: usize) -> Site {
+        Site {
+            scope: scope.iter().map(|index| NodeIndex::new(*index)).collect(),
+            node: NodeIndex::new(node),
+        }
+    }
+
+    /// One collector as the graph walk reports it, with no range attached yet.
+    fn graph_collector(site: Site) -> spine::Collector {
+        spine::Collector {
+            site,
+            qubits: vec![0],
+            partition: Partition::singletons(1),
+            synthesizer: SynthesizerType::RzSx,
+            param_indices: Vec::new(),
+            steps: Vec::new(),
+        }
+    }
+
+    /// One collector as the template reports it, carrying the range it minted.
+    fn template_params(site: Site, param_indices: Vec<usize>) -> CollectorParams {
+        CollectorParams {
+            site,
+            qubits: vec![0],
+            synthesizer: SynthesizerType::RzSx,
+            param_indices,
+        }
+    }
+
+    #[test]
+    fn test_a_collector_keeps_its_own_range_when_the_walks_disagree_on_order() {
+        // This is the divergence a count comparison cannot see: the same number of collectors on both
+        // sides, in opposite orders. Positionally the second collector would take the first one's
+        // angles, mis-randomizing a circuit that still executes. Keyed on the site there is nothing to
+        // get wrong — the reorder is resolved rather than carried through.
+        let template = vec![
+            template_params(site(&[], 1), vec![0, 1, 2]),
+            template_params(site(&[], 7), vec![3, 4, 5]),
+        ];
+        let mut collectors = vec![graph_collector(site(&[], 7)), graph_collector(site(&[], 1))];
+        attach_param_indices(&mut collectors, &template).unwrap();
+        assert_eq!(collectors[0].param_indices, vec![3, 4, 5]);
+        assert_eq!(collectors[1].param_indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_the_same_node_index_in_two_scopes_is_two_collectors() {
+        // Node indices are per-scope, so identity is the whole path and not its last step. A join keyed
+        // on the node alone would fuse a nested collector with a top-level one.
+        let template = vec![
+            template_params(site(&[], 3), vec![0, 1, 2]),
+            template_params(site(&[4], 3), vec![3, 4, 5]),
+        ];
+        let mut collectors = vec![
+            graph_collector(site(&[4], 3)),
+            graph_collector(site(&[], 3)),
+        ];
+        attach_param_indices(&mut collectors, &template).unwrap();
+        assert_eq!(collectors[0].param_indices, vec![3, 4, 5]);
+        assert_eq!(collectors[1].param_indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_a_collector_only_the_graph_walk_found_is_refused() {
+        // Nothing minted its angles, so there is no honest range to give it. Reported, never skipped: a
+        // collector left with an empty range would synthesize from parameters the template does not
+        // have.
+        let template = vec![template_params(site(&[], 1), vec![0, 1, 2])];
+        let mut collectors = vec![graph_collector(site(&[], 1)), graph_collector(site(&[], 9))];
+        assert!(attach_param_indices(&mut collectors, &template).is_err());
+    }
+
+    #[test]
+    fn test_a_collector_only_the_template_found_is_refused() {
+        // The other direction: angles standing in the template with nothing in the graph computing
+        // them.
+        let template = vec![
+            template_params(site(&[], 1), vec![0, 1, 2]),
+            template_params(site(&[], 9), vec![3, 4, 5]),
+        ];
+        let mut collectors = vec![graph_collector(site(&[], 1))];
+        assert!(attach_param_indices(&mut collectors, &template).is_err());
+    }
+
+    #[test]
+    fn test_two_ranges_for_one_site_is_refused() {
+        // A site names one collect box, so the join would have no defined answer here.
+        let template = vec![
+            template_params(site(&[], 1), vec![0, 1, 2]),
+            template_params(site(&[], 1), vec![3, 4, 5]),
+        ];
+        let mut collectors = vec![graph_collector(site(&[], 1))];
+        assert!(attach_param_indices(&mut collectors, &template).is_err());
+    }
+
+    // --- The two walks over a real emission circuit ----------------------------------------------
+
+    fn twirl() -> Arc<dyn Annotation> {
+        Arc::new(Twirl {
+            distribution: DistributionType::UniformPauli,
+            dressing: Dressing::Left,
+            decomposition: SynthesizerType::RzSx,
+        })
+    }
+
+    /// A twirled box holding a gate and a second twirled box, so lowering has to cross a boundary.
+    ///
+    /// Nesting is the case worth building, because it is where the two walks genuinely differ:
+    /// `write_scope` keeps the content box and recurses into it, `flatten` inlines it onto the spine.
+    fn nested_twirl() -> DAGCircuit {
+        Python::initialize();
+        let mut inner = new_dag_body(1, 0, 1).unwrap().into_builder();
+        append(&mut inner, StandardGate::H.into(), None, &[Qubit(0)], &[]).unwrap();
+
+        let mut outer = new_dag_body(1, 0, 2).unwrap().into_builder();
+        append(&mut outer, StandardGate::H.into(), None, &[Qubit(0)], &[]).unwrap();
+        write_box(
+            &mut outer,
+            inner.build(),
+            vec![twirl()],
+            None,
+            &[Qubit(0)],
+            &[],
+        )
+        .unwrap();
+
+        let mut out = new_dag_body(1, 0, 1).unwrap().into_builder();
+        write_box(
+            &mut out,
+            outer.build(),
+            vec![twirl()],
+            None,
+            &[Qubit(0)],
+            &[],
+        )
+        .unwrap();
+        out.build()
+    }
+
+    #[test]
+    fn test_both_walks_name_the_same_collectors_across_a_box_boundary() {
+        // The claim the join rests on: the two readings descend through the same boxes, so a collector
+        // has one site whichever walk found it.
+        let (dag, _table) = build(&nested_twirl()).unwrap();
+        let (_template, params) = build_template(&dag).unwrap();
+
+        let mut spine = Spine::default();
+        let mut parameters = ParameterTable::new();
+        let identity: Vec<usize> = (0..dag.num_qubits()).collect();
+        flatten(&dag, &[], &identity, &mut spine, &mut parameters).unwrap();
+
+        let template_sites: HashSet<&Site> = params.iter().map(|c| &c.site).collect();
+        let graph_sites: HashSet<&Site> = spine.collectors.iter().map(|c| &c.site).collect();
+        assert_eq!(template_sites.len(), params.len(), "sites are unique");
+        assert_eq!(template_sites, graph_sites);
+        assert_eq!(
+            params.len(),
+            4,
+            "build collects on both edges of both twirled boxes"
+        );
+        assert_eq!(
+            template_sites
+                .iter()
+                .filter(|site| !site.scope.is_empty())
+                .count(),
+            2,
+            "the inner twirl's pair is named through the content box it sits in"
+        );
+    }
+
+    #[test]
+    fn test_lowering_a_nested_circuit_gives_every_collector_its_own_range() {
+        // End to end over the same circuit: the ranges the template minted are exactly the ranges the
+        // graph's collect nodes ask for.
+        let (dag, table) = build(&nested_twirl()).unwrap();
+        let (_template, params) = build_template(&dag).unwrap();
+        let (graph, _parameters) = build_sampling_graph(&dag, &table, &params).unwrap();
+
+        let mut minted: Vec<&Vec<usize>> = params.iter().map(|c| &c.param_indices).collect();
+        let mut bound: Vec<&Vec<usize>> = graph
+            .graph
+            .node_weights()
+            .filter_map(|node| match &node.kind {
+                NodeKind::Collect(collect) => Some(&collect.param_indices),
+                _ => None,
+            })
+            .collect();
+        minted.sort();
+        bound.sort();
+        assert_eq!(minted, bound);
+        assert!(
+            bound.iter().all(|range| range.len() == PARAMS_PER_QUBIT),
+            "one qubit each, so three angles each: {bound:?}"
+        );
+    }
 }

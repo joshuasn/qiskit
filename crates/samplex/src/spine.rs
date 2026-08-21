@@ -33,6 +33,7 @@ use qiskit_circuit::operations::{Operation, StandardGate};
 use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::DistributionTable;
 use crate::emission_circuit::Emit;
+use crate::emission_circuit_navigation::Site;
 use crate::partition::Partition;
 use crate::sampling_graph::{
     AbsorbedGate, CollectStep, Direction, Edge, Node, NodeKind, Propagate, SamplingGraph,
@@ -41,6 +42,10 @@ use crate::virtual_type::{VirtualType, propagates};
 
 /// One collector, flattened out of the circuit.
 pub struct Collector {
+    /// Where this collector stood in the emission circuit, which is what identifies it across the
+    /// two readings of that circuit. A `Site` is a path of node indices, so it survives the borrow
+    /// that produced it and a spine carrying one still holds no `DAGCircuit`.
+    pub site: Site,
     pub qubits: Vec<usize>,
     /// How those qubits group into subsystems, by index into `qubits`.
     pub partition: Partition,
@@ -96,7 +101,8 @@ pub enum Item {
     Gate(StandardGate, Vec<usize>),
     Measure(Vec<usize>, Vec<usize>),
     Reset(Vec<usize>),
-    /// A real operation with no virtual effect, kept so positions line up with the template.
+    /// A real operation with no virtual effect, kept so that a position on the spine still stands for
+    /// one instruction of the circuit it was read from.
     Opaque,
 }
 
@@ -329,8 +335,15 @@ mod tests {
     }
 
     /// A collector over `qubits` whose absorbed run is `steps`.
+    ///
+    /// The site is a placeholder: these tests exercise propagation, which never reads it. What does
+    /// read it is the join in `lower`, tested there.
     fn collector(qubits: &[usize], steps: Vec<CollectStep>) -> Collector {
         Collector {
+            site: Site {
+                scope: Vec::new(),
+                node: NodeIndex::new(0),
+            },
             qubits: qubits.to_vec(),
             partition: Partition::singletons(qubits.len()),
             synthesizer: SynthesizerType::RzSx,
