@@ -24,8 +24,11 @@
 //!   --merge_parallel_nodes, prune, set_virtual_types-->
 //! ```
 //!
-//! Each root module holds one stage's vocabulary; each file under [`passes`] is one transform. Both
-//! optimizations must precede `lower`, which mints the template's parameters.
+//! Most root modules hold one stage's vocabulary, and each file under [`passes`] is one transform.
+//! Two root modules are not stages but *readings* of IR2: [`emission_circuit_navigation`] is how a
+//! pass walks a nested emission circuit, and [`spine`] is the flat reading of one that lowering
+//! resolves propagations along. Both optimizations must precede `lower`, which mints the template's
+//! parameters.
 //!
 //! `absorb_dressing` should precede `merge_collectors`, and the reason is what merging needs rather
 //! than what it does to bodies: two collectors merge only with nothing between them, and absorption is
