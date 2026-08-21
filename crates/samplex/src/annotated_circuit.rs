@@ -12,9 +12,11 @@
 
 //! IR1 vocabulary: the annotations a user puts on a box, and what they resolve to.
 //!
-//! `Twirl`, `ChangeBasis`, `InjectLocalClifford`, `InjectNoise` and `Tag` are the Python-facing
-//! annotations; `resolve_annotations` folds a box's set of them into one `ResolvedBox`. The shared
-//! enums the later IRs borrow live here too, so nothing downstream imports vocabulary from a pass.
+//! [`Twirl`], [`ChangeBasis`], [`InjectLocalClifford`], [`InjectNoise`] and [`Tag`] are the
+//! annotations themselves — native values implementing [`Annotation`] — each paired with a
+//! `Py`-prefixed pyclass that is only Python's view of one. `resolve_annotations` folds a box's set
+//! of them into one `ResolvedBox`. The shared enums the later IRs borrow live here too, so nothing
+//! downstream imports vocabulary from a pass.
 
 use std::sync::Arc;
 
@@ -122,18 +124,15 @@ pub enum InjectionSite {
 /// stranger did. This is the crate's only classifier over that: it names the ones in our vocabulary
 /// and stays silent about the rest, which is what lets a foreign annotation ride through untouched.
 pub fn annotation_kind(annotation: &dyn Annotation) -> Option<AnnotationKind> {
-    if annotation.downcast_ref::<TwirlSpec>().is_some() {
+    if annotation.downcast_ref::<Twirl>().is_some() {
         Some(AnnotationKind::Twirl)
-    } else if annotation.downcast_ref::<ChangeBasisSpec>().is_some() {
+    } else if annotation.downcast_ref::<ChangeBasis>().is_some() {
         Some(AnnotationKind::ChangeBasis)
-    } else if annotation
-        .downcast_ref::<InjectLocalCliffordSpec>()
-        .is_some()
-    {
+    } else if annotation.downcast_ref::<InjectLocalClifford>().is_some() {
         Some(AnnotationKind::InjectLocalClifford)
-    } else if annotation.downcast_ref::<InjectNoiseSpec>().is_some() {
+    } else if annotation.downcast_ref::<InjectNoise>().is_some() {
         Some(AnnotationKind::InjectNoise)
-    } else if annotation.downcast_ref::<TagSpec>().is_some() {
+    } else if annotation.downcast_ref::<Tag>().is_some() {
         Some(AnnotationKind::Tag)
     } else {
         None
@@ -154,7 +153,7 @@ pub enum AnnotationKind {
 ///
 /// The `group` (e.g. Pauli, local-C1) is resolved to a [`DistributionType`] at construction time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TwirlSpec {
+pub struct Twirl {
     pub distribution: DistributionType,
     pub dressing: Dressing,
     pub decomposition: SynthesizerType,
@@ -162,7 +161,7 @@ pub struct TwirlSpec {
 
 /// A basis-change annotation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChangeBasisSpec {
+pub struct ChangeBasis {
     pub mode: ChangeBasisMode,
     pub reference: String,
     pub placement: Placement,
@@ -171,14 +170,14 @@ pub struct ChangeBasisSpec {
 
 /// An inject-local-Clifford annotation (a local-Clifford frame change).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InjectLocalCliffordSpec {
+pub struct InjectLocalClifford {
     pub reference: String,
     pub site: InjectionSite,
 }
 
 /// A noise-injection annotation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InjectNoiseSpec {
+pub struct InjectNoise {
     pub reference: String,
     pub modifier: Option<String>,
     pub site: InjectionSite,
@@ -186,7 +185,7 @@ pub struct InjectNoiseSpec {
 
 /// A tag annotation. Carries nothing: it marks a box without asking for any emission.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TagSpec;
+pub struct Tag;
 
 parse_enum!(parse_distribution, DistributionType, "distribution", {
     "uniform_pauli" => UniformPauli,
@@ -253,9 +252,9 @@ pub struct ResolvedBasis {
 /// What a single annotated box resolves to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedBox {
-    pub twirl: Option<TwirlSpec>,
+    pub twirl: Option<Twirl>,
     pub change_basis: Option<ResolvedBasis>,
-    pub inject_noise: Option<InjectNoiseSpec>,
+    pub inject_noise: Option<InjectNoise>,
     pub synthesizer: Option<SynthesizerType>,
     pub dressing: Option<Dressing>,
 }
@@ -300,17 +299,17 @@ pub fn resolve_annotations(annotations: &[Arc<dyn Annotation>]) -> Result<Resolv
     let mut resolved = ResolvedBox::default();
     for annotation in annotations {
         let annotation = annotation.as_ref();
-        if let Some(twirl) = annotation.downcast_ref::<TwirlSpec>() {
+        if let Some(twirl) = annotation.downcast_ref::<Twirl>() {
             resolved.dressing = Some(twirl.dressing);
             resolved.twirl = Some(twirl.clone());
-        } else if let Some(cb) = annotation.downcast_ref::<ChangeBasisSpec>() {
+        } else if let Some(cb) = annotation.downcast_ref::<ChangeBasis>() {
             resolved.change_basis = Some(ResolvedBasis {
                 origin: BasisOrigin::ChangeBasis,
                 mode: cb.mode,
                 ref_id: format!("basis_changes.{}", cb.reference),
                 placement: cb.placement,
             });
-        } else if let Some(ilc) = annotation.downcast_ref::<InjectLocalCliffordSpec>() {
+        } else if let Some(ilc) = annotation.downcast_ref::<InjectLocalClifford>() {
             resolved.change_basis = Some(ResolvedBasis {
                 origin: BasisOrigin::InjectLocalClifford,
                 mode: ChangeBasisMode::LocalClifford,
@@ -320,7 +319,7 @@ pub fn resolve_annotations(annotations: &[Arc<dyn Annotation>]) -> Result<Resolv
                     InjectionSite::After => Placement::End,
                 },
             });
-        } else if let Some(inj) = annotation.downcast_ref::<InjectNoiseSpec>() {
+        } else if let Some(inj) = annotation.downcast_ref::<InjectNoise>() {
             resolved.inject_noise = Some(inj.clone());
         }
     }
@@ -345,49 +344,45 @@ pub fn resolve_annotations(annotations: &[Arc<dyn Annotation>]) -> Result<Resolv
     // third requires a twirl — so a consumer's fallback is unreachable rather than merely unused.
     resolved.synthesizer = annotations
         .iter()
-        .find_map(|a| {
-            a.as_ref()
-                .downcast_ref::<TwirlSpec>()
-                .map(|t| t.decomposition)
-        })
+        .find_map(|a| a.as_ref().downcast_ref::<Twirl>().map(|t| t.decomposition))
         .or_else(|| {
             annotations.iter().find_map(|a| {
                 a.as_ref()
-                    .downcast_ref::<ChangeBasisSpec>()
+                    .downcast_ref::<ChangeBasis>()
                     .map(|cb| cb.decomposition)
             })
         });
     Ok(resolved)
 }
 
-impl Annotation for TwirlSpec {
+impl Annotation for Twirl {
     fn namespace(&self) -> &str {
         NAMESPACE
     }
 
     fn create_py_annotation(&self, py: Python) -> PyResult<Py<PyAny>> {
-        Ok(Py::new(py, Twirl::init(self.clone()))?.into_any())
+        Ok(Py::new(py, PyTwirl::init(self.clone()))?.into_any())
     }
 }
 
-#[pyclass(module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
-pub struct Twirl {
-    inner: Arc<TwirlSpec>,
+#[pyclass(name = "Twirl", module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
+pub struct PyTwirl {
+    inner: Arc<Twirl>,
 }
 
-impl Twirl {
+impl PyTwirl {
     /// Build the initializer, base and subclass sharing one allocation.
     ///
     /// The base *must* carry the native value: without it a Python round trip comes back as an
-    /// opaque `PythonAnnotation` and every `downcast_ref::<TwirlSpec>()` reader silently sees `None`.
-    fn init(spec: TwirlSpec) -> PyClassInitializer<Self> {
+    /// opaque `PythonAnnotation` and every `downcast_ref::<Twirl>()` reader silently sees `None`.
+    fn init(spec: Twirl) -> PyClassInitializer<Self> {
         let inner = Arc::new(spec);
-        PyClassInitializer::from(PyAnnotation::new(inner.clone())).add_subclass(Twirl { inner })
+        PyClassInitializer::from(PyAnnotation::new(inner.clone())).add_subclass(PyTwirl { inner })
     }
 }
 
 #[pymethods]
-impl Twirl {
+impl PyTwirl {
     #[new]
     #[pyo3(signature = (distribution="uniform_pauli", dressing="left", decomposition="rzsx"))]
     fn new(
@@ -395,7 +390,7 @@ impl Twirl {
         dressing: &str,
         decomposition: &str,
     ) -> PyResult<PyClassInitializer<Self>> {
-        Ok(Twirl::init(TwirlSpec {
+        Ok(PyTwirl::init(Twirl {
             distribution: parse_distribution(distribution)?,
             dressing: parse_dressing(dressing)?,
             decomposition: parse_decomposition(decomposition)?,
@@ -415,35 +410,35 @@ impl Twirl {
     }
 }
 
-impl Annotation for ChangeBasisSpec {
+impl Annotation for ChangeBasis {
     fn namespace(&self) -> &str {
         NAMESPACE
     }
 
     fn create_py_annotation(&self, py: Python) -> PyResult<Py<PyAny>> {
-        Ok(Py::new(py, ChangeBasis::init(self.clone()))?.into_any())
+        Ok(Py::new(py, PyChangeBasis::init(self.clone()))?.into_any())
     }
 }
 
-#[pyclass(module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
-pub struct ChangeBasis {
-    inner: Arc<ChangeBasisSpec>,
+#[pyclass(name = "ChangeBasis", module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
+pub struct PyChangeBasis {
+    inner: Arc<ChangeBasis>,
 }
 
-impl ChangeBasis {
+impl PyChangeBasis {
     /// Build the initializer, base and subclass sharing one allocation.
     ///
     /// The base *must* carry the native value: without it a Python round trip comes back as an
-    /// opaque `PythonAnnotation` and every `downcast_ref::<ChangeBasisSpec>()` reader silently sees `None`.
-    fn init(spec: ChangeBasisSpec) -> PyClassInitializer<Self> {
+    /// opaque `PythonAnnotation` and every `downcast_ref::<ChangeBasis>()` reader silently sees `None`.
+    fn init(spec: ChangeBasis) -> PyClassInitializer<Self> {
         let inner = Arc::new(spec);
         PyClassInitializer::from(PyAnnotation::new(inner.clone()))
-            .add_subclass(ChangeBasis { inner })
+            .add_subclass(PyChangeBasis { inner })
     }
 }
 
 #[pymethods]
-impl ChangeBasis {
+impl PyChangeBasis {
     #[new]
     #[pyo3(signature = (reference, mode="measure_pauli", placement="end", decomposition="rzsx"))]
     fn new(
@@ -452,7 +447,7 @@ impl ChangeBasis {
         placement: &str,
         decomposition: &str,
     ) -> PyResult<PyClassInitializer<Self>> {
-        Ok(ChangeBasis::init(ChangeBasisSpec {
+        Ok(PyChangeBasis::init(ChangeBasis {
             mode: parse_change_basis_mode(mode)?,
             reference,
             placement: parse_placement(placement)?,
@@ -473,39 +468,39 @@ impl ChangeBasis {
     }
 }
 
-impl Annotation for InjectLocalCliffordSpec {
+impl Annotation for InjectLocalClifford {
     fn namespace(&self) -> &str {
         NAMESPACE
     }
 
     fn create_py_annotation(&self, py: Python) -> PyResult<Py<PyAny>> {
-        Ok(Py::new(py, InjectLocalClifford::init(self.clone()))?.into_any())
+        Ok(Py::new(py, PyInjectLocalClifford::init(self.clone()))?.into_any())
     }
 }
 
-#[pyclass(module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
-pub struct InjectLocalClifford {
-    inner: Arc<InjectLocalCliffordSpec>,
+#[pyclass(name = "InjectLocalClifford", module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
+pub struct PyInjectLocalClifford {
+    inner: Arc<InjectLocalClifford>,
 }
 
-impl InjectLocalClifford {
+impl PyInjectLocalClifford {
     /// Build the initializer, base and subclass sharing one allocation.
     ///
     /// The base *must* carry the native value: without it a Python round trip comes back as an
-    /// opaque `PythonAnnotation` and every `downcast_ref::<InjectLocalCliffordSpec>()` reader silently sees `None`.
-    fn init(spec: InjectLocalCliffordSpec) -> PyClassInitializer<Self> {
+    /// opaque `PythonAnnotation` and every `downcast_ref::<InjectLocalClifford>()` reader silently sees `None`.
+    fn init(spec: InjectLocalClifford) -> PyClassInitializer<Self> {
         let inner = Arc::new(spec);
         PyClassInitializer::from(PyAnnotation::new(inner.clone()))
-            .add_subclass(InjectLocalClifford { inner })
+            .add_subclass(PyInjectLocalClifford { inner })
     }
 }
 
 #[pymethods]
-impl InjectLocalClifford {
+impl PyInjectLocalClifford {
     #[new]
     #[pyo3(signature = (reference, site="before"))]
     fn new(reference: String, site: &str) -> PyResult<PyClassInitializer<Self>> {
-        Ok(InjectLocalClifford::init(InjectLocalCliffordSpec {
+        Ok(PyInjectLocalClifford::init(InjectLocalClifford {
             reference,
             site: parse_injection_site(site)?,
         }))
@@ -524,35 +519,35 @@ impl InjectLocalClifford {
     }
 }
 
-impl Annotation for InjectNoiseSpec {
+impl Annotation for InjectNoise {
     fn namespace(&self) -> &str {
         NAMESPACE
     }
 
     fn create_py_annotation(&self, py: Python) -> PyResult<Py<PyAny>> {
-        Ok(Py::new(py, InjectNoise::init(self.clone()))?.into_any())
+        Ok(Py::new(py, PyInjectNoise::init(self.clone()))?.into_any())
     }
 }
 
-#[pyclass(module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
-pub struct InjectNoise {
-    inner: Arc<InjectNoiseSpec>,
+#[pyclass(name = "InjectNoise", module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
+pub struct PyInjectNoise {
+    inner: Arc<InjectNoise>,
 }
 
-impl InjectNoise {
+impl PyInjectNoise {
     /// Build the initializer, base and subclass sharing one allocation.
     ///
     /// The base *must* carry the native value: without it a Python round trip comes back as an
-    /// opaque `PythonAnnotation` and every `downcast_ref::<InjectNoiseSpec>()` reader silently sees `None`.
-    fn init(spec: InjectNoiseSpec) -> PyClassInitializer<Self> {
+    /// opaque `PythonAnnotation` and every `downcast_ref::<InjectNoise>()` reader silently sees `None`.
+    fn init(spec: InjectNoise) -> PyClassInitializer<Self> {
         let inner = Arc::new(spec);
         PyClassInitializer::from(PyAnnotation::new(inner.clone()))
-            .add_subclass(InjectNoise { inner })
+            .add_subclass(PyInjectNoise { inner })
     }
 }
 
 #[pymethods]
-impl InjectNoise {
+impl PyInjectNoise {
     #[new]
     #[pyo3(signature = (reference, site="after", modifier=None))]
     fn new(
@@ -560,7 +555,7 @@ impl InjectNoise {
         site: &str,
         modifier: Option<String>,
     ) -> PyResult<PyClassInitializer<Self>> {
-        Ok(InjectNoise::init(InjectNoiseSpec {
+        Ok(PyInjectNoise::init(InjectNoise {
             reference,
             modifier,
             site: parse_injection_site(site)?,
@@ -580,32 +575,32 @@ impl InjectNoise {
     }
 }
 
-impl Annotation for TagSpec {
+impl Annotation for Tag {
     fn namespace(&self) -> &str {
         NAMESPACE
     }
 
     fn create_py_annotation(&self, py: Python) -> PyResult<Py<PyAny>> {
-        Ok(Py::new(py, Tag::init())?.into_any())
+        Ok(Py::new(py, PyTag::init())?.into_any())
     }
 }
 
-#[pyclass(module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
-pub struct Tag;
+#[pyclass(name = "Tag", module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
+pub struct PyTag;
 
-impl Tag {
-    /// Build the initializer. `Tag` has no payload, but the base still carries the native value so
-    /// that a round-tripped `Tag` downcasts back to a `TagSpec`.
+impl PyTag {
+    /// Build the initializer. [`Tag`] has no payload, but the base still carries the native value
+    /// so that a round-tripped annotation downcasts back to a [`Tag`].
     fn init() -> PyClassInitializer<Self> {
-        PyClassInitializer::from(PyAnnotation::new(Arc::new(TagSpec))).add_subclass(Tag)
+        PyClassInitializer::from(PyAnnotation::new(Arc::new(Tag))).add_subclass(PyTag)
     }
 }
 
 #[pymethods]
-impl Tag {
+impl PyTag {
     #[new]
     fn new() -> PyClassInitializer<Self> {
-        Tag::init()
+        PyTag::init()
     }
 
     #[classattr]
@@ -629,7 +624,7 @@ mod tests {
     }
 
     fn twirl(distribution: DistributionType) -> Arc<dyn Annotation> {
-        annotation(TwirlSpec {
+        annotation(Twirl {
             distribution,
             dressing: Dressing::Left,
             decomposition: SynthesizerType::RzSx,
@@ -659,7 +654,7 @@ mod tests {
     }
 
     fn change_basis(reference: &str, placement: Placement) -> Arc<dyn Annotation> {
-        annotation(ChangeBasisSpec {
+        annotation(ChangeBasis {
             mode: ChangeBasisMode::MeasurePauli,
             reference: reference.to_string(),
             placement,
@@ -689,7 +684,7 @@ mod tests {
         // Needs a twirl beside it: an injection happens *to* a twirled box's content.
         let resolved = resolve_annotations(&[
             twirl(DistributionType::UniformPauli),
-            annotation(InjectLocalCliffordSpec {
+            annotation(InjectLocalClifford {
                 reference: "c3".to_string(),
                 site: InjectionSite::Before,
             }),
@@ -703,7 +698,7 @@ mod tests {
 
     #[test]
     fn test_resolve_inject_local_clifford_without_twirl_errors() {
-        let err = resolve_annotations(&[annotation(InjectLocalCliffordSpec {
+        let err = resolve_annotations(&[annotation(InjectLocalClifford {
             reference: "c3".to_string(),
             site: InjectionSite::Before,
         })])
@@ -737,7 +732,7 @@ mod tests {
 
     #[test]
     fn test_resolve_tag_only_produces_nothing() {
-        let resolved = resolve_annotations(&[annotation(TagSpec)]).unwrap();
+        let resolved = resolve_annotations(&[annotation(Tag)]).unwrap();
         assert!(resolved.twirl.is_none());
         assert!(resolved.change_basis.is_none());
         assert!(resolved.inject_noise.is_none());
@@ -756,7 +751,7 @@ mod tests {
 
     #[test]
     fn test_resolve_inject_noise_without_twirl_errors() {
-        let err = resolve_annotations(&[annotation(InjectNoiseSpec {
+        let err = resolve_annotations(&[annotation(InjectNoise {
             reference: "r0".to_string(),
             modifier: None,
             site: InjectionSite::Before,
@@ -769,7 +764,7 @@ mod tests {
     fn test_resolve_inject_noise_with_twirl_ok() {
         let resolved = resolve_annotations(&[
             twirl(DistributionType::UniformPauli),
-            annotation(InjectNoiseSpec {
+            annotation(InjectNoise {
                 reference: "r0".to_string(),
                 modifier: Some("m1".to_string()),
                 site: InjectionSite::After,
@@ -786,7 +781,7 @@ mod tests {
     fn test_resolve_change_basis_conflict_errors() {
         let err = resolve_annotations(&[
             change_basis("0", Placement::Start),
-            annotation(InjectLocalCliffordSpec {
+            annotation(InjectLocalClifford {
                 reference: "0".to_string(),
                 site: InjectionSite::Before,
             }),
@@ -797,7 +792,7 @@ mod tests {
 
     #[test]
     fn test_twirl_round_trips_through_python() {
-        assert_round_trips(TwirlSpec {
+        assert_round_trips(Twirl {
             distribution: DistributionType::UniformPauli,
             dressing: Dressing::Left,
             decomposition: SynthesizerType::RzSx,
@@ -806,7 +801,7 @@ mod tests {
 
     #[test]
     fn test_change_basis_round_trips_through_python() {
-        assert_round_trips(ChangeBasisSpec {
+        assert_round_trips(ChangeBasis {
             mode: ChangeBasisMode::MeasurePauli,
             reference: "0".to_string(),
             placement: Placement::Start,
@@ -816,7 +811,7 @@ mod tests {
 
     #[test]
     fn test_inject_local_clifford_round_trips_through_python() {
-        assert_round_trips(InjectLocalCliffordSpec {
+        assert_round_trips(InjectLocalClifford {
             reference: "c3".to_string(),
             site: InjectionSite::Before,
         });
@@ -824,7 +819,7 @@ mod tests {
 
     #[test]
     fn test_inject_noise_round_trips_through_python() {
-        assert_round_trips(InjectNoiseSpec {
+        assert_round_trips(InjectNoise {
             reference: "r0".to_string(),
             modifier: Some("m1".to_string()),
             site: InjectionSite::After,
@@ -834,23 +829,23 @@ mod tests {
     #[test]
     fn test_tag_round_trips_through_python() {
         // Carries no payload, so the round trip is entirely about identity: a tag has to come back as
-        // a `TagSpec` and not as an opaque annotation that happens to have the right namespace.
-        assert_round_trips(TagSpec);
+        // a `Tag` and not as an opaque annotation that happens to have the right namespace.
+        assert_round_trips(Tag);
     }
 
     #[test]
     fn test_ir1_annotations_share_the_flat_namespace() {
-        // One vocabulary, the one a user writes, so one namespace. `CollectSpec` is the exception and
+        // One vocabulary, the one a user writes, so one namespace. `Collect` is the exception and
         // says why in `emission_circuit`.
         for annotation in [
             twirl(DistributionType::UniformPauli),
             change_basis("0", Placement::Start),
-            annotation(TagSpec),
-            annotation(InjectLocalCliffordSpec {
+            annotation(Tag),
+            annotation(InjectLocalClifford {
                 reference: "c3".to_string(),
                 site: InjectionSite::Before,
             }),
-            annotation(InjectNoiseSpec {
+            annotation(InjectNoise {
                 reference: "r0".to_string(),
                 modifier: None,
                 site: InjectionSite::After,
@@ -868,11 +863,11 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             for declared in [
-                Twirl::namespace(py),
-                ChangeBasis::namespace(py),
-                InjectLocalClifford::namespace(py),
-                InjectNoise::namespace(py),
-                Tag::namespace(py),
+                PyTwirl::namespace(py),
+                PyChangeBasis::namespace(py),
+                PyInjectLocalClifford::namespace(py),
+                PyInjectNoise::namespace(py),
+                PyTag::namespace(py),
             ] {
                 assert_eq!(declared.extract::<String>(py).unwrap(), NAMESPACE);
             }

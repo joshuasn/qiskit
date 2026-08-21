@@ -62,7 +62,7 @@ use super::utils::{
     IntoPyResult, Site, WireCursor, collect_annotation, emission_spec, is_box, is_collector,
     lift_wires, new_dag_body, next_on_wire, params_of, scope_dag, scope_dag_mut, site_instruction,
 };
-use crate::emission_circuit::{CollectSpec, EmitSpec};
+use crate::emission_circuit::{Collect, Emit};
 use crate::sampling_graph::Direction;
 
 /// Absorb dressing into every collector, in place.
@@ -117,7 +117,7 @@ enum BodyOp {
 struct Absorption {
     collector: Site,
     /// The collector's existing descriptors, which absorption does not change.
-    spec: CollectSpec,
+    spec: Collect,
     /// Everything absorbed, in composition order — becomes the collector's body verbatim.
     content: Vec<BodyOp>,
     /// Every node this collector took over, to be deleted from wherever it was.
@@ -273,7 +273,7 @@ fn walk_absorb(
 
         // Take one emission layer. Requiring every wire also confines it to the collector's own
         // qubits, since a wire outside them has no cursor to be adjacent on.
-        let mut layer: Option<(Site, EmitSpec, Vec<Qubit>)> = None;
+        let mut layer: Option<(Site, Emit, Vec<Qubit>)> = None;
         for qubit in qubits {
             let Some((_, site)) = peek(root, &cursors[qubit], direction, claimed, &descend)? else {
                 continue;
@@ -317,7 +317,7 @@ fn walk_absorb(
         let Some((site, spec, wires)) = layer else {
             break;
         };
-        let local_spec = EmitSpec {
+        let local_spec = Emit {
             direction: None,
             partition: spec.partition.clone(),
             parts: spec.parts.clone(),
@@ -467,7 +467,7 @@ fn build_body(root: &DAGCircuit, plan: &Absorption) -> PyResult<DAGCircuit> {
 fn collect_op(root: &DAGCircuit, plan: &Absorption) -> PyResult<PackedOperation> {
     let scope = scope_dag(root, &plan.collector.scope)?;
     let inst = scope.dag()[plan.collector.node].unwrap_operation();
-    let spec = CollectSpec {
+    let spec = Collect {
         // Absorption changes only what a collector composes, not what it is.
         partition: plan.spec.partition.clone(),
         parts: plan.spec.parts.clone(),

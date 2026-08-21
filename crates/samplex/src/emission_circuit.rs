@@ -16,10 +16,10 @@
 //! [`DistKey`] and its draw slots, with opposite [`Direction`]s; `InjectNoise` and `ChangeBasis` /
 //! `InjectLocalClifford` produce one each.
 //!
-//! An emission is Rust-native: [`EmitSpec`] *is* the operation, implementing
+//! An emission is Rust-native: [`Emit`] *is* the operation, implementing
 //! [`CustomOperation`] so it lands in a circuit as a `PackedOperation` with no Python object at
-//! rest, and Rust reads it back with `downcast_ref::<EmitSpec>()`. The [`Emit`] pyclass is a
-//! read-only view, built on demand by [`EmitSpec::create_py_op`] whenever Python asks a circuit for
+//! rest, and Rust reads it back with `downcast_ref::<Emit>()`. The [`PyEmit`] pyclass is a
+//! read-only view, built on demand by [`Emit::create_py_op`] whenever Python asks a circuit for
 //! the operation — which is what keeps a lowered circuit inspectable and drawable.
 
 use std::sync::Arc;
@@ -39,7 +39,7 @@ use crate::sampling_graph::Direction;
 use crate::virtual_type::VirtualType;
 
 /// The instruction name reported to Qiskit for every emission, regardless of kind. Which kind an
-/// emission is comes from the [`DistEntry`] its `dist` key points at; see [`Emit::source`].
+/// emission is comes from the [`DistEntry`] its `dist` key points at; see [`PyEmit::source`].
 pub const EMIT_NAME: &str = "emit";
 
 /// Per-part descriptor for an emission, parallel with its partition.
@@ -54,9 +54,9 @@ pub struct EmitPart {
     pub adjoint: bool,
 }
 
-/// The payload of an [`Emit`] instruction.
+/// An emission: the operation itself, with [`PyEmit`] as Python's read-only view of one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmitSpec {
+pub struct Emit {
     /// Which way the emitted virtual state flows, or `None` if it has already resolved in place —
     /// owned directly by the collector body it sits in, rather than propagating towards one.
     pub direction: Option<Direction>,
@@ -66,7 +66,7 @@ pub struct EmitSpec {
     pub parts: Vec<EmitPart>,
 }
 
-impl EmitSpec {
+impl Emit {
     /// The distribution key of the first part. Convenience for the common uniform case where all
     /// parts share the same distribution.
     pub fn dist(&self) -> DistKey {
@@ -78,12 +78,12 @@ impl EmitSpec {
     pub fn virtual_type(&self, table: &DistributionTable) -> VirtualType {
         table
             .get(self.dist())
-            .expect("an EmitSpec's dist key always resolves in the table it was built from")
+            .expect("an Emit's dist key always resolves in the table it was built from")
             .virtual_type()
     }
 }
 
-impl Operation for EmitSpec {
+impl Operation for Emit {
     fn name(&self) -> &str {
         EMIT_NAME
     }
@@ -105,14 +105,14 @@ impl Operation for EmitSpec {
     }
 }
 
-impl CustomOperation for EmitSpec {
+impl CustomOperation for Emit {
     // An emission is a marker for a later stage to consume, not a gate: it has no matrix and no
     // definition, so it cannot be decomposed or transpiled through.
     fn is_unitary(&self) -> bool {
         false
     }
 
-    /// Hand Python a read-only [`Emit`] view of this emission.
+    /// Hand Python a read-only [`PyEmit`] view of this emission.
     fn create_py_op(
         &self,
         py: Python,
@@ -120,35 +120,40 @@ impl CustomOperation for EmitSpec {
         _label: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
         ensure_registered(py)?;
-        Ok(Py::new(py, Emit::new(self.clone()))?.into_any())
+        Ok(Py::new(py, PyEmit::new(self.clone()))?.into_any())
     }
 }
 
-/// A read-only view onto one [`EmitSpec`] in a lowered circuit.
+/// A read-only view onto one [`Emit`] in a lowered circuit.
 ///
-/// Never the storage — this is materialized on demand by [`EmitSpec::create_py_op`], so there is no
+/// Never the storage — this is materialized on demand by [`Emit::create_py_op`], so there is no
 /// way to build one from Python and append it. That is deliberate: a Python-constructed `Emit` would
-/// land as a `PyInstruction`, which the `downcast_ref::<EmitSpec>()` readers cannot see.
-#[pyclass(module = "qiskit._accelerate.samplex", frozen, skip_from_py_object)]
+/// land as a `PyInstruction`, which the `downcast_ref::<Emit>()` readers cannot see.
+#[pyclass(
+    name = "Emit",
+    module = "qiskit._accelerate.samplex",
+    frozen,
+    skip_from_py_object
+)]
 #[derive(Debug, Clone)]
-pub struct Emit {
-    pub(crate) inner: EmitSpec,
+pub struct PyEmit {
+    pub(crate) inner: Emit,
 }
 
-impl Emit {
+impl PyEmit {
     /// Wrap a spec.
-    pub fn new(inner: EmitSpec) -> Self {
-        Emit { inner }
+    pub fn new(inner: Emit) -> Self {
+        PyEmit { inner }
     }
 
     /// The wrapped spec.
-    pub fn spec(&self) -> &EmitSpec {
+    pub fn spec(&self) -> &Emit {
         &self.inner
     }
 }
 
 #[pymethods]
-impl Emit {
+impl PyEmit {
     // --- the `qiskit.circuit.Operation` interface ---
 
     #[getter]
@@ -247,24 +252,24 @@ impl Emit {
         )
     }
 
-    fn __eq__(&self, other: &Emit) -> bool {
+    fn __eq__(&self, other: &PyEmit) -> bool {
         self.inner == other.inner
     }
 }
 
 static REGISTERED: PyOnceLock<()> = PyOnceLock::new();
 
-/// Register [`Emit`] as an `abc` virtual subclass of `qiskit.circuit.Operation`, once.
+/// Register [`PyEmit`] as an `abc` virtual subclass of `qiskit.circuit.Operation`, once.
 ///
 /// **Must not run while `qiskit._accelerate` is still initialising**, since importing
-/// `qiskit.circuit` that early fails. [`EmitSpec::create_py_op`] is the only caller, which keeps it
+/// `qiskit.circuit` that early fails. [`Emit::create_py_op`] is the only caller, which keeps it
 /// safe by construction: a view is only ever built when Python asks a circuit for an operation, long
 /// after import.
 pub fn ensure_registered(py: Python) -> PyResult<()> {
     REGISTERED.get_or_try_init::<_, PyErr>(py, || {
         qiskit_circuit::imports::OPERATION
             .get_bound(py)
-            .call_method1("register", (py.get_type::<Emit>(),))?;
+            .call_method1("register", (py.get_type::<PyEmit>(),))?;
         Ok(())
     })?;
     Ok(())
@@ -284,16 +289,17 @@ pub struct CollectPart {
     pub synthesizer: SynthesizerType,
 }
 
-/// The payload of a [`Collect`] annotation.
+/// A collect annotation: marks a box whose body holds what a dressing absorbed, to be replaced by
+/// a synthesizer template during lowering.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CollectSpec {
+pub struct Collect {
     /// How the collector's qubits group into subsystems, by index into the box's own qargs.
     pub partition: Partition,
     /// Per-part descriptors, parallel with `partition.iter()`.
     pub parts: Vec<CollectPart>,
 }
 
-impl CollectSpec {
+impl Collect {
     /// The synthesizer of the first part. Convenience for the common uniform case where all parts
     /// share the same synthesizer.
     pub fn synthesizer(&self) -> SynthesizerType {
@@ -311,38 +317,37 @@ impl CollectSpec {
 /// what samplex *emitted* can name it exactly.
 const NAMESPACE: &str = "samplex.collect";
 
-impl Annotation for CollectSpec {
+impl Annotation for Collect {
     fn namespace(&self) -> &str {
         NAMESPACE
     }
 
     fn create_py_annotation(&self, py: Python) -> PyResult<Py<PyAny>> {
-        Ok(Py::new(py, Collect::init(self.clone()))?.into_any())
+        Ok(Py::new(py, PyCollect::init(self.clone()))?.into_any())
     }
 }
 
-/// Marks a box whose body holds what a dressing absorbed, to be replaced by a synthesizer template
-/// during lowering.
-#[pyclass(module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
-pub struct Collect {
-    inner: Arc<CollectSpec>,
+/// Python's view of a [`Collect`].
+#[pyclass(name = "Collect", module = "qiskit._accelerate.samplex", frozen, extends = PyAnnotation)]
+pub struct PyCollect {
+    inner: Arc<Collect>,
 }
 
-impl Collect {
+impl PyCollect {
     /// Build the initializer, base and subclass sharing one allocation.
     ///
     /// The base *must* carry the native value: without it a Python round trip comes back as an
     /// opaque `PythonAnnotation`, `utils::collect_annotation` stops seeing the box as a collector,
     /// and the pass walks quietly treat it as ordinary content. This is the same hazard the `Emit`
     /// note above records, and it fails silently in exactly the same way.
-    fn init(spec: CollectSpec) -> PyClassInitializer<Self> {
+    fn init(spec: Collect) -> PyClassInitializer<Self> {
         let inner = Arc::new(spec);
-        PyClassInitializer::from(PyAnnotation::new(inner.clone())).add_subclass(Collect { inner })
+        PyClassInitializer::from(PyAnnotation::new(inner.clone())).add_subclass(PyCollect { inner })
     }
 }
 
 #[pymethods]
-impl Collect {
+impl PyCollect {
     /// Construct a `Collect` annotation covering no qubits.
     ///
     /// The partition is empty because a bare annotation has no box to take its width from yet, while
@@ -352,7 +357,7 @@ impl Collect {
     #[pyo3(signature = (synthesizer="rzsx"))]
     fn new(synthesizer: &str) -> PyResult<PyClassInitializer<Self>> {
         let synth = parse_decomposition(synthesizer)?;
-        Ok(Collect::init(CollectSpec {
+        Ok(PyCollect::init(Collect {
             partition: Partition::singletons(0),
             parts: vec![CollectPart { synthesizer: synth }],
         }))
@@ -381,8 +386,8 @@ mod tests {
     use super::*;
     use qiskit_circuit::annotation::extract_annotation;
 
-    fn spec() -> CollectSpec {
-        CollectSpec {
+    fn spec() -> Collect {
+        Collect {
             partition: Partition::singletons(2),
             parts: vec![
                 CollectPart {
@@ -404,7 +409,7 @@ mod tests {
         Python::attach(|py| {
             let object = original.create_py_annotation(py).unwrap();
             let recovered = extract_annotation(object.bind(py));
-            assert_eq!(recovered.downcast_ref::<CollectSpec>(), Some(&original));
+            assert_eq!(recovered.downcast_ref::<Collect>(), Some(&original));
         });
     }
 
@@ -415,10 +420,10 @@ mod tests {
         // reader while looking perfectly correct from Python.
         Python::initialize();
         Python::attach(|py| {
-            let object = Py::new(py, Collect::new("rzrx").unwrap()).unwrap();
+            let object = Py::new(py, PyCollect::new("rzrx").unwrap()).unwrap();
             let recovered = extract_annotation(object.bind(py).as_any());
             let spec = recovered
-                .downcast_ref::<CollectSpec>()
+                .downcast_ref::<Collect>()
                 .expect("a Python-constructed collector must still be a native one");
             assert_eq!(spec.synthesizer(), SynthesizerType::RzRx);
         });
@@ -437,7 +442,7 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             assert_eq!(
-                Collect::namespace(py).extract::<String>(py).unwrap(),
+                PyCollect::namespace(py).extract::<String>(py).unwrap(),
                 NAMESPACE
             );
         });

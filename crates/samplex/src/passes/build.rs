@@ -49,7 +49,7 @@ use crate::annotated_circuit::{
     BasisOrigin, Dressing, ResolvedBox, SynthesizerType, annotation_kind, resolve_annotations,
 };
 use crate::distributions::{DistEntry, DistKey, DistributionTable};
-use crate::emission_circuit::{CollectPart, CollectSpec, EmitPart, EmitSpec};
+use crate::emission_circuit::{Collect, CollectPart, Emit, EmitPart};
 use crate::partition::Partition;
 use crate::sampling_graph::Direction;
 
@@ -103,7 +103,7 @@ impl ContentEmissions<'_> {
 
 /// An emission together with where it goes relative to its box's content.
 struct Placed {
-    spec: EmitSpec,
+    spec: Emit,
     /// Which side of the content box it is written on.
     edge: Direction,
     /// Distance from the content box; see the `DEPTH_*` constants.
@@ -303,11 +303,11 @@ impl Build {
 
         // Collectors start empty — the absorb_dressing pass populates them by walking the spine.
         let empty_body = new_body(width, body_clbits.len(), 0)?;
-        let left = CollectSpec {
+        let left = Collect {
             partition: partition.clone(),
             parts: collect_parts.clone(),
         };
-        let right = CollectSpec {
+        let right = Collect {
             partition: partition.clone(),
             parts: collect_parts,
         };
@@ -511,7 +511,7 @@ impl Build {
                     })
                     .collect();
                 emissions.push(Placed {
-                    spec: EmitSpec {
+                    spec: Emit {
                         direction: Some(direction),
                         partition: partition.clone(),
                         parts,
@@ -536,7 +536,7 @@ impl Build {
                 })
                 .collect();
             emissions.push(Placed {
-                spec: EmitSpec {
+                spec: Emit {
                     direction: Some(direction),
                     partition: partition.clone(),
                     parts,
@@ -563,7 +563,7 @@ impl Build {
                 })
                 .collect();
             emissions.push(Placed {
-                spec: EmitSpec {
+                spec: Emit {
                     direction: Some(direction),
                     partition: partition.clone(),
                     parts,
@@ -713,7 +713,7 @@ fn write_emissions(
 /// Write a collect box, with an empty body for `absorb_dressing` to fill in.
 fn write_collect(
     out: &mut DAGCircuitBuilder,
-    spec: CollectSpec,
+    spec: Collect,
     body: DAGCircuit,
     qargs: &[Qubit],
     cargs: &[Clbit],
@@ -738,7 +738,7 @@ fn write_content_box(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotated_circuit::{DistributionType, TwirlSpec};
+    use crate::annotated_circuit::{DistributionType, Twirl};
     use crate::partition::Partition;
     use qiskit_circuit::operations::StandardGate;
 
@@ -758,8 +758,8 @@ mod tests {
         }
     }
 
-    fn twirl() -> TwirlSpec {
-        TwirlSpec {
+    fn twirl() -> Twirl {
+        Twirl {
             distribution: DistributionType::UniformPauli,
             dressing: Dressing::Left,
             decomposition: SynthesizerType::RzSx,
@@ -835,7 +835,7 @@ mod tests {
         assert_eq!(annotations.len(), 1);
         assert_eq!(annotations[0].downcast_ref::<Foreign>(), Some(&Foreign));
         assert!(
-            annotations[0].downcast_ref::<TwirlSpec>().is_none(),
+            annotations[0].downcast_ref::<Twirl>().is_none(),
             "a consumed twirl must not ride along into IR2"
         );
     }

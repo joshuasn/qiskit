@@ -29,8 +29,8 @@ pub enum PartitionError {
 /// A partition of the first *n* integers, grouping an item's qubits into subsystems.
 ///
 /// The parts hold **indices into the qubits of whatever carries the partition** — an
-/// [`Emit`](crate::emission_circuit::EmitSpec)'s qargs, a
-/// [`Collect`](crate::emission_circuit::CollectSpec) box's qargs, a sampling-graph
+/// [`Emit`](crate::emission_circuit::Emit)'s qargs, a
+/// [`Collect`](crate::emission_circuit::Collect) box's qargs, a sampling-graph
 /// [`Node`](crate::sampling_graph::Node)'s own qubit list. Every one of those already names its
 /// qubits, so recording them here too would be a second copy of that list, free to drift out of
 /// agreement with it and with the instruction's width; indices cannot. Pair them back up with

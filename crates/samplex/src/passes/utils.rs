@@ -32,7 +32,7 @@ use qiskit_circuit::operations::{BoxDuration, ControlFlow, ControlFlowInstructio
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use qiskit_circuit::{Block, Clbit, Qubit};
 
-use crate::emission_circuit::{CollectSpec, EmitSpec};
+use crate::emission_circuit::{Collect, Emit};
 use crate::sampling_graph::{Direction, Edge, Node};
 
 /// Extension trait that converts any `Result<T, E: Display>` into `PyResult<T>` via `PyValueError`.
@@ -94,8 +94,8 @@ pub(super) fn params_of(inst: &PackedInstruction) -> Option<Parameters<qiskit_ci
     (!inst.params_view().is_empty())
         .then(|| Parameters::Params(inst.params_view().iter().cloned().collect()))
 }
-/// The [`CollectSpec`] on this instruction, if it is a collector.
-pub(super) fn collect_annotation(inst: &PackedInstruction) -> Option<CollectSpec> {
+/// The [`Collect`] on this instruction, if it is a collector.
+pub(super) fn collect_annotation(inst: &PackedInstruction) -> Option<Collect> {
     box_collect_spec(inst).cloned()
 }
 
@@ -117,7 +117,7 @@ pub(super) fn is_box(inst: &PackedInstruction) -> bool {
 /// The crate's only read of a box's annotations for its own vocabulary, and the reason none of the
 /// IR2 walks need a `Python` token: a native annotation is a Rust value, so asking what a box
 /// declares is a `TypeId` comparison rather than an attribute lookup.
-fn box_collect_spec(inst: &PackedInstruction) -> Option<&CollectSpec> {
+fn box_collect_spec(inst: &PackedInstruction) -> Option<&Collect> {
     let OperationRef::ControlFlow(cf) = inst.op.view() else {
         return None;
     };
@@ -126,7 +126,7 @@ fn box_collect_spec(inst: &PackedInstruction) -> Option<&CollectSpec> {
     };
     annotations
         .iter()
-        .find_map(|a| a.as_ref().downcast_ref::<CollectSpec>())
+        .find_map(|a| a.as_ref().downcast_ref::<Collect>())
 }
 
 /// A collect box of the given width, carrying this spec.
@@ -135,11 +135,7 @@ fn box_collect_spec(inst: &PackedInstruction) -> Option<&CollectSpec> {
 /// because `build::write_collect` is the sole minter of collect boxes and gives them exactly one
 /// annotation and no duration. A collect box that ever needs to carry a second annotation has to
 /// revisit this.
-pub(super) fn collect_op(
-    spec: CollectSpec,
-    num_qubits: usize,
-    num_clbits: usize,
-) -> PackedOperation {
+pub(super) fn collect_op(spec: Collect, num_qubits: usize, num_clbits: usize) -> PackedOperation {
     PackedOperation::from_control_flow(Box::new(ControlFlowInstruction {
         control_flow: ControlFlow::Box {
             duration: None,
@@ -152,7 +148,7 @@ pub(super) fn collect_op(
 pub(super) fn is_emission(inst: &PackedInstruction) -> bool {
     matches!(
         inst.op.view(),
-        OperationRef::CustomOperation(op) if op.downcast_ref::<EmitSpec>().is_some()
+        OperationRef::CustomOperation(op) if op.downcast_ref::<Emit>().is_some()
     )
 }
 /// The single body of a box instruction.
@@ -169,10 +165,10 @@ pub(super) fn block_body<'a>(
     }
 }
 
-/// The [`EmitSpec`] on this instruction, if it is an emission.
-pub(super) fn emission_spec(inst: &PackedInstruction) -> Option<EmitSpec> {
+/// The [`Emit`] on this instruction, if it is an emission.
+pub(super) fn emission_spec(inst: &PackedInstruction) -> Option<Emit> {
     match inst.op.view() {
-        OperationRef::CustomOperation(op) => op.downcast_ref::<EmitSpec>().cloned(),
+        OperationRef::CustomOperation(op) => op.downcast_ref::<Emit>().cloned(),
         _ => None,
     }
 }
@@ -460,7 +456,7 @@ pub(super) fn new_dag_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotated_circuit::{DistributionType, Dressing, SynthesizerType, TwirlSpec};
+    use crate::annotated_circuit::{DistributionType, Dressing, SynthesizerType, Twirl};
     use crate::emission_circuit::CollectPart;
     use crate::partition::Partition;
     use qiskit_circuit::annotation::Annotation;
@@ -504,8 +500,8 @@ mod tests {
         )
     }
 
-    fn collect_spec() -> CollectSpec {
-        CollectSpec {
+    fn collect_spec() -> Collect {
+        Collect {
             partition: Partition::singletons(1),
             parts: vec![CollectPart {
                 synthesizer: SynthesizerType::RzSx,
@@ -513,8 +509,8 @@ mod tests {
         }
     }
 
-    fn twirl_spec() -> TwirlSpec {
-        TwirlSpec {
+    fn twirl_spec() -> Twirl {
+        Twirl {
             distribution: DistributionType::UniformPauli,
             dressing: Dressing::Left,
             decomposition: SynthesizerType::RzSx,
@@ -581,6 +577,6 @@ mod tests {
         };
         assert!(duration.is_none());
         assert_eq!(annotations.len(), 1);
-        assert_eq!(annotations[0].downcast_ref::<CollectSpec>(), Some(&spec));
+        assert_eq!(annotations[0].downcast_ref::<Collect>(), Some(&spec));
     }
 }

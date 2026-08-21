@@ -47,7 +47,7 @@ use super::utils::{
     is_box, is_collector, lift_wires, new_dag_body, params_of, scope_dag, scope_dag_mut,
 };
 use crate::annotated_circuit::SynthesizerType;
-use crate::emission_circuit::{CollectPart, CollectSpec};
+use crate::emission_circuit::{Collect, CollectPart};
 use crate::partition::Partition;
 use crate::sampling_graph::Direction;
 
@@ -521,7 +521,7 @@ fn find_mergeable(
 }
 
 /// Add a collector's contribution to an open group.
-fn join(group: &mut Group, node: NodeIndex, spec: &CollectSpec, qubits: &[Qubit]) {
+fn join(group: &mut Group, node: NodeIndex, spec: &Collect, qubits: &[Qubit]) {
     group.members.push(node);
     group.span.extend(qubits.iter().copied());
     group.subsystems.extend(spec.partition.groups(qubits));
@@ -665,14 +665,14 @@ fn merged_op(group: &Group, num_qubits: usize, num_clbits: usize) -> PackedOpera
     let parts = (0..partition.len())
         .map(|_| CollectPart { synthesizer })
         .collect();
-    let spec = CollectSpec { partition, parts };
+    let spec = Collect { partition, parts };
     collect_op(spec, num_qubits, num_clbits)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotated_circuit::{DistributionType, Dressing, TwirlSpec};
+    use crate::annotated_circuit::{DistributionType, Dressing, Twirl};
     use qiskit_circuit::annotation::Annotation;
     use qiskit_circuit::operations::StandardGate;
     use std::sync::Arc;
@@ -681,7 +681,7 @@ mod tests {
     use super::super::utils::{append, is_box, new_dag_body, write_box};
 
     fn twirl() -> Arc<dyn Annotation> {
-        Arc::new(TwirlSpec {
+        Arc::new(Twirl {
             distribution: DistributionType::UniformPauli,
             dressing: Dressing::Left,
             decomposition: SynthesizerType::RzSx,

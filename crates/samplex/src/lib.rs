@@ -64,15 +64,15 @@ pub mod sampling_graph;
 pub mod virtual_type;
 
 pub fn samplex_mod(m: &Bound<PyModule>) -> PyResult<()> {
-    m.add_class::<annotated_circuit::Twirl>()?;
-    m.add_class::<annotated_circuit::ChangeBasis>()?;
-    m.add_class::<annotated_circuit::InjectLocalClifford>()?;
-    m.add_class::<annotated_circuit::InjectNoise>()?;
-    m.add_class::<annotated_circuit::Tag>()?;
-    m.add_class::<emission_circuit::Collect>()?;
+    m.add_class::<annotated_circuit::PyTwirl>()?;
+    m.add_class::<annotated_circuit::PyChangeBasis>()?;
+    m.add_class::<annotated_circuit::PyInjectLocalClifford>()?;
+    m.add_class::<annotated_circuit::PyInjectNoise>()?;
+    m.add_class::<annotated_circuit::PyTag>()?;
+    m.add_class::<emission_circuit::PyCollect>()?;
     m.add_class::<distributions::DistributionTable>()?;
     m.add_class::<parameters::ParameterTable>()?;
-    m.add_class::<emission_circuit::Emit>()?;
+    m.add_class::<emission_circuit::PyEmit>()?;
     m.add_class::<sampling_graph::SamplingGraph>()?;
     m.add_wrapped(wrap_pyfunction!(passes::build::py_build))?;
     m.add_wrapped(wrap_pyfunction!(

@@ -46,7 +46,7 @@ use qiskit_circuit::operations::StandardInstruction;
 use super::utils::{IntoPyResult, block_body, collect_annotation, emission_spec, is_emission};
 use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::DistributionTable;
-use crate::emission_circuit::EmitSpec;
+use crate::emission_circuit::Emit;
 use crate::parameters::ParameterTable;
 use crate::partition::Partition;
 use crate::sampling_graph::{
@@ -340,7 +340,7 @@ impl CollectorInfo {
 
 /// The circuit as a flat sequence, which is what makes the propagation walk a simple scan.
 enum Event {
-    Emission(EmitSpec, Vec<usize>),
+    Emission(Emit, Vec<usize>),
     Collector(usize),
     Gate(StandardGate, Vec<usize>),
     Measure(Vec<usize>, Vec<usize>),
@@ -484,7 +484,7 @@ fn scan_for_collector(
     events: &[Event],
     start: usize,
     direction: Direction,
-    spec: &EmitSpec,
+    spec: &Emit,
     qubits: &[usize],
     infos: &[CollectorInfo],
     table: &DistributionTable,
@@ -530,7 +530,7 @@ fn scan_for_collector(
 /// change of rule shows up as a test change rather than silently.
 fn compatible(
     info: &CollectorInfo,
-    spec: &EmitSpec,
+    spec: &Emit,
     qubits: &[usize],
     table: &DistributionTable,
 ) -> bool {
@@ -670,7 +670,7 @@ fn walk_emission(
     sg: &mut SamplingGraph,
     events: &[Event],
     from: usize,
-    spec: &EmitSpec,
+    spec: &Emit,
     emission_qubits: &[usize],
     source: NodeIndex,
     target_index: usize,
@@ -794,7 +794,7 @@ fn chain(
 }
 
 /// The graph node for one emission, resolved from the table entry its `dist` key points at.
-fn emission_kind(spec: &EmitSpec, table: &DistributionTable) -> PyResult<NodeKind> {
+fn emission_kind(spec: &Emit, table: &DistributionTable) -> PyResult<NodeKind> {
     let entry = table.get(spec.dist()).ok_or_else(|| {
         PyValueError::new_err(format!(
             "emission (dist={}) references a missing table entry",
