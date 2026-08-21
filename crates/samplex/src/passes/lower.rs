@@ -164,7 +164,7 @@ fn write_scope(
         let inst = src.dag()[node].unwrap_operation();
 
         // A collector becomes the parametric fragment its angles drive.
-        if let Some(spec) = collect_annotation(inst) {
+        if let Some(collector) = collect_annotation(inst) {
             let locals = src.qargs_interner().get(inst.qubits);
             let written: Vec<usize> = locals.iter().map(|q| frame[q.index()]).collect();
             let qubits: Vec<usize> = locals.iter().map(|q| global[q.index()]).collect();
@@ -172,14 +172,14 @@ fn write_scope(
             let param_indices: Vec<usize> = (*next_param..*next_param + count).collect();
             *next_param += count;
 
-            write_synth_template(out, spec.synthesizer(), &written, &param_indices)?;
+            write_synth_template(out, collector.synthesizer(), &written, &param_indices)?;
             collectors.push(CollectorParams {
                 site: Site {
                     scope: scope.to_vec(),
                     node,
                 },
                 qubits,
-                synthesizer: spec.synthesizer(),
+                synthesizer: collector.synthesizer(),
                 param_indices,
             });
             continue;
@@ -384,11 +384,11 @@ pub fn build_sampling_graph(
 
     for (position, item) in spine.items.iter().enumerate() {
         match item {
-            spine::Item::Emission(spec, qubits) => {
+            spine::Item::Emission(emission, qubits) => {
                 let node = sg.graph.add_node(Node::new(
                     qubits.clone(),
-                    spec.partition.clone(),
-                    emission_kind(spec, table)?,
+                    emission.partition.clone(),
+                    emission_kind(emission, table)?,
                 ));
                 emission_nodes.insert(position, node);
             }
@@ -412,13 +412,13 @@ pub fn build_sampling_graph(
     // Target resolution is purely positional: scan from the emission in its travel direction to
     // find the nearest compatible collector.
     for (position, item) in spine.items.iter().enumerate() {
-        let spine::Item::Emission(spec, qubits) = item else {
+        let spine::Item::Emission(emission, qubits) = item else {
             continue;
         };
         let source = emission_nodes[&position];
         // A local emission is resolved in place inside its collector's body, so it never reaches
         // the top-level spine; anything here is still travelling.
-        let direction = spec.direction.expect(
+        let direction = emission.direction.expect(
             "a local emission never surfaces as a top-level Item::Emission — it lives inside its \
              collector's body",
         );
@@ -428,7 +428,7 @@ pub fn build_sampling_graph(
         // which would otherwise show up as a randomization that is never undone — so it is reported
         // rather than skipped.
         let target = spine
-            .resolve_collector(position, direction, spec, qubits, table)
+            .resolve_collector(position, direction, emission, qubits, table)
             .ok_or_else(|| {
                 PyValueError::new_err(format!(
                     "emission on qubits {qubits:?} travelling {direction:?} has no compatible \
@@ -438,7 +438,7 @@ pub fn build_sampling_graph(
         spine.propagate(
             &mut sg,
             position,
-            spec,
+            emission,
             qubits,
             source,
             target,
@@ -552,7 +552,7 @@ fn flatten(
             .map(|q| frame[q.index()])
             .collect();
 
-        if let Some(spec) = collect_annotation(inst) {
+        if let Some(collector) = collect_annotation(inst) {
             // This read yields *a* linear extension of the body, not the order the absorption walk
             // appended in. Harmless — a local emission spans every qubit it covers, so it stays a
             // barrier — but it must not be reported as circuit order. See `Collect::steps`.
@@ -600,17 +600,17 @@ fn flatten(
                     scope: scope.to_vec(),
                     node,
                 },
-                partition: spec.partition.clone(),
+                partition: collector.partition.clone(),
                 qubits,
-                synthesizer: spec.synthesizer(),
+                synthesizer: collector.synthesizer(),
                 param_indices: Vec::new(),
                 steps,
             });
             continue;
         }
 
-        if let Some(spec) = emission_spec(inst) {
-            spine.items.push(spine::Item::Emission(spec, qubits));
+        if let Some(emission) = emission_spec(inst) {
+            spine.items.push(spine::Item::Emission(emission, qubits));
             continue;
         }
 
@@ -642,16 +642,16 @@ fn flatten(
 }
 
 /// The graph node for one emission, resolved from the table entry its `dist` key points at.
-fn emission_kind(spec: &Emit, table: &DistributionTable) -> PyResult<NodeKind> {
-    let entry = table.get(spec.dist()).ok_or_else(|| {
+fn emission_kind(emission: &Emit, table: &DistributionTable) -> PyResult<NodeKind> {
+    let entry = table.get(emission.dist()).ok_or_else(|| {
         PyValueError::new_err(format!(
             "emission (dist={}) references a missing table entry",
-            spec.dist().0
+            emission.dist().0
         ))
     })?;
     Ok(NodeKind::Emission(Emission {
-        key: spec.dist(),
-        direction: spec.direction.expect(
+        key: emission.dist(),
+        direction: emission.direction.expect(
             "a local emission never surfaces as a top-level Item::Emission — it lives inside its \
              collector's body",
         ),

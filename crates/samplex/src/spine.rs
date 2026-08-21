@@ -69,8 +69,8 @@ impl Collector {
     ///
     /// - It covers every qubit the emission acts on. A collector that covers only part of an emission
     ///   could not synthesize the whole of what was emitted. The emission's qubits come from the walk
-    ///   rather than from the spec: a spec groups its *own qargs* by index and is shared by every
-    ///   placement of it, so it cannot know which wires it landed on.
+    ///   rather than from the annotation: one `Emit` groups its *own qargs* by index and is shared
+    ///   by every placement of it, so it cannot know which wires it landed on.
     /// - Its synthesizer accepts the emission's virtual type, so the value it would have to produce is one
     ///   it can express.
     ///
@@ -87,9 +87,9 @@ impl Collector {
     /// walking rather than by consulting an id. Until then a nested twirl of the same group is collected
     /// early, and `test_sampling_graph.py::TestNestedPropagation` pins that provisional behaviour so the
     /// change of rule shows up as a test change rather than silently.
-    pub fn accepts(&self, spec: &Emit, qubits: &[usize], table: &DistributionTable) -> bool {
+    pub fn accepts(&self, emission: &Emit, qubits: &[usize], table: &DistributionTable) -> bool {
         qubits.iter().all(|q| self.qubits.contains(q))
-            && self.synthesizer.accepts(spec.virtual_type(table))
+            && self.synthesizer.accepts(emission.virtual_type(table))
     }
 }
 
@@ -148,7 +148,7 @@ impl Spine {
         &self,
         start: usize,
         direction: Direction,
-        spec: &Emit,
+        emission: &Emit,
         qubits: &[usize],
         table: &DistributionTable,
     ) -> Option<usize> {
@@ -158,7 +158,7 @@ impl Spine {
         };
         for i in range {
             if let Item::Collector(index) = &self.items[i]
-                && self.collectors[*index].accepts(spec, qubits, table)
+                && self.collectors[*index].accepts(emission, qubits, table)
             {
                 return Some(*index);
             }
@@ -172,7 +172,7 @@ impl Spine {
         &self,
         sg: &mut SamplingGraph,
         from: usize,
-        spec: &Emit,
+        emission: &Emit,
         emission_qubits: &[usize],
         source: NodeIndex,
         target_index: usize,
@@ -182,11 +182,11 @@ impl Spine {
     ) -> PyResult<()> {
         let qubits: HashSet<usize> = emission_qubits.iter().copied().collect();
         let mut frontier: HashMap<usize, NodeIndex> = qubits.iter().map(|q| (*q, source)).collect();
-        let direction = spec.direction.expect(
+        let direction = emission.direction.expect(
             "a local emission never surfaces as a top-level Item::Emission — it lives inside its \
              collector's body",
         );
-        let virtual_type = spec.virtual_type(table);
+        let virtual_type = emission.virtual_type(table);
 
         // Walking in the emission's own direction is what makes propagation derivable rather than
         // recorded.
@@ -366,7 +366,7 @@ mod tests {
     fn wire(
         spine: &Spine,
         from: usize,
-        spec: &Emit,
+        emission: &Emit,
         qubits: &[usize],
         target: usize,
         table: &DistributionTable,
@@ -375,9 +375,9 @@ mod tests {
         let source = sg.graph.add_node(Node::singletons(
             qubits.to_vec(),
             NodeKind::Emission(Emission {
-                key: spec.dist(),
-                direction: spec.direction.unwrap(),
-                virtual_type: spec.virtual_type(table),
+                key: emission.dist(),
+                direction: emission.direction.unwrap(),
+                virtual_type: emission.virtual_type(table),
             }),
         ));
         let target_node = sg.graph.add_node(Node::new(
@@ -393,7 +393,7 @@ mod tests {
         spine.propagate(
             &mut sg,
             from,
-            spec,
+            emission,
             qubits,
             source,
             target,
@@ -426,10 +426,10 @@ mod tests {
     #[test]
     fn test_an_emission_resolves_to_the_nearest_collector_ahead() {
         let (table, key) = table_with(DistributionType::UniformPauli);
-        let spec = emit(Direction::Right, 1, key);
+        let emission = emit(Direction::Right, 1, key);
         let spine = Spine::new(
             vec![
-                Item::Emission(spec.clone(), vec![0]),
+                Item::Emission(emission.clone(), vec![0]),
                 Item::Gate(StandardGate::H, vec![0]),
                 Item::Collector(0),
                 Item::Collector(1),
@@ -437,7 +437,7 @@ mod tests {
             vec![collector(&[0], vec![]), collector(&[0], vec![])],
         );
         assert_eq!(
-            spine.resolve_collector(0, Direction::Right, &spec, &[0], &table),
+            spine.resolve_collector(0, Direction::Right, &emission, &[0], &table),
             Some(0)
         );
     }
@@ -465,10 +465,10 @@ mod tests {
     #[test]
     fn test_a_collector_that_does_not_cover_the_emission_is_crossed() {
         let (table, key) = table_with(DistributionType::UniformPauli);
-        let spec = emit(Direction::Right, 2, key);
+        let emission = emit(Direction::Right, 2, key);
         let spine = Spine::new(
             vec![
-                Item::Emission(spec.clone(), vec![0, 1]),
+                Item::Emission(emission.clone(), vec![0, 1]),
                 Item::Collector(0),
                 Item::Collector(1),
             ],
@@ -476,10 +476,10 @@ mod tests {
             // synthesize the whole of what was emitted and the emission travels past it.
             vec![collector(&[0], vec![]), collector(&[0, 1], vec![])],
         );
-        assert!(!spine.collectors[0].accepts(&spec, &[0, 1], &table));
-        assert!(spine.collectors[1].accepts(&spec, &[0, 1], &table));
+        assert!(!spine.collectors[0].accepts(&emission, &[0, 1], &table));
+        assert!(spine.collectors[1].accepts(&emission, &[0, 1], &table));
         assert_eq!(
-            spine.resolve_collector(0, Direction::Right, &spec, &[0, 1], &table),
+            spine.resolve_collector(0, Direction::Right, &emission, &[0, 1], &table),
             Some(1)
         );
     }
@@ -487,17 +487,17 @@ mod tests {
     #[test]
     fn test_an_emission_with_nothing_to_collect_it_does_not_resolve() {
         let (table, key) = table_with(DistributionType::UniformPauli);
-        let spec = emit(Direction::Right, 1, key);
+        let emission = emit(Direction::Right, 1, key);
         let spine = Spine::new(
             vec![
-                Item::Emission(spec.clone(), vec![0]),
+                Item::Emission(emission.clone(), vec![0]),
                 Item::Gate(StandardGate::H, vec![0]),
             ],
             vec![],
         );
         // The caller turns this into the "randomization could not be undone" error.
         assert_eq!(
-            spine.resolve_collector(0, Direction::Right, &spec, &[0], &table),
+            spine.resolve_collector(0, Direction::Right, &emission, &[0], &table),
             None
         );
     }
@@ -507,17 +507,17 @@ mod tests {
     #[test]
     fn test_each_wire_chains_through_its_own_gates() {
         let (table, key) = table_with(DistributionType::UniformPauli);
-        let spec = emit(Direction::Right, 2, key);
+        let emission = emit(Direction::Right, 2, key);
         let spine = Spine::new(
             vec![
-                Item::Emission(spec.clone(), vec![0, 1]),
+                Item::Emission(emission.clone(), vec![0, 1]),
                 Item::Gate(StandardGate::H, vec![0]),
                 Item::Gate(StandardGate::S, vec![1]),
                 Item::Collector(0),
             ],
             vec![collector(&[0, 1], vec![])],
         );
-        let (sg, _source, target) = wire(&spine, 0, &spec, &[0, 1], 0, &table).unwrap();
+        let (sg, _source, target) = wire(&spine, 0, &emission, &[0, 1], 0, &table).unwrap();
 
         // One conjugation per gate, each on its own wire: the two wires never met, so nothing joins.
         let mut found = conjugations(&sg);
@@ -533,16 +533,16 @@ mod tests {
     #[test]
     fn test_a_gate_spanning_both_wires_joins_their_chains() {
         let (table, key) = table_with(DistributionType::UniformPauli);
-        let spec = emit(Direction::Right, 2, key);
+        let emission = emit(Direction::Right, 2, key);
         let spine = Spine::new(
             vec![
-                Item::Emission(spec.clone(), vec![0, 1]),
+                Item::Emission(emission.clone(), vec![0, 1]),
                 Item::Gate(StandardGate::CX, vec![0, 1]),
                 Item::Collector(0),
             ],
             vec![collector(&[0, 1], vec![])],
         );
-        let (sg, source, target) = wire(&spine, 0, &spec, &[0, 1], 0, &table).unwrap();
+        let (sg, source, target) = wire(&spine, 0, &emission, &[0, 1], 0, &table).unwrap();
 
         // A conjugation by a two-qubit gate mixes its wires, so it is one joint node rather than two.
         assert_eq!(conjugations(&sg), vec![(StandardGate::CX, vec![0, 1])]);
@@ -559,16 +559,16 @@ mod tests {
     #[test]
     fn test_a_gate_off_the_emissions_wires_is_not_chained() {
         let (table, key) = table_with(DistributionType::UniformPauli);
-        let spec = emit(Direction::Right, 1, key);
+        let emission = emit(Direction::Right, 1, key);
         let spine = Spine::new(
             vec![
-                Item::Emission(spec.clone(), vec![0]),
+                Item::Emission(emission.clone(), vec![0]),
                 Item::Gate(StandardGate::H, vec![1]),
                 Item::Collector(0),
             ],
             vec![collector(&[0], vec![])],
         );
-        let (sg, source, target) = wire(&spine, 0, &spec, &[0], 0, &table).unwrap();
+        let (sg, source, target) = wire(&spine, 0, &emission, &[0], 0, &table).unwrap();
 
         assert!(conjugations(&sg).is_empty());
         // Nothing stood between them, so the emission feeds its collector directly.
@@ -578,10 +578,10 @@ mod tests {
     #[test]
     fn test_a_crossed_collectors_absorbed_gates_still_conjugate() {
         let (table, key) = table_with(DistributionType::UniformPauli);
-        let spec = emit(Direction::Right, 2, key);
+        let emission = emit(Direction::Right, 2, key);
         let spine = Spine::new(
             vec![
-                Item::Emission(spec.clone(), vec![0, 1]),
+                Item::Emission(emission.clone(), vec![0, 1]),
                 Item::Collector(0),
                 Item::Collector(1),
             ],
@@ -592,10 +592,11 @@ mod tests {
             ],
         );
         let target = spine
-            .resolve_collector(0, Direction::Right, &spec, &[0, 1], &table)
+            .resolve_collector(0, Direction::Right, &emission, &[0, 1], &table)
             .unwrap();
         assert_eq!(target, 1);
-        let (sg, _source, target_node) = wire(&spine, 0, &spec, &[0, 1], target, &table).unwrap();
+        let (sg, _source, target_node) =
+            wire(&spine, 0, &emission, &[0, 1], target, &table).unwrap();
 
         assert_eq!(conjugations(&sg), vec![(StandardGate::H, vec![0])]);
         // Wire 0 ends on the conjugation, wire 1 still on the emission itself.
@@ -608,10 +609,10 @@ mod tests {
     fn test_propagation_refuses_a_gate_with_no_rule() {
         // A local U2 element admits single-qubit gates only, so a CX on its wire has no rule.
         let (table, key) = table_with(DistributionType::HaarU2);
-        let spec = emit(Direction::Right, 1, key);
+        let emission = emit(Direction::Right, 1, key);
         let spine = Spine::new(
             vec![
-                Item::Emission(spec.clone(), vec![0]),
+                Item::Emission(emission.clone(), vec![0]),
                 Item::Gate(StandardGate::CX, vec![0, 1]),
                 Item::Collector(0),
             ],
@@ -619,10 +620,10 @@ mod tests {
         );
         // Resolution still succeeds — it is the walk that discovers there is no rule.
         assert_eq!(
-            spine.resolve_collector(0, Direction::Right, &spec, &[0], &table),
+            spine.resolve_collector(0, Direction::Right, &emission, &[0], &table),
             Some(0)
         );
-        assert!(wire(&spine, 0, &spec, &[0], 0, &table).is_err());
+        assert!(wire(&spine, 0, &emission, &[0], 0, &table).is_err());
     }
 
     #[test]
@@ -630,16 +631,16 @@ mod tests {
         // The refusal is a property of the virtual type, not of the spine's shape: the same spine
         // with a Pauli emission wires cleanly.
         let (table, key) = table_with(DistributionType::UniformPauli);
-        let spec = emit(Direction::Right, 1, key);
+        let emission = emit(Direction::Right, 1, key);
         let spine = Spine::new(
             vec![
-                Item::Emission(spec.clone(), vec![0]),
+                Item::Emission(emission.clone(), vec![0]),
                 Item::Gate(StandardGate::CX, vec![0, 1]),
                 Item::Collector(0),
             ],
             vec![collector(&[0], vec![])],
         );
-        let (sg, _source, _target) = wire(&spine, 0, &spec, &[0], 0, &table).unwrap();
+        let (sg, _source, _target) = wire(&spine, 0, &emission, &[0], 0, &table).unwrap();
         assert_eq!(conjugations(&sg), vec![(StandardGate::CX, vec![0, 1])]);
     }
 }
