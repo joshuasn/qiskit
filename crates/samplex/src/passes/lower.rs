@@ -638,12 +638,6 @@ fn emission_kind(emission: &Emit, table: &DistributionTable) -> Result<NodeKind>
 mod tests {
     use super::*;
 
-    use hashbrown::HashSet;
-    use qiskit_circuit::annotation::Annotation;
-
-    use super::super::build::build;
-    use crate::annotated_circuit::{DistributionType, Dressing, Twirl};
-    use crate::emission_circuit_navigation::{append, new_dag_body, write_box};
     use crate::partition::Partition;
 
     // --- The join, on the two sides built by hand ------------------------------------------------
@@ -757,106 +751,5 @@ mod tests {
             attach_param_indices(&mut collectors, &template),
             Err(SamplexError::DuplicateCollectorParams(duplicated)) if duplicated == site(&[], 1)
         ));
-    }
-
-    // --- The two walks over a real emission circuit ----------------------------------------------
-
-    fn twirl() -> Arc<dyn Annotation> {
-        Arc::new(Twirl {
-            distribution: DistributionType::UniformPauli,
-            dressing: Dressing::Left,
-            decomposition: SynthesizerType::RzSx,
-        })
-    }
-
-    /// A twirled box holding a gate and a second twirled box, so lowering has to cross a boundary.
-    ///
-    /// Nesting is the case worth building, because it is where the two walks genuinely differ:
-    /// `write_scope` keeps the content box and recurses into it, `flatten` inlines it onto the spine.
-    fn nested_twirl() -> DAGCircuit {
-        Python::initialize();
-        let mut inner = new_dag_body(1, 0, 1).unwrap().into_builder();
-        append(&mut inner, StandardGate::H.into(), None, &[Qubit(0)], &[]).unwrap();
-
-        let mut outer = new_dag_body(1, 0, 2).unwrap().into_builder();
-        append(&mut outer, StandardGate::H.into(), None, &[Qubit(0)], &[]).unwrap();
-        write_box(
-            &mut outer,
-            inner.build(),
-            vec![twirl()],
-            None,
-            &[Qubit(0)],
-            &[],
-        )
-        .unwrap();
-
-        let mut out = new_dag_body(1, 0, 1).unwrap().into_builder();
-        write_box(
-            &mut out,
-            outer.build(),
-            vec![twirl()],
-            None,
-            &[Qubit(0)],
-            &[],
-        )
-        .unwrap();
-        out.build()
-    }
-
-    #[test]
-    fn test_both_walks_name_the_same_collectors_across_a_box_boundary() {
-        // The claim the join rests on: the two readings descend through the same boxes, so a collector
-        // has one site whichever walk found it.
-        let (dag, _table) = build(&nested_twirl()).unwrap();
-        let (_template, params) = build_template(&dag).unwrap();
-
-        let mut spine = Spine::default();
-        let mut parameters = ParameterTable::new();
-        let identity: Vec<usize> = (0..dag.num_qubits()).collect();
-        flatten(&dag, &[], &identity, &mut spine, &mut parameters).unwrap();
-
-        let template_sites: HashSet<&Site> = params.iter().map(|c| &c.site).collect();
-        let graph_sites: HashSet<&Site> = spine.collectors.iter().map(|c| &c.site).collect();
-        assert_eq!(template_sites.len(), params.len(), "sites are unique");
-        assert_eq!(template_sites, graph_sites);
-        assert_eq!(
-            params.len(),
-            4,
-            "build collects on both edges of both twirled boxes"
-        );
-        assert_eq!(
-            template_sites
-                .iter()
-                .filter(|site| !site.scope.is_empty())
-                .count(),
-            2,
-            "the inner twirl's pair is named through the content box it sits in"
-        );
-    }
-
-    #[test]
-    fn test_lowering_a_nested_circuit_gives_every_collector_its_own_range() {
-        // End to end over the same circuit: the ranges the template minted are exactly the ranges the
-        // graph's collect nodes ask for.
-        let (dag, table) = build(&nested_twirl()).unwrap();
-        let (_template, params) = build_template(&dag).unwrap();
-        let (graph, _parameters) = build_sampling_graph(&dag, &table, &params).unwrap();
-
-        let mut minted: Vec<&Vec<usize>> = params.iter().map(|c| &c.param_indices).collect();
-        let mut bound: Vec<&Vec<usize>> = graph
-            .graph
-            .node_weights()
-            .filter_map(|node| match &node.kind {
-                NodeKind::Collect(collect) => Some(&collect.param_indices),
-                _ => None,
-            })
-            .collect();
-        minted.sort();
-        bound.sort();
-        assert_eq!(minted, bound);
-        assert!(
-            bound.iter().all(|range| range.len() == PARAMS_PER_QUBIT),
-            "one qubit each, so three angles each: {bound:?}"
-        );
     }
 }

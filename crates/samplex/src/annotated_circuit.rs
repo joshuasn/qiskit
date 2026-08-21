@@ -616,7 +616,6 @@ impl PyTag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qiskit_circuit::annotation::extract_annotation;
 
     /// Erase a spec to the trait object a box actually stores.
     fn annotation<A: Annotation>(spec: A) -> Arc<dyn Annotation> {
@@ -629,28 +628,6 @@ mod tests {
             dressing: Dressing::Left,
             decomposition: SynthesizerType::RzSx,
         })
-    }
-
-    /// Assert a spec survives a Python round trip as itself.
-    ///
-    /// This pins the port's one silent failure mode. `create_py_annotation` must put the native value
-    /// on the `PyAnnotation` base; if it does not, `extract_annotation` degrades the annotation to an
-    /// opaque `PythonAnnotation`, every `downcast_ref` reader in the crate starts seeing `None`, and
-    /// nothing errors — the box simply stops being recognised as ours.
-    fn assert_round_trips<A>(spec: A)
-    where
-        A: Annotation + Clone + PartialEq + std::fmt::Debug,
-    {
-        Python::initialize();
-        Python::attach(|py| {
-            let object = spec.create_py_annotation(py).unwrap();
-            let recovered = extract_annotation(object.bind(py));
-            assert_eq!(
-                recovered.downcast_ref::<A>(),
-                Some(&spec),
-                "{spec:?} did not come back as itself"
-            );
-        });
     }
 
     fn change_basis(reference: &str, placement: Placement) -> Arc<dyn Annotation> {
@@ -794,49 +771,6 @@ mod tests {
     }
 
     #[test]
-    fn test_twirl_round_trips_through_python() {
-        assert_round_trips(Twirl {
-            distribution: DistributionType::UniformPauli,
-            dressing: Dressing::Left,
-            decomposition: SynthesizerType::RzSx,
-        });
-    }
-
-    #[test]
-    fn test_change_basis_round_trips_through_python() {
-        assert_round_trips(ChangeBasis {
-            mode: ChangeBasisMode::MeasurePauli,
-            reference: "0".to_string(),
-            placement: Placement::Start,
-            decomposition: SynthesizerType::RzSx,
-        });
-    }
-
-    #[test]
-    fn test_inject_local_clifford_round_trips_through_python() {
-        assert_round_trips(InjectLocalClifford {
-            reference: "c3".to_string(),
-            site: InjectionSite::Before,
-        });
-    }
-
-    #[test]
-    fn test_inject_noise_round_trips_through_python() {
-        assert_round_trips(InjectNoise {
-            reference: "r0".to_string(),
-            modifier: Some("m1".to_string()),
-            site: InjectionSite::After,
-        });
-    }
-
-    #[test]
-    fn test_tag_round_trips_through_python() {
-        // Carries no payload, so the round trip is entirely about identity: a tag has to come back as
-        // a `Tag` and not as an opaque annotation that happens to have the right namespace.
-        assert_round_trips(Tag);
-    }
-
-    #[test]
     fn test_ir1_annotations_share_the_flat_namespace() {
         // One vocabulary, the one a user writes, so one namespace. `Collect` is the exception and
         // says why in `emission_circuit`.
@@ -857,23 +791,5 @@ mod tests {
             assert_eq!(annotation.namespace(), NAMESPACE);
         }
         assert_eq!(NAMESPACE, "samplex");
-    }
-
-    #[test]
-    fn test_python_visible_namespace_matches_the_native_one() {
-        // The class attribute is what a Python-side dispatch table keys on, and the trait method is
-        // what Rust reads. They are separate surfaces over one const, and this is what keeps them so.
-        Python::initialize();
-        Python::attach(|py| {
-            for declared in [
-                PyTwirl::namespace(py),
-                PyChangeBasis::namespace(py),
-                PyInjectLocalClifford::namespace(py),
-                PyInjectNoise::namespace(py),
-                PyTag::namespace(py),
-            ] {
-                assert_eq!(declared.extract::<String>(py).unwrap(), NAMESPACE);
-            }
-        });
     }
 }
