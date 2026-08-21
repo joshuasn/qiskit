@@ -39,15 +39,16 @@ use rustworkx_core::petgraph::stable_graph::NodeIndex;
 use pyo3::prelude::*;
 use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder};
 use qiskit_circuit::instruction::Parameters;
-use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
+use qiskit_circuit::packed_instruction::PackedOperation;
 use qiskit_circuit::{Clbit, Qubit};
 
-use super::utils::{
-    IntoPyResult, Site, WireCursor, block_body, collect_annotation, collect_op, emission_spec,
-    is_box, is_collector, lift_wires, new_dag_body, params_of, scope_dag, scope_dag_mut,
-};
 use crate::annotated_circuit::SynthesizerType;
 use crate::emission_circuit::{Collect, CollectPart};
+use crate::emission_circuit_navigation::{
+    ScopeOrder, Site, WireCursor, append_instruction, block_body, collect_annotation, collect_op,
+    collectors, emission_spec, is_box, new_dag_body, scope_dag,
+};
+use crate::error::IntoPyResult;
 use crate::partition::Partition;
 use crate::sampling_graph::Direction;
 
@@ -181,28 +182,10 @@ fn escape_round(dag: &mut DAGCircuit) -> PyResult<bool> {
 fn plan_escapes(root: &DAGCircuit) -> PyResult<Vec<Escape>> {
     let mut plans: Vec<Escape> = Vec::new();
     let mut claimed: HashSet<Site> = HashSet::new();
-    plan_escapes_in(root, &mut Vec::new(), &mut plans, &mut claimed)?;
-    Ok(plans)
-}
 
-fn plan_escapes_in(
-    root: &DAGCircuit,
-    path: &mut Vec<NodeIndex>,
-    plans: &mut Vec<Escape>,
-    claimed: &mut HashSet<Site>,
-) -> PyResult<()> {
-    let nodes: Vec<NodeIndex> = scope_dag(root, path)?.topological_op_nodes(false).collect();
-
-    for node in &nodes {
-        let dag = scope_dag(root, path)?;
-        let inst = dag.dag()[*node].unwrap_operation();
-        if !is_collector(inst) {
-            continue;
-        }
-        let outer = Site {
-            scope: path.clone(),
-            node: *node,
-        };
+    // `ScopeOrder::Outermost` is what pairs the levels up correctly: a collector is judged before the
+    // collectors nested below it, so a two-level nest resolves from the outside in.
+    for outer in collectors(root, ScopeOrder::Outermost)? {
         if claimed.contains(&outer) {
             continue;
         }
@@ -223,27 +206,13 @@ fn plan_escapes_in(
             break;
         }
     }
-
-    // Recurse, so a collector two levels down is considered against the collector one level down.
-    for node in &nodes {
-        let dag = scope_dag(root, path)?;
-        let inst = dag.dag()[*node].unwrap_operation();
-        if !is_box(inst) || is_collector(inst) {
-            continue;
-        }
-        path.push(*node);
-        plan_escapes_in(root, path, plans, claimed)?;
-        path.pop();
-    }
-    Ok(())
+    Ok(plans)
 }
 
 /// The collector that may leave its box and fold into `outer`, walking `direction`, if any.
 fn escapable(root: &DAGCircuit, outer: &Site, direction: Direction) -> PyResult<Option<Site>> {
-    let dag = scope_dag(root, &outer.scope)?;
-    let inst = dag.dag()[outer.node].unwrap_operation();
-    let spec = collect_annotation(inst).expect("only asked of a collector");
-    let wires: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();
+    let spec = outer.collector(root)?.expect("only asked of a collector");
+    let wires: Vec<Qubit> = outer.qubits(root)?;
 
     // Every distinct collector-inside-a-box any of `outer`'s wires reaches first. More than one is
     // ordinary — two narrow boxes side by side inside one content box — so each is judged on its own
@@ -254,11 +223,10 @@ fn escapable(root: &DAGCircuit, outer: &Site, direction: Direction) -> PyResult<
             continue;
         };
         // A collector in the same scope is a sibling, which the contraction sweep handles.
-        if site.scope.len() <= outer.scope.len() {
+        if !site.deeper_than(&outer.scope) {
             continue;
         }
-        let reached = scope_dag(root, &site.scope)?.dag()[site.node].unwrap_operation();
-        if !is_collector(reached) {
+        if site.collector(root)?.is_none() {
             continue;
         }
         if !candidates.contains(&site) {
@@ -267,9 +235,7 @@ fn escapable(root: &DAGCircuit, outer: &Site, direction: Direction) -> PyResult<
     }
 
     for inner in candidates {
-        let inner_dag = scope_dag(root, &inner.scope)?;
-        let inner_inst = inner_dag.dag()[inner.node].unwrap_operation();
-        let inner_spec = collect_annotation(inner_inst).expect("checked above");
+        let inner_spec = inner.collector(root)?.expect("checked above");
         // Every part of both, not just the first: the two are about to become one layer, and a part
         // that synthesizes differently could not be expressed by it. Same test `find_mergeable` makes.
         let synthesizer = spec.synthesizer();
@@ -281,7 +247,7 @@ fn escapable(root: &DAGCircuit, outer: &Site, direction: Direction) -> PyResult<
         {
             continue;
         }
-        let inner_wires = lift_to(root, &outer.scope, &inner, inner_dag, inner_inst)?;
+        let inner_wires = inner.qubits_in(root, &outer.scope)?;
         // Always true for a nested collector, since its box sits inside `outer`'s — checked because
         // the transfer would silently drop content if it were not.
         if !inner_wires.iter().all(|wire| wires.contains(wire)) {
@@ -307,7 +273,7 @@ fn escapable(root: &DAGCircuit, outer: &Site, direction: Direction) -> PyResult<
             Direction::Left => Direction::Right,
         };
         let arriving = count_emissions_towards(scope_dag(root, &inner.scope)?, outward)?;
-        if arriving > 0 && !body_is_empty(inner_dag, inner_inst)? {
+        if arriving > 0 && !body_is_empty(root, &inner)? {
             // The content being moved sits on such an emission's path: crossed today, with the inner
             // collector foreign to it, and composed inside its target afterwards.
             continue;
@@ -329,9 +295,7 @@ fn first_site(
     wire: Qubit,
     direction: Direction,
 ) -> PyResult<Option<Site>> {
-    let descend = |inst: &PackedInstruction| is_box(inst) && !is_collector(inst);
-    let mut cursor = WireCursor::new(from.scope.clone(), from.node, wire);
-    cursor.advance(root, direction, &descend)
+    WireCursor::at(from, wire).advance(root, direction)
 }
 
 /// How many emissions in this body, at any depth, are still travelling in `direction`.
@@ -361,20 +325,8 @@ fn count_emissions_towards(dag: &DAGCircuit, direction: Direction) -> PyResult<u
 ///
 /// Before absorption every body is empty, which is why an escape pre-absorption is purely structural:
 /// it deletes a collector and re-points whatever that collector was catching, moving no content at all.
-fn body_is_empty(dag: &DAGCircuit, inst: &PackedInstruction) -> PyResult<bool> {
-    Ok(block_body(dag, inst)?.is_none_or(|body| body.num_ops() == 0))
-}
-
-/// A nested collector's qargs, lifted out of the boxes between it and `base` into that frame.
-fn lift_to(
-    root: &DAGCircuit,
-    base: &[NodeIndex],
-    site: &Site,
-    site_dag: &DAGCircuit,
-    inst: &PackedInstruction,
-) -> PyResult<Vec<Qubit>> {
-    let local = site_dag.qargs_interner().get(inst.qubits).to_vec();
-    lift_wires(scope_dag(root, base)?, &site.scope[base.len()..], &local)
+fn body_is_empty(root: &DAGCircuit, site: &Site) -> PyResult<bool> {
+    Ok(site.body(root)?.is_none_or(|body| body.num_ops() == 0))
 }
 
 /// Move one collector's body into the collector outside its box, and delete it.
@@ -382,17 +334,16 @@ fn escape(root: &mut DAGCircuit, plan: &Escape) -> PyResult<()> {
     // Everything is read before anything is written: the merged body is built while both collectors
     // are still in place.
     let (op, body) = {
-        let outer_dag = scope_dag(root, &plan.outer.scope)?;
-        let outer_inst = outer_dag.dag()[plan.outer.node].unwrap_operation();
-        let frame: Vec<Qubit> = outer_dag.qargs_interner().get(outer_inst.qubits).to_vec();
-        let num_clbits = outer_dag.cargs_interner().get(outer_inst.clbits).len();
-        let spec = collect_annotation(outer_inst).expect("planned from a collector");
-        let outer_body = block_body(outer_dag, outer_inst)?;
+        let frame: Vec<Qubit> = plan.outer.qubits(root)?;
+        let num_clbits = plan.outer.num_clbits(root)?;
+        let spec = plan
+            .outer
+            .collector(root)?
+            .expect("planned from a collector");
+        let outer_body = plan.outer.body(root)?;
 
-        let inner_dag = scope_dag(root, &plan.inner.scope)?;
-        let inner_inst = inner_dag.dag()[plan.inner.node].unwrap_operation();
-        let inner_wires = lift_to(root, &plan.outer.scope, &plan.inner, inner_dag, inner_inst)?;
-        let inner_body = block_body(inner_dag, inner_inst)?;
+        let inner_wires = plan.inner.qubits_in(root, &plan.outer.scope)?;
+        let inner_body = plan.inner.body(root)?;
 
         let capacity =
             outer_body.map_or(0, |b| b.num_ops()) + inner_body.map_or(0, |b| b.num_ops());
@@ -413,17 +364,8 @@ fn escape(root: &mut DAGCircuit, plan: &Escape) -> PyResult<()> {
         (op, body.build())
     };
 
-    let outer_scope = scope_dag_mut(root, &plan.outer.scope)?;
-    let block = outer_scope.add_block(body);
-    outer_scope
-        .substitute_op(
-            plan.outer.node,
-            op,
-            Some(Parameters::Blocks(vec![block])),
-            None,
-        )
-        .into_py_result()?;
-    scope_dag_mut(root, &plan.inner.scope)?.remove_op_node(plan.inner.node);
+    plan.outer.substitute(root, op, body)?;
+    plan.inner.remove(root)?;
     Ok(())
 }
 
@@ -651,7 +593,7 @@ fn append_contribution(
                 Qubit(merged as u32)
             })
             .collect();
-        super::utils::append(out, gate.op.clone(), params_of(gate), &qargs, &[])?;
+        append_instruction(out, gate, &qargs, &[])?;
     }
     Ok(())
 }
@@ -678,7 +620,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::super::build::build;
-    use super::super::utils::{append, is_box, new_dag_body, write_box};
+    use crate::emission_circuit_navigation::{append, is_collector, new_dag_body, write_box};
 
     fn twirl() -> Arc<dyn Annotation> {
         Arc::new(Twirl {

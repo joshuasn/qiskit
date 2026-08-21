@@ -56,6 +56,7 @@ macro_rules! parse_enum {
 pub mod annotated_circuit;
 pub mod distributions;
 pub mod emission_circuit;
+pub mod emission_circuit_navigation;
 pub mod error;
 pub mod parameters;
 pub mod partition;

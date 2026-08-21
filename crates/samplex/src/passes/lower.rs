@@ -43,10 +43,13 @@ use rustworkx_core::petgraph::stable_graph::NodeIndex;
 
 use qiskit_circuit::operations::StandardInstruction;
 
-use super::utils::{IntoPyResult, block_body, collect_annotation, emission_spec, is_emission};
 use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::DistributionTable;
 use crate::emission_circuit::Emit;
+use crate::emission_circuit_navigation::{
+    block_body, collect_annotation, emission_spec, is_box, is_emission,
+};
+use crate::error::IntoPyResult;
 use crate::parameters::ParameterTable;
 use crate::sampling_graph::{
     AbsorbedGate, AbsorbedParam, Collect, CollectStep, Emission, LocalEmission, Measure, Node,
@@ -277,16 +280,10 @@ fn plain_box_body<'a>(
     src: &'a DAGCircuit,
     inst: &PackedInstruction,
 ) -> PyResult<Option<&'a DAGCircuit>> {
-    match inst.op.view() {
-        OperationRef::ControlFlow(cf)
-            if matches!(
-                cf.control_flow,
-                qiskit_circuit::operations::ControlFlow::Box { .. }
-            ) =>
-        {
-            block_body(src, inst)
-        }
-        _ => Ok(None),
+    if is_box(inst) {
+        block_body(src, inst)
+    } else {
+        Ok(None)
     }
 }
 

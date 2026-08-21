@@ -49,20 +49,18 @@
 //! [`Collect::steps`]: crate::sampling_graph::Collect::steps
 
 use hashbrown::{HashMap, HashSet};
-use rustworkx_core::petgraph::stable_graph::NodeIndex;
 
 use pyo3::prelude::*;
 use qiskit_circuit::Qubit;
 use qiskit_circuit::dag_circuit::DAGCircuit;
-use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::OperationRef;
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 
-use super::utils::{
-    IntoPyResult, Site, WireCursor, collect_annotation, emission_spec, is_box, is_collector,
-    lift_wires, new_dag_body, next_on_wire, params_of, scope_dag, scope_dag_mut, site_instruction,
-};
 use crate::emission_circuit::{Collect, Emit};
+use crate::emission_circuit_navigation::{
+    ScopeOrder, Site, WireCursor, append, append_instruction, collect_op, collectors,
+    emission_spec, new_dag_body, next_on_wire,
+};
 use crate::sampling_graph::Direction;
 
 /// Absorb dressing into every collector, in place.
@@ -80,17 +78,8 @@ pub fn absorb_dressing(dag: &mut DAGCircuit) -> PyResult<()> {
     let plans = plan_absorptions(dag)?;
     for plan in &plans {
         let body = build_body(dag, plan)?;
-        let op = collect_op(dag, plan)?;
-        let scope = scope_dag_mut(dag, &plan.collector.scope)?;
-        let block = scope.add_block(body);
-        scope
-            .substitute_op(
-                plan.collector.node,
-                op,
-                Some(Parameters::Blocks(vec![block])),
-                None,
-            )
-            .into_py_result()?;
+        let op = absorbed_op(dag, plan)?;
+        plan.collector.substitute(dag, op, body)?;
     }
     // Kept as a sequence as well as a set, so that removal order is fixed rather than whatever the
     // set happens to iterate in.
@@ -99,7 +88,7 @@ pub fn absorb_dressing(dag: &mut DAGCircuit) -> PyResult<()> {
         .flat_map(|plan| plan.consumed.iter().cloned())
         .collect();
     for site in &consumed {
-        scope_dag_mut(dag, &site.scope)?.remove_op_node(site.node);
+        site.remove(dag)?;
     }
     Ok(())
 }
@@ -132,56 +121,24 @@ struct Walk {
 
 /// Plan every collector's absorption.
 ///
-/// First come, first served: a claimed site is a barrier to the next collector, so nothing is
-/// absorbed twice.
+/// First come, first served: a claimed site is a barrier to the next collector, so nothing is absorbed
+/// twice. [`ScopeOrder::Innermost`] is what makes that fair — a collector inside a box gets first
+/// refusal on the content in there, being nearer to it than anything outside, and an outer collector
+/// reaching in would starve it.
 fn plan_absorptions(root: &DAGCircuit) -> PyResult<Vec<Absorption>> {
     let mut plans: Vec<Absorption> = Vec::new();
     let mut claimed: HashSet<Site> = HashSet::new();
-    plan_scope(root, &mut Vec::new(), &mut plans, &mut claimed)?;
-    Ok(plans)
-}
 
-/// Plan one scope's collectors, after every scope nested inside it.
-///
-/// Innermost first, so a collector inside a box gets first refusal on the content in there: it is
-/// nearer to that content than anything outside, and an outer collector reaching in would starve it.
-/// Within one scope, topological order decides, which makes the winner deterministic.
-fn plan_scope(
-    root: &DAGCircuit,
-    path: &mut Vec<NodeIndex>,
-    plans: &mut Vec<Absorption>,
-    claimed: &mut HashSet<Site>,
-) -> PyResult<()> {
-    let nodes: Vec<NodeIndex> = scope_dag(root, path)?.topological_op_nodes(false).collect();
-
-    for node in &nodes {
-        let inst = scope_dag(root, path)?.dag()[*node].unwrap_operation();
-        // A collector's body holds only what was just absorbed into it, so there is nothing in there
-        // to absorb — and descending into one would take content that already belongs to it.
-        if !is_box(inst) || is_collector(inst) {
-            continue;
-        }
-        path.push(*node);
-        plan_scope(root, path, plans, claimed)?;
-        path.pop();
-    }
-
-    for node in &nodes {
-        let dag = scope_dag(root, path)?;
-        let inst = dag.dag()[*node].unwrap_operation();
-        let Some(spec) = collect_annotation(inst) else {
-            continue;
-        };
-        let qubits: Vec<Qubit> = dag.qargs_interner().get(inst.qubits).to_vec();
-        let collector = Site {
-            scope: path.clone(),
-            node: *node,
-        };
+    for collector in collectors(root, ScopeOrder::Innermost)? {
+        let spec = collector
+            .collector(root)?
+            .expect("a swept site is a collector");
+        let qubits = collector.qubits(root)?;
 
         // Walking leftward visits the outermost content last, so it comes back reversed.
-        let mut left = walk_absorb(root, &collector, Direction::Left, &qubits, claimed)?;
+        let mut left = walk_absorb(root, &collector, Direction::Left, &qubits, &claimed)?;
         left.content.reverse();
-        let right = walk_absorb(root, &collector, Direction::Right, &qubits, claimed)?;
+        let right = walk_absorb(root, &collector, Direction::Right, &qubits, &claimed)?;
 
         let mut content = left.content;
         content.extend(right.content);
@@ -196,7 +153,7 @@ fn plan_scope(
             consumed,
         });
     }
-    Ok(())
+    Ok(plans)
 }
 
 /// Whether a collector can absorb this instruction: a single-qubit standard gate.
@@ -226,17 +183,9 @@ fn walk_absorb(
         Direction::Right => Direction::Left,
         Direction::Left => Direction::Right,
     };
-    // A collect box is a barrier, not something to walk into; anything else with a body is content
-    // the walk may reach through.
-    let descend = |inst: &PackedInstruction| is_box(inst) && !is_collector(inst);
     let mut cursors: HashMap<Qubit, WireCursor> = qubits
         .iter()
-        .map(|qubit| {
-            (
-                *qubit,
-                WireCursor::new(collector.scope.clone(), collector.node, *qubit),
-            )
-        })
+        .map(|qubit| (*qubit, WireCursor::at(collector, *qubit)))
         .collect();
     let mut walk = Walk {
         content: Vec::new(),
@@ -247,10 +196,8 @@ fn walk_absorb(
         // Drain the single-qubit gates now adjacent. Absorbing one can only expose another on that
         // same wire, so one pass per wire is enough.
         for qubit in qubits {
-            while let Some((probe, site)) =
-                peek(root, &cursors[qubit], direction, claimed, &descend)?
-            {
-                let dag = scope_dag(root, &site.scope)?;
+            while let Some((probe, site)) = unclaimed(root, &cursors[qubit], direction, claimed)? {
+                let dag = site.scope_dag(root)?;
                 let inst = dag.dag()[site.node].unwrap_operation();
                 if !is_absorbable_gate(dag, inst) {
                     break;
@@ -258,13 +205,12 @@ fn walk_absorb(
                 // A dressing is its own box's. A gate in the collector's own scope belongs to whatever
                 // encloses that box, not to it, so only what the walk descended into is on offer — and
                 // of that, only the dressing side of the twirl point.
-                if site.scope.len() == collector.scope.len()
+                if !site.deeper_than(&collector.scope)
                     || !on_dressing_side(dag, &site, direction, facing)?
                 {
                     break;
                 }
-                let local = dag.qargs_interner().get(inst.qubits).to_vec();
-                let wires = lift_to_collector(root, &collector.scope, &site, &local)?;
+                let wires = site.qubits_in(root, &collector.scope)?;
                 walk.content.push(BodyOp::Gate(site.clone(), wires));
                 walk.consumed.push(site);
                 cursors.insert(*qubit, probe);
@@ -275,12 +221,10 @@ fn walk_absorb(
         // qubits, since a wire outside them has no cursor to be adjacent on.
         let mut layer: Option<(Site, Emit, Vec<Qubit>)> = None;
         for qubit in qubits {
-            let Some((_, site)) = peek(root, &cursors[qubit], direction, claimed, &descend)? else {
+            let Some((_, site)) = unclaimed(root, &cursors[qubit], direction, claimed)? else {
                 continue;
             };
-            let dag = scope_dag(root, &site.scope)?;
-            let inst = dag.dag()[site.node].unwrap_operation();
-            let Some(spec) = emission_spec(inst) else {
+            let Some(spec) = emission_spec(site.instruction(root)?) else {
                 continue;
             };
             if spec.direction != Some(facing) {
@@ -293,15 +237,15 @@ fn walk_absorb(
             // content in between. The discrimination belongs in *compatibility*, not position: once a
             // collector can be typed as unable to collect a given emission, it will decline and the
             // emission will carry on to one that can. See `lower::compatible`.
-            let local = dag.qargs_interner().get(inst.qubits).to_vec();
-            let wires = lift_to_collector(root, &collector.scope, &site, &local)?;
+            let wires = site.qubits_in(root, &collector.scope)?;
             // An emission comes off as a whole layer or not at all: taking it on some wires only
             // would pull content from the far side of it into the body ahead of where it belongs.
             let mut every = true;
             for wire in &wires {
                 let reached = match cursors.get(wire) {
-                    Some(cursor) => peek(root, cursor, direction, claimed, &descend)?
-                        .map(|(_, reached)| reached),
+                    Some(cursor) => {
+                        unclaimed(root, cursor, direction, claimed)?.map(|(_, reached)| reached)
+                    }
                     None => None,
                 };
                 if reached.as_ref() != Some(&site) {
@@ -328,7 +272,7 @@ fn walk_absorb(
         walk.consumed.push(site);
         for wire in &wires {
             let mut probe = cursors[wire].clone();
-            probe.advance(root, direction, &descend)?;
+            probe.advance(root, direction)?;
             cursors.insert(*wire, probe);
         }
     }
@@ -336,20 +280,18 @@ fn walk_absorb(
     Ok(walk)
 }
 
-/// The site this wire sees next, with the cursor that reaches it, or `None` if the wire has run out
-/// in the collector's own scope or runs into something another collector already claimed.
+/// What this wire sees next, unless another collector has already claimed it.
 ///
-/// A peek, not a step: the cursor only moves if the caller takes what it found.
-fn peek(
+/// A claimed site is this pass's own barrier laid on top of the walk's: first come, first served, so a
+/// site already spoken for ends the wire as surely as the end of a body does.
+fn unclaimed(
     root: &DAGCircuit,
     cursor: &WireCursor,
     direction: Direction,
     claimed: &HashSet<Site>,
-    descend: &dyn Fn(&PackedInstruction) -> bool,
 ) -> PyResult<Option<(WireCursor, Site)>> {
-    let mut probe = cursor.clone();
-    match probe.advance(root, direction, descend)? {
-        Some(site) if !claimed.contains(&site) => Ok(Some((probe, site))),
+    match cursor.peek(root, direction)? {
+        Some((probe, site)) if !claimed.contains(&site) => Ok(Some((probe, site))),
         _ => Ok(None),
     }
 }
@@ -412,25 +354,10 @@ fn holds_any_emission(dag: &DAGCircuit) -> PyResult<bool> {
         .any(|(_, inst)| emission_spec(inst).is_some()))
 }
 
-/// Lift wires from the scope a site lives in up into the frame of the collector absorbing it.
-fn lift_to_collector(
-    root: &DAGCircuit,
-    collector_scope: &[NodeIndex],
-    site: &Site,
-    wires: &[Qubit],
-) -> PyResult<Vec<Qubit>> {
-    // A cursor never ascends above the collector's scope, so a site it reached is always at or below
-    // it and the relative path is the tail.
-    let base = scope_dag(root, collector_scope)?;
-    lift_wires(base, &site.scope[collector_scope.len()..], wires)
-}
-
 /// Build a collector's body from what it absorbed, remapped into its own frame.
 fn build_body(root: &DAGCircuit, plan: &Absorption) -> PyResult<DAGCircuit> {
-    let scope = scope_dag(root, &plan.collector.scope)?;
-    let inst = scope.dag()[plan.collector.node].unwrap_operation();
-    let frame: Vec<Qubit> = scope.qargs_interner().get(inst.qubits).to_vec();
-    let num_clbits = scope.cargs_interner().get(inst.clbits).len();
+    let frame = plan.collector.qubits(root)?;
+    let num_clbits = plan.collector.num_clbits(root)?;
     let mut body = new_dag_body(frame.len(), num_clbits, plan.content.len())?.into_builder();
 
     // The walk only ever offers content on the collector's own wires, so this always resolves.
@@ -450,13 +377,10 @@ fn build_body(root: &DAGCircuit, plan: &Absorption) -> PyResult<DAGCircuit> {
     for op in &plan.content {
         match op {
             BodyOp::Gate(site, wires) => {
-                let gate = site_instruction(root, site)?;
-                let qargs = remap(wires);
-                super::utils::append(&mut body, gate.op.clone(), params_of(gate), &qargs, &[])?;
+                append_instruction(&mut body, site.instruction(root)?, &remap(wires), &[])?;
             }
             BodyOp::Local(local_op, wires) => {
-                let qargs = remap(wires);
-                super::utils::append(&mut body, local_op.clone(), None, &qargs, &[])?;
+                append(&mut body, local_op.clone(), None, &remap(wires), &[])?;
             }
         }
     }
@@ -464,17 +388,15 @@ fn build_body(root: &DAGCircuit, plan: &Absorption) -> PyResult<DAGCircuit> {
 }
 
 /// The collector operation carrying the newly absorbed body.
-fn collect_op(root: &DAGCircuit, plan: &Absorption) -> PyResult<PackedOperation> {
-    let scope = scope_dag(root, &plan.collector.scope)?;
-    let inst = scope.dag()[plan.collector.node].unwrap_operation();
-    let spec = Collect {
+fn absorbed_op(root: &DAGCircuit, plan: &Absorption) -> PyResult<PackedOperation> {
+    let annotation = Collect {
         // Absorption changes only what a collector composes, not what it is.
         partition: plan.spec.partition.clone(),
         parts: plan.spec.parts.clone(),
     };
-    Ok(super::utils::collect_op(
-        spec,
-        scope.qargs_interner().get(inst.qubits).len(),
-        scope.cargs_interner().get(inst.clbits).len(),
+    Ok(collect_op(
+        annotation,
+        plan.collector.qubits(root)?.len(),
+        plan.collector.num_clbits(root)?,
     ))
 }

@@ -19,8 +19,6 @@ use rustworkx_core::petgraph::visit::EdgeRef;
 
 use crate::sampling_graph::{NodeKind, SamplingGraph, VirtualType};
 
-use super::utils::topological_generations;
-
 /// The type a source node puts onto its outgoing edges.
 ///
 /// For an emission this is read straight off the node rather than re-derived from its distribution
@@ -38,7 +36,7 @@ fn source_virtual_type(kind: &NodeKind) -> Option<VirtualType> {
 /// Set the virtual type on all edges by forward-propagating from each node's output type.
 /// Propagate nodes pass through the virtual type from their incoming edges unchanged.
 pub fn set_virtual_types(sg: &mut SamplingGraph) {
-    let generations = topological_generations(&sg.graph);
+    let generations = sg.topological_generations();
 
     for generation in generations {
         for idx in generation {

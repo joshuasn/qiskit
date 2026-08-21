@@ -30,15 +30,13 @@
 //! Parameters are deliberately absent; they are minted during lowering.
 
 use hashbrown::{HashMap, HashSet};
-use smallvec::SmallVec;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use qiskit_circuit::annotation::Annotation;
 use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder, NodeIndex};
-use qiskit_circuit::instruction::Parameters;
 use qiskit_circuit::operations::{
-    BoxDuration, ControlFlow, ControlFlowView, Operation, OperationRef, Param,
+    BoxDuration, ControlFlow, ControlFlowView, Operation, OperationRef,
 };
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 
@@ -50,10 +48,10 @@ use crate::annotated_circuit::{
 };
 use crate::distributions::{DistEntry, DistKey, DistributionTable};
 use crate::emission_circuit::{Collect, CollectPart, Emit, EmitPart};
+use crate::emission_circuit_navigation::{append, append_instruction, new_dag_body, write_box};
+use crate::error::IntoPyResult;
 use crate::partition::Partition;
 use crate::sampling_graph::Direction;
-
-use super::utils::{IntoPyResult, append, new_dag_body, write_box};
 
 /// The synthesizer assumed when a box's annotations do not name one.
 ///
@@ -302,7 +300,7 @@ impl Build {
             .collect();
 
         // Collectors start empty — the absorb_dressing pass populates them by walking the spine.
-        let empty_body = new_body(width, body_clbits.len(), 0)?;
+        let empty_body = new_dag_body(width, body_clbits.len(), 0)?;
         let left = Collect {
             partition: partition.clone(),
             parts: collect_parts.clone(),
@@ -427,7 +425,7 @@ impl Build {
         };
         let (easy_nodes, hard_nodes) = classify_body(body, dressing);
         let mut builder =
-            new_body(width, num_clbits, body.num_ops() + inside.len())?.into_builder();
+            new_dag_body(width, num_clbits, body.num_ops() + inside.len())?.into_builder();
         // A body is exactly as wide as its box, so inside it the box's qubits *are* `0..width`. An
         // emission's own partition indexes its qargs, so these are what it is written on.
         let body_qargs: Vec<Qubit> = (0..width as u32).map(Qubit).collect();
@@ -662,10 +660,6 @@ fn box_duration(inst: &PackedInstruction) -> Option<BoxDuration> {
     duration.clone()
 }
 
-fn new_body(num_qubits: usize, num_clbits: usize, capacity: usize) -> PyResult<DAGCircuit> {
-    new_dag_body(num_qubits, num_clbits, capacity)
-}
-
 /// Copy an instruction verbatim into `out`, remapping its bits through `scope`.
 fn copy_instruction(
     dag: &DAGCircuit,
@@ -675,15 +669,7 @@ fn copy_instruction(
 ) -> PyResult<()> {
     let qargs = scope.out_qubits(dag.qargs_interner().get(inst.qubits))?;
     let cargs = scope.out_clbits(dag.cargs_interner().get(inst.clbits))?;
-    let params: Option<Parameters<_>> = (!inst.params_view().is_empty()).then(|| {
-        Parameters::Params(
-            inst.params_view()
-                .iter()
-                .cloned()
-                .collect::<SmallVec<[Param; 3]>>(),
-        )
-    });
-    append(out, inst.op.clone(), params, &qargs, &cargs)
+    append_instruction(out, inst, &qargs, &cargs)
 }
 
 /// Write the emissions belonging to one edge of a box, in the order given, on `qargs`.
@@ -742,7 +728,9 @@ mod tests {
     use crate::partition::Partition;
     use qiskit_circuit::operations::StandardGate;
 
-    use super::super::utils::{append, collect_annotation, is_box, is_collector, new_dag_body};
+    use crate::emission_circuit_navigation::{
+        append, collect_annotation, is_box, is_collector, new_dag_body,
+    };
 
     /// An annotation from outside samplex's vocabulary, of the kind a box may carry alongside ours.
     #[derive(Debug, Clone, PartialEq)]

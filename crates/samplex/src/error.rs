@@ -12,9 +12,26 @@
 
 //! Errors raised while lowering an annotated circuit.
 
+use pyo3::PyResult;
+use pyo3::exceptions::PyValueError;
 use thiserror::Error;
 
 use crate::annotated_circuit::AnnotationKind;
+
+/// Extension trait that converts any `Result<T, E: Display>` into `PyResult<T>` via `PyValueError`.
+///
+/// The crate's one adapter between a Rust error and a Python one. Samplex's own rules are written as
+/// pure functions returning plain `Result`s, and the `DAGCircuit` methods they call have errors of
+/// their own; this is where both become the `PyResult` a pass hands back.
+pub trait IntoPyResult<T> {
+    fn into_py_result(self) -> PyResult<T>;
+}
+
+impl<T, E: std::fmt::Display> IntoPyResult<T> for Result<T, E> {
+    fn into_py_result(self) -> PyResult<T> {
+        self.map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LowerError {

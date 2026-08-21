@@ -10,10 +10,13 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+use std::collections::VecDeque;
+
 use hashbrown::HashMap;
 use pyo3::prelude::*;
 use qiskit_circuit::operations::Operation;
 use qiskit_circuit::standard_gate::StandardGate;
+use rustworkx_core::petgraph::Direction as PetDirection;
 use rustworkx_core::petgraph::stable_graph::{NodeIndex, StableDiGraph};
 
 use crate::distributions::{DistEntry, DistKey, DistributionTable};
@@ -295,6 +298,53 @@ impl SamplingGraph {
         SamplingGraph {
             graph: StableDiGraph::new(),
         }
+    }
+
+    /// The nodes grouped into topological generations: each generation depends only on earlier ones,
+    /// so its members are mutually concurrent.
+    ///
+    /// Kahn's algorithm. Two IR3 passes are written over generations rather than over a plain
+    /// topological order because both need the concurrency, not just the order: merging fuses nodes
+    /// *within* a generation, and type inference needs a node's predecessors settled before it is
+    /// visited.
+    ///
+    /// A cycle is reported by omission rather than by error — nodes on one never reach in-degree zero,
+    /// so they appear in no generation. Nothing builds a cyclic sampling graph, and neither caller has
+    /// anything to do about one.
+    pub fn topological_generations(&self) -> Vec<Vec<NodeIndex>> {
+        let mut in_degree: HashMap<NodeIndex, usize> = HashMap::new();
+        for idx in self.graph.node_indices() {
+            in_degree.insert(
+                idx,
+                self.graph
+                    .neighbors_directed(idx, PetDirection::Incoming)
+                    .count(),
+            );
+        }
+
+        let mut generations = Vec::new();
+        let mut queue: VecDeque<NodeIndex> = in_degree
+            .iter()
+            .filter(|(_, d)| **d == 0)
+            .map(|(idx, _)| *idx)
+            .collect();
+
+        while !queue.is_empty() {
+            let current_gen: Vec<NodeIndex> = queue.drain(..).collect();
+            for &node in &current_gen {
+                for succ in self.graph.neighbors_directed(node, PetDirection::Outgoing) {
+                    if let Some(d) = in_degree.get_mut(&succ) {
+                        *d -= 1;
+                        if *d == 0 {
+                            queue.push_back(succ);
+                        }
+                    }
+                }
+            }
+            generations.push(current_gen);
+        }
+
+        generations
     }
 }
 

@@ -25,8 +25,6 @@ use qiskit_circuit::standard_gate::StandardGate;
 use crate::partition::Partition;
 use crate::sampling_graph::{Direction, Measure, Node, NodeKind, Propagate, SamplingGraph};
 
-use super::utils::topological_generations;
-
 #[derive(PartialEq, Eq, Hash)]
 enum MergeKey {
     /// Handedness is part of the key: two conjugations of the same gate in opposite directions are
@@ -53,7 +51,7 @@ fn merge_key(kind: &NodeKind) -> Option<MergeKey> {
 
 /// Merge parallel nodes throughout a sampling graph, in place.
 pub fn merge_parallel_nodes(sg: &mut SamplingGraph) {
-    let generations = topological_generations(&sg.graph);
+    let generations = sg.topological_generations();
 
     for generation in generations {
         let mut key_groups: HashMap<MergeKey, Vec<NodeIndex>> = HashMap::new();

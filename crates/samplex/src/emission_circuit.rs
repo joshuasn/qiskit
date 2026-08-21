@@ -337,9 +337,9 @@ impl PyCollect {
     /// Build the initializer, base and subclass sharing one allocation.
     ///
     /// The base *must* carry the native value: without it a Python round trip comes back as an
-    /// opaque `PythonAnnotation`, `utils::collect_annotation` stops seeing the box as a collector,
-    /// and the pass walks quietly treat it as ordinary content. This is the same hazard the `Emit`
-    /// note above records, and it fails silently in exactly the same way.
+    /// opaque `PythonAnnotation`, `emission_circuit_navigation::collect_annotation` stops seeing the
+    /// box as a collector, and the pass walks quietly treat it as ordinary content. This is the same
+    /// hazard the `Emit` note above records, and it fails silently in exactly the same way.
     fn init(spec: Collect) -> PyClassInitializer<Self> {
         let inner = Arc::new(spec);
         PyClassInitializer::from(PyAnnotation::new(inner.clone())).add_subclass(PyCollect { inner })

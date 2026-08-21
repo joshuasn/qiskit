@@ -21,7 +21,6 @@ pub mod merge_collectors;
 mod merge_parallel_nodes;
 mod prune;
 mod set_virtual_types;
-mod utils;
 
 #[cfg(test)]
 pub(crate) mod test_fixtures;
