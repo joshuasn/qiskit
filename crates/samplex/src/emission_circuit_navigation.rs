@@ -34,6 +34,12 @@
 //! - **A collect box carries exactly one annotation and no duration.** [`collect_op`] mints them that
 //!   way and [`collect_annotation`] reads them back, and those two are the whole of it.
 //!
+//! What a walk finds is offered as data as well as by address. A [`Sighting`] is what one position
+//! looks like to a rule, and [`WireSights`] and [`EmissionTally`] are the two readings of a body that
+//! the IR2 rules decide on. That seam is the point: reading a circuit needs the circuit, deciding does
+//! not, so a rule stated over sightings can be put to a case written as a literal instead of as a
+//! nested circuit.
+//!
 //! Nothing here holds a `Python` token. A native annotation is a Rust value, so asking what a box
 //! declares is a `TypeId` comparison rather than an attribute lookup.
 
@@ -49,7 +55,9 @@ use qiskit_circuit::annotation::Annotation;
 use qiskit_circuit::bit::{ShareableClbit, ShareableQubit};
 use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder, NodeType, Wire};
 use qiskit_circuit::instruction::Parameters;
-use qiskit_circuit::operations::{BoxDuration, ControlFlow, ControlFlowInstruction, OperationRef};
+use qiskit_circuit::operations::{
+    BoxDuration, ControlFlow, ControlFlowInstruction, Operation, OperationRef,
+};
 use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use qiskit_circuit::{Block, Clbit, Qubit};
 
@@ -362,8 +370,12 @@ fn sweep_bodies(
 /// The next operation node along one wire, or `None` at the end of it.
 ///
 /// Reaching the wire's output node counts as the end. This scope only: a box on the wire is the node
-/// reported, not something stepped into. [`WireCursor`] is the walk that crosses box boundaries.
-pub fn next_on_wire(
+/// reported, not something stepped into.
+///
+/// Private: adjacency along a wire is a step, and the two things a pass wants are a walk that crosses
+/// box boundaries — [`WireCursor`] — and a reading of what this scope's wire holds — [`WireSights`].
+/// Both are built from this, and neither leaves a caller to re-derive the other.
+fn next_on_wire(
     dag: &DAGCircuit,
     from: NodeIndex,
     qubit: Qubit,
@@ -496,6 +508,174 @@ impl WireCursor {
     }
 }
 
+// --- What a walk sees ---------------------------------------------------------------------------
+
+/// What stands at one position, as an IR2 rule sees it.
+///
+/// The whole of what the absorption and escape rules ever ask about an instruction, and deliberately no
+/// more: with the question narrowed to this, a rule is a function of plain data rather than of a
+/// `DAGCircuit`, so stating the case one decides costs a literal rather than a nested circuit and an
+/// interpreter to build it in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Sighting {
+    /// A gate that can belong to an easy run: a single-qubit standard gate, which is the only kind a
+    /// dressing multiplies in.
+    EasyGate,
+    /// An emission, and the direction it is still travelling. `None` once it has resolved in place,
+    /// owned by the collector body it sits in rather than propagating towards one.
+    Emission(Option<Direction>),
+    /// A collect box.
+    CollectBox,
+    /// Hard content: anything else. No collector absorbs it, and nothing is moved across it.
+    HardContent,
+}
+
+impl Sighting {
+    /// What this instruction is.
+    ///
+    /// Takes no DAG, which is what keeps the rules downstream free of one: a node's qargs and its
+    /// operation always agree on how many wires it covers, so an easy gate's width comes off the
+    /// operation rather than out of an interner.
+    pub fn of(inst: &PackedInstruction) -> Self {
+        match inst.op.view() {
+            OperationRef::CustomOperation(op) => match op.downcast_ref::<Emit>() {
+                Some(emit) => Sighting::Emission(emit.direction),
+                None => Sighting::HardContent,
+            },
+            OperationRef::StandardGate(gate) if gate.num_qubits() == 1 => Sighting::EasyGate,
+            OperationRef::ControlFlow(_) if is_collector(inst) => Sighting::CollectBox,
+            _ => Sighting::HardContent,
+        }
+    }
+}
+
+/// What one wire sees ahead of a position, in the order it sees it.
+///
+/// This scope only: a box is one sighting rather than something stepped into, so a rule reading these
+/// judges the run of content it is standing in and never something nested inside it. [`WireCursor`] is
+/// the walk that crosses box boundaries; this is the reading that stays where it is.
+///
+/// Lazy, because every rule over it stops at the first sighting that settles the question, and the rest
+/// of the wire is then nobody's business.
+pub struct WireSights<'a> {
+    dag: &'a DAGCircuit,
+    at: NodeIndex,
+    wire: Qubit,
+    direction: Direction,
+}
+
+impl<'a> WireSights<'a> {
+    /// What `wire` sees ahead of the node `from`, travelling `direction`.
+    pub fn ahead(dag: &'a DAGCircuit, from: NodeIndex, wire: Qubit, direction: Direction) -> Self {
+        WireSights {
+            dag,
+            at: from,
+            wire,
+            direction,
+        }
+    }
+}
+
+impl Iterator for WireSights<'_> {
+    type Item = Sighting;
+
+    fn next(&mut self) -> Option<Sighting> {
+        // The end of the wire ends the sequence and keeps ending it: from the last operation,
+        // `next_on_wire` reports the same nothing every time.
+        self.at = next_on_wire(self.dag, self.at, self.wire, self.direction)?;
+        Some(Sighting::of(self.dag.dag()[self.at].unwrap_operation()))
+    }
+}
+
+/// How many emissions a body holds, by the direction each is still travelling.
+///
+/// Two rules count emissions and neither can use the other's count, so the difference between them is
+/// the two readings here rather than an argument: absorption asks whether the body it is folding out of
+/// has a twirl point of its own, and an escape asks how many emissions would arrive at the collector it
+/// is folding into, wherever in the box they were written. Once counted, both are these same three
+/// numbers, and the rules over them need no circuit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct EmissionTally {
+    left: usize,
+    right: usize,
+    /// Resolved in place, so travelling nowhere and arriving at no collector.
+    resolved: usize,
+}
+
+impl EmissionTally {
+    /// The emissions written directly in this body.
+    ///
+    /// This scope only, deliberately. A nested box's emissions are fenced by that box's own collectors
+    /// — build writes them before its emissions on either side — so they resolve inside it and never
+    /// reach a gate in the enclosing body. Counting them anyway would make a `ChangeBasis` box wrapping
+    /// a twirled one look occupied by the inner box's twirl point.
+    pub fn here(dag: &DAGCircuit) -> Self {
+        dag.op_nodes(true)
+            .map(|(_, inst)| Sighting::of(inst))
+            .collect()
+    }
+
+    /// Every emission in this body and in every body nested inside it, at any depth.
+    ///
+    /// A collect box is descended into as well, unlike everywhere else in this module: what one holds
+    /// has resolved in place, so it adds to no direction and needs no exception made for it.
+    pub fn subtree(dag: &DAGCircuit) -> PyResult<Self> {
+        let mut tally = Self::default();
+        for (_, inst) in dag.op_nodes(true) {
+            if let Sighting::Emission(direction) = Sighting::of(inst) {
+                tally.count(direction);
+                continue;
+            }
+            if let Some(body) = block_body(dag, inst)? {
+                tally.add(Self::subtree(body)?);
+            }
+        }
+        Ok(tally)
+    }
+
+    /// How many are still travelling in `direction`, and so still looking for a collector that way.
+    pub fn towards(&self, direction: Direction) -> usize {
+        match direction {
+            Direction::Left => self.left,
+            Direction::Right => self.right,
+        }
+    }
+
+    /// Whether the body holds any emission at all, travelling or resolved — that is, whether it has a
+    /// twirl point in it.
+    pub fn any(&self) -> bool {
+        self.left + self.right + self.resolved > 0
+    }
+
+    fn count(&mut self, direction: Option<Direction>) {
+        match direction {
+            Some(Direction::Left) => self.left += 1,
+            Some(Direction::Right) => self.right += 1,
+            None => self.resolved += 1,
+        }
+    }
+
+    /// Add a nested body's tally to this one. An emission arrives where it arrives regardless of how
+    /// many boxes it was written inside.
+    fn add(&mut self, nested: Self) {
+        self.left += nested.left;
+        self.right += nested.right;
+        self.resolved += nested.resolved;
+    }
+}
+
+impl FromIterator<Sighting> for EmissionTally {
+    fn from_iter<I: IntoIterator<Item = Sighting>>(sightings: I) -> Self {
+        let mut tally = Self::default();
+        for sighting in sightings {
+            if let Sighting::Emission(direction) = sighting {
+                tally.count(direction);
+            }
+        }
+        tally
+    }
+}
+
 // --- Writing ------------------------------------------------------------------------------------
 
 /// Create an empty `DAGCircuit` body with the given dimensions and anonymous wires.
@@ -602,7 +782,8 @@ pub fn collect_op(annotation: Collect, num_qubits: usize, num_clbits: usize) -> 
 mod tests {
     use super::*;
     use crate::annotated_circuit::{DistributionType, Dressing, SynthesizerType, Twirl};
-    use crate::emission_circuit::CollectPart;
+    use crate::distributions::DistKey;
+    use crate::emission_circuit::{CollectPart, EmitPart};
     use crate::partition::Partition;
     use qiskit_circuit::annotation::Annotation;
     use qiskit_circuit::operations::StandardGate;
@@ -639,6 +820,30 @@ mod tests {
                 num_clbits: 0,
             },
             Vec::new(),
+            Default::default(),
+            Default::default(),
+            None,
+        )
+    }
+
+    /// A one-qubit emission travelling `direction`, or resolved in place if `None`.
+    fn emit_spec(direction: Option<Direction>) -> Emit {
+        Emit {
+            direction,
+            partition: Partition::singletons(1),
+            parts: vec![EmitPart {
+                dist: DistKey(0),
+                draw: 0,
+                adjoint: false,
+            }],
+        }
+    }
+
+    /// A one-qubit emission as an instruction, with the same empty interner keys as
+    /// [`box_instruction`] and for the same reason.
+    fn emission_instruction(direction: Option<Direction>) -> PackedInstruction {
+        PackedInstruction::from_custom_operation(
+            emit_spec(direction),
             Default::default(),
             Default::default(),
             None,
@@ -785,6 +990,44 @@ mod tests {
             write_box(&mut out, body.build(), annotations, None, &[Qubit(0)], &[]).unwrap();
         }
         out.build()
+    }
+
+    /// One qubit: an emission travelling rightward, then a content box holding an emission travelling
+    /// leftward and a collect box with a resolved emission in it.
+    ///
+    /// Three depths and three answers, which is what separates the two tally readings.
+    fn emissions_at_depth() -> DAGCircuit {
+        Python::initialize();
+        let mut out = new_dag_body(1, 0, 2).unwrap().into_builder();
+        append_emission(&mut out, Some(Direction::Right));
+        let mut body = new_dag_body(1, 0, 2).unwrap().into_builder();
+        append_emission(&mut body, Some(Direction::Left));
+        let mut absorbed = new_dag_body(1, 0, 1).unwrap().into_builder();
+        append_emission(&mut absorbed, None);
+        write_box(
+            &mut body,
+            absorbed.build(),
+            collect_annotations(),
+            None,
+            &[Qubit(0)],
+            &[],
+        )
+        .unwrap();
+        write_box(
+            &mut out,
+            body.build(),
+            content_annotations(),
+            None,
+            &[Qubit(0)],
+            &[],
+        )
+        .unwrap();
+        out.build()
+    }
+
+    fn append_emission(out: &mut DAGCircuitBuilder, direction: Option<Direction>) {
+        let op = PackedOperation::from_custom_operation(Box::new(emit_spec(direction)));
+        append(out, op, None, &[Qubit(0)], &[]).unwrap();
     }
 
     #[test]
@@ -998,5 +1241,109 @@ mod tests {
             node: NodeIndex::new(0),
         };
         assert!(site.qubits_in(&root, &[NodeIndex::new(0)]).is_err());
+    }
+
+    #[test]
+    fn test_sighting_reads_what_a_rule_asks_about() {
+        // No DAG anywhere in here, which is the whole reason sightings exist: the four cases a rule
+        // distinguishes are read off an instruction alone.
+        assert_eq!(
+            Sighting::of(&PackedInstruction::from_standard_gate(
+                StandardGate::H,
+                None,
+                Default::default()
+            )),
+            Sighting::EasyGate
+        );
+        assert_eq!(
+            Sighting::of(&PackedInstruction::from_standard_gate(
+                StandardGate::CX,
+                None,
+                Default::default()
+            )),
+            Sighting::HardContent,
+            "a dressing multiplies in single-qubit gates only"
+        );
+        assert_eq!(
+            Sighting::of(&box_instruction(collect_annotations())),
+            Sighting::CollectBox
+        );
+        assert_eq!(
+            Sighting::of(&box_instruction(content_annotations())),
+            Sighting::HardContent,
+            "a content box is one opaque thing to a wire reading its own scope"
+        );
+        assert_eq!(
+            Sighting::of(&emission_instruction(Some(Direction::Left))),
+            Sighting::Emission(Some(Direction::Left))
+        );
+        assert_eq!(
+            Sighting::of(&emission_instruction(None)),
+            Sighting::Emission(None),
+            "an absorbed emission has resolved in place and travels nowhere"
+        );
+    }
+
+    #[test]
+    fn test_wire_sights_stay_in_their_own_scope() {
+        // The other reading of the same nest that `WireCursor` descends into: a box is one sighting,
+        // reported and passed over, so a rule judging a run never sees the run inside a box.
+        let root = content_nest();
+        let start = gate_site(&root, Vec::new(), StandardGate::H);
+        let ahead: Vec<Sighting> =
+            WireSights::ahead(&root, start.node, Qubit(0), Direction::Right).collect();
+        assert_eq!(
+            ahead,
+            vec![Sighting::HardContent, Sighting::EasyGate],
+            "the content box, then the z after it — not the x and y inside"
+        );
+    }
+
+    #[test]
+    fn test_emission_tally_here_ignores_a_nested_body() {
+        // The reading absorption makes: a box's own twirl point, never a nested box's, which that
+        // box's own collectors have already fenced.
+        let root = emissions_at_depth();
+        let tally = EmissionTally::here(&root);
+        assert!(tally.any());
+        assert_eq!(tally.towards(Direction::Right), 1);
+        assert_eq!(
+            tally.towards(Direction::Left),
+            0,
+            "the nested one is not here"
+        );
+    }
+
+    #[test]
+    fn test_emission_tally_subtree_counts_at_any_depth() {
+        // The reading an escape makes: every emission that will arrive at the collector being folded
+        // into, however deep in the box it was written, and a collector's own body descended into as
+        // well because what is in there has resolved.
+        let root = emissions_at_depth();
+        let tally = EmissionTally::subtree(&root).unwrap();
+        assert_eq!(tally.towards(Direction::Right), 1);
+        assert_eq!(tally.towards(Direction::Left), 1, "the one inside the box");
+        assert_eq!(
+            tally,
+            [
+                Sighting::Emission(Some(Direction::Right)),
+                Sighting::Emission(Some(Direction::Left)),
+                Sighting::Emission(None),
+            ]
+            .into_iter()
+            .collect(),
+            "the resolved one is counted too, and towards nothing"
+        );
+    }
+
+    #[test]
+    fn test_emission_tally_counts_only_emissions() {
+        // Collected straight from sightings, which is how a rule's test states the case it decides
+        // without a circuit to imply it.
+        let tally: EmissionTally = [Sighting::EasyGate, Sighting::CollectBox]
+            .into_iter()
+            .collect();
+        assert!(!tally.any());
+        assert_eq!(tally.towards(Direction::Left), 0);
     }
 }

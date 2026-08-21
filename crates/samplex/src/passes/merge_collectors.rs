@@ -45,8 +45,8 @@ use qiskit_circuit::{Clbit, Qubit};
 use crate::annotated_circuit::SynthesizerType;
 use crate::emission_circuit::{Collect, CollectPart};
 use crate::emission_circuit_navigation::{
-    ScopeOrder, Site, WireCursor, append_instruction, block_body, collect_annotation, collect_op,
-    collectors, emission_spec, is_box, new_dag_body, scope_dag,
+    EmissionTally, ScopeOrder, Site, WireCursor, append_instruction, collect_annotation,
+    collect_op, collectors, is_box, new_dag_body, scope_dag,
 };
 use crate::error::IntoPyResult;
 use crate::partition::Partition;
@@ -265,22 +265,14 @@ fn escapable(root: &DAGCircuit, outer: &Site, direction: Direction) -> PyResult<
         if !adjacent {
             continue;
         }
-        // P2, as two hazards rather than one blanket refusal. `outward` is the way an emission would
-        // have to travel to end up at `outer`, and after the transfer every such emission does, since
-        // the collector that was catching them is gone.
+        // P2. `outward` is the way an emission would have to travel to end up at `outer`, and after the
+        // transfer every such emission does, since the collector that was catching them is gone.
         let outward = match direction {
             Direction::Right => Direction::Left,
             Direction::Left => Direction::Right,
         };
-        let arriving = count_emissions_towards(scope_dag(root, &inner.scope)?, outward)?;
-        if arriving > 0 && !body_is_empty(root, &inner)? {
-            // The content being moved sits on such an emission's path: crossed today, with the inner
-            // collector foreign to it, and composed inside its target afterwards.
-            continue;
-        }
-        if arriving > 1 {
-            // Two would arrive at `outer` from the same side, and which composes nearer its edge is a
-            // question only the incoming-placement rule answers.
+        let arriving = EmissionTally::subtree(scope_dag(root, &inner.scope)?)?;
+        if !hazards_clear(&arriving, outward, !body_is_empty(root, &inner)?) {
             continue;
         }
         return Ok(Some(inner));
@@ -298,27 +290,30 @@ fn first_site(
     WireCursor::at(from, wire).advance(root, direction)
 }
 
-/// How many emissions in this body, at any depth, are still travelling in `direction`.
+/// Whether an escape's two hazards are clear, given what the inner collector's box holds.
 ///
-/// These are the ones that end up at the collector being folded into, since the transfer deletes the
-/// collector that was catching them. The count is what separates an escape's two hazards from each
-/// other: one of them needs any such emission plus content to move, the other needs two of them.
+/// P2 as two hazards rather than one blanket refusal. `arriving` is a tally of the box the escaping
+/// collector is leaving, and `outward` the way an emission has to travel to end up at the collector
+/// being folded into — every one of those does end up there after the transfer, since the collector
+/// that was catching them is gone. `moves_content` says whether the escaping collector has a body to
+/// take with it.
 ///
-/// A local emission is not counted — it has resolved in place and travels nowhere.
-fn count_emissions_towards(dag: &DAGCircuit, direction: Direction) -> PyResult<usize> {
-    let mut total = 0;
-    for (_, inst) in dag.op_nodes(true) {
-        if let Some(spec) = emission_spec(inst) {
-            if spec.direction == Some(direction) {
-                total += 1;
-            }
-            continue;
-        }
-        if let Some(body) = block_body(dag, inst)? {
-            total += count_emissions_towards(body, direction)?;
-        }
+/// - Content plus even one arriving emission refuses: the content being moved sits on that emission's
+///   path — crossed today, with the escaping collector foreign to it, and composed inside its target
+///   afterwards.
+/// - Two arriving refuses whether anything moves or not: both would reach the same collector from the
+///   same side, and which composes nearer its edge is a question only the incoming-placement rule
+///   answers.
+///
+/// A tally rather than a body, so the hazards are decided on plain data. Which emissions are in the
+/// tally is [`EmissionTally::subtree`]'s business, and it counts at any depth: an emission nested two
+/// boxes down still arrives at `outer`, and a local one arrives nowhere.
+fn hazards_clear(arriving: &EmissionTally, outward: Direction, moves_content: bool) -> bool {
+    let arriving = arriving.towards(outward);
+    if arriving > 0 && moves_content {
+        return false;
     }
-    Ok(total)
+    arriving <= 1
 }
 
 /// Whether a collector has nothing in its body to move.
@@ -620,7 +615,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::super::build::build;
-    use crate::emission_circuit_navigation::{append, is_collector, new_dag_body, write_box};
+    use crate::emission_circuit_navigation::{
+        Sighting, append, is_collector, new_dag_body, write_box,
+    };
 
     fn twirl() -> Arc<dyn Annotation> {
         Arc::new(Twirl {
@@ -695,5 +692,55 @@ mod tests {
         let before = (collector_count(&dag), box_count(&dag));
         merge_collectors(&mut dag).unwrap();
         assert_eq!((collector_count(&dag), box_count(&dag)), before);
+    }
+
+    /// The tally of a box holding `count` emissions travelling `outward`, all of which arrive at the
+    /// collector an escape would fold into.
+    ///
+    /// Where in the box they were written does not appear here, which is the point of taking a tally:
+    /// [`EmissionTally::subtree`] counts them at any depth, and the hazards below cannot tell — nor
+    /// should they, since an emission two boxes down arrives just the same.
+    fn arriving(count: usize, outward: Direction) -> EmissionTally {
+        (0..count)
+            .map(|_| Sighting::Emission(Some(outward)))
+            .collect()
+    }
+
+    #[test]
+    fn test_an_escape_with_content_to_move_refuses_any_arriving_emission() {
+        assert!(!hazards_clear(
+            &arriving(1, Direction::Left),
+            Direction::Left,
+            true
+        ));
+        assert!(
+            hazards_clear(&arriving(1, Direction::Left), Direction::Left, false),
+            "an unabsorbed collector moves nothing, so its escape is purely structural"
+        );
+    }
+
+    #[test]
+    fn test_an_escape_refuses_two_arriving_emissions_whatever_moves() {
+        for moves_content in [false, true] {
+            assert!(!hazards_clear(
+                &arriving(2, Direction::Left),
+                Direction::Left,
+                moves_content
+            ));
+        }
+    }
+
+    #[test]
+    fn test_only_the_emissions_that_would_arrive_are_hazards() {
+        // Travelling the other way, or resolved in place: neither ends up at the collector being folded
+        // into, so neither refuses the escape even with a body to move.
+        let elsewhere: EmissionTally = [
+            Sighting::Emission(Some(Direction::Right)),
+            Sighting::Emission(Some(Direction::Right)),
+            Sighting::Emission(None),
+        ]
+        .into_iter()
+        .collect();
+        assert!(hazards_clear(&elsewhere, Direction::Left, true));
     }
 }

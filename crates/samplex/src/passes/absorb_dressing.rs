@@ -53,13 +53,12 @@ use hashbrown::{HashMap, HashSet};
 use pyo3::prelude::*;
 use qiskit_circuit::Qubit;
 use qiskit_circuit::dag_circuit::DAGCircuit;
-use qiskit_circuit::operations::OperationRef;
-use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
+use qiskit_circuit::packed_instruction::PackedOperation;
 
 use crate::emission_circuit::{Collect, Emit};
 use crate::emission_circuit_navigation::{
-    ScopeOrder, Site, WireCursor, append, append_instruction, collect_op, collectors,
-    emission_spec, new_dag_body, next_on_wire,
+    EmissionTally, ScopeOrder, Sighting, Site, WireCursor, WireSights, append, append_instruction,
+    collect_op, collectors, emission_spec, new_dag_body,
 };
 use crate::sampling_graph::Direction;
 
@@ -156,15 +155,6 @@ fn plan_absorptions(root: &DAGCircuit) -> PyResult<Vec<Absorption>> {
     Ok(plans)
 }
 
-/// Whether a collector can absorb this instruction: a single-qubit standard gate.
-///
-/// Which wire it is on need not be checked — the walk only offers nodes adjacent along one of the
-/// collector's own wires, so a single-qubit gate reached that way is on that wire by construction.
-fn is_absorbable_gate(dag: &DAGCircuit, inst: &PackedInstruction) -> bool {
-    matches!(inst.op.view(), OperationRef::StandardGate(_))
-        && dag.qargs_interner().get(inst.qubits).len() == 1
-}
-
 /// Walk outward from a collector along its own wires, absorbing what it reaches.
 ///
 /// Each wire carries its own cursor — the last site absorbed on it — so a blocked wire stops moving
@@ -199,15 +189,24 @@ fn walk_absorb(
             while let Some((probe, site)) = unclaimed(root, &cursors[qubit], direction, claimed)? {
                 let dag = site.scope_dag(root)?;
                 let inst = dag.dag()[site.node].unwrap_operation();
-                if !is_absorbable_gate(dag, inst) {
+                if Sighting::of(inst) != Sighting::EasyGate {
                     break;
                 }
                 // A dressing is its own box's. A gate in the collector's own scope belongs to whatever
                 // encloses that box, not to it, so only what the walk descended into is on offer — and
                 // of that, only the dressing side of the twirl point.
-                if !site.deeper_than(&collector.scope)
-                    || !on_dressing_side(dag, &site, direction, facing)?
-                {
+                if !site.deeper_than(&collector.scope) {
+                    break;
+                }
+                // An easy gate is single-qubit, so the run this one belongs to is on one wire.
+                let Some(wire) = dag.qargs_interner().get(inst.qubits).first().copied() else {
+                    break;
+                };
+                if !on_dressing_side(
+                    &EmissionTally::here(dag),
+                    WireSights::ahead(dag, site.node, wire, direction),
+                    facing,
+                ) {
                     break;
                 }
                 let wires = site.qubits_in(root, &collector.scope)?;
@@ -297,61 +296,45 @@ fn unclaimed(
 }
 
 /// Whether a gate inside a box is on the dressing side of that box's twirl point, as seen by a
-/// collector walking `direction`.
+/// collector walking towards it — `ahead` being what the gate's own wire sees the other way, and
+/// `facing` the direction an emission must travel to reach the collector.
 ///
-/// **A box with no emission in it has no twirl point to be on the wrong side of**, so its whole
-/// absorbable run is fair game. That is the ordinary shape of a box carrying only a `ChangeBasis`: the
-/// frame change names the box's edge, so it is written on the spine outside, and nothing propagates
-/// within the body at all. Nothing there can be on an emission's path, so nothing there can be taken
-/// off one. An enclosing box's emission crossing the body is unaffected — this collector is foreign to
-/// it, so the gates are still crossed rather than composed.
+/// A rule over plain data, and the one in this crate that most needs to be: a wrong answer here is
+/// silent. It still yields a valid randomization, just of a different region than was asked for, so no
+/// round-trip test can catch it and only a case stated directly can.
 ///
-/// Otherwise scan on along the gate's own wire, over the absorbable run it belongs to. An emission
-/// facing this collector at the end of that run means the run lies between the collector and the twirl
-/// point: those gates multiply into this dressing and nothing propagating ever crosses them. Anything
-/// else — content, a collector, the end of the body — means the run is on the far side of the twirl
-/// point, so it is content that an emission travelling this way is conjugated by. Folding that in would
-/// take it off the propagation path, which is sound only if the incoming emission is composed on the far
-/// side of it, and nothing implements that yet.
+/// **A box with no emission in it has no twirl point to be on the wrong side of**, so its whole easy run
+/// is fair game. That is the ordinary shape of a box carrying only a `ChangeBasis`: the frame change
+/// names the box's edge, so it is written on the spine outside, and nothing propagates within the body at
+/// all. Nothing there can be on an emission's path, so nothing there can be taken off one. An enclosing
+/// box's emission crossing the body is unaffected — this collector is foreign to it, so the gates are
+/// still crossed rather than composed.
+///
+/// Otherwise read on along the gate's own wire, over the easy run it belongs to. An emission facing this
+/// collector at the end of that run means the run lies between the collector and the twirl point: those
+/// gates multiply into this dressing and nothing propagating ever crosses them. Anything else — hard
+/// content, a collector, the end of the body — means the run is on the far side of the twirl point, so it
+/// is content that an emission travelling this way is conjugated by. Folding that in would take it off
+/// the propagation path, which is sound only if the incoming emission is composed on the far side of it,
+/// and nothing implements that yet.
 fn on_dressing_side(
-    dag: &DAGCircuit,
-    site: &Site,
-    direction: Direction,
+    content: &EmissionTally,
+    ahead: impl IntoIterator<Item = Sighting>,
     facing: Direction,
-) -> PyResult<bool> {
-    if !holds_any_emission(dag)? {
-        return Ok(true);
+) -> bool {
+    if !content.any() {
+        return true;
     }
-    let inst = dag.dag()[site.node].unwrap_operation();
-    // Absorbable gates are single-qubit, so the run this one belongs to is on one wire.
-    let Some(wire) = dag.qargs_interner().get(inst.qubits).first().copied() else {
-        return Ok(false);
-    };
-    let mut at = site.node;
-    while let Some(next) = next_on_wire(dag, at, wire, direction) {
-        let ahead = dag.dag()[next].unwrap_operation();
-        if let Some(spec) = emission_spec(ahead) {
-            return Ok(spec.direction == Some(facing));
+    for sighting in ahead {
+        match sighting {
+            Sighting::EasyGate => continue,
+            Sighting::Emission(direction) => return direction == Some(facing),
+            Sighting::CollectBox | Sighting::HardContent => return false,
         }
-        if !is_absorbable_gate(dag, ahead) {
-            return Ok(false);
-        }
-        at = next;
     }
-    Ok(false)
-}
-
-/// Whether this body holds an emission of its own.
-///
-/// This scope only, deliberately. A nested box's emissions are fenced by that box's own collectors —
-/// build writes them before its emissions on either side — so they resolve inside it and never reach a
-/// gate in the enclosing body. Descending would count them anyway and cost the fold: a `ChangeBasis` box
-/// wrapping a twirled one would look occupied by the inner box's twirl point and stop folding its own
-/// absorbable run, which is exactly the case this is here to allow.
-fn holds_any_emission(dag: &DAGCircuit) -> PyResult<bool> {
-    Ok(dag
-        .op_nodes(true)
-        .any(|(_, inst)| emission_spec(inst).is_some()))
+    // The end of the body, with a twirl point somewhere off this wire: nothing says this run is on the
+    // dressing side of it, so it is not offered.
+    false
 }
 
 /// Build a collector's body from what it absorbed, remapped into its own frame.
@@ -399,4 +382,95 @@ fn absorbed_op(root: &DAGCircuit, plan: &Absorption) -> PyResult<PackedOperation
         plan.collector.qubits(root)?.len(),
         plan.collector.num_clbits(root)?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // None of these touches a `DAGCircuit` or an interpreter, which is what they are for. The rule they
+    // pin is silent: a wrong answer still yields a valid randomization, just of a different region than
+    // was asked for, so no round-trip through the passes can observe it and only a case stated directly
+    // can.
+
+    /// The tally of a box that has a twirl point in it, which is when the rule has anything to decide.
+    fn twirled() -> EmissionTally {
+        [Sighting::Emission(Some(Direction::Left))]
+            .into_iter()
+            .collect()
+    }
+
+    /// The direction an emission travels to get away from a collector that `facing` reaches.
+    fn away_from(facing: Direction) -> Direction {
+        match facing {
+            Direction::Left => Direction::Right,
+            Direction::Right => Direction::Left,
+        }
+    }
+
+    #[test]
+    fn test_an_easy_run_reaching_the_twirl_point_multiplies_into_the_dressing() {
+        // Both directions, since a collector walks each way out of its own box and the two answers are
+        // mirror images. An emission facing this collector at the end of the run puts the run between
+        // the two, so nothing propagating ever crosses it and the dressing may have it.
+        for facing in [Direction::Left, Direction::Right] {
+            assert!(on_dressing_side(
+                &twirled(),
+                [Sighting::EasyGate, Sighting::Emission(Some(facing))],
+                facing,
+            ));
+        }
+    }
+
+    #[test]
+    fn test_an_easy_run_past_the_twirl_point_stays_hard_content() {
+        // The emission at the end of the run is travelling away, so the run is content that emission is
+        // conjugated by. Folding it in would take it off the propagation path.
+        for facing in [Direction::Left, Direction::Right] {
+            assert!(!on_dressing_side(
+                &twirled(),
+                [
+                    Sighting::EasyGate,
+                    Sighting::Emission(Some(away_from(facing)))
+                ],
+                facing,
+            ));
+            assert!(
+                !on_dressing_side(
+                    &twirled(),
+                    [Sighting::EasyGate, Sighting::Emission(None)],
+                    facing,
+                ),
+                "an emission that has resolved in place faces nobody"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_run_with_no_twirl_point_at_the_end_of_it_stays_where_it_is() {
+        // Hard content, a collector, or the end of the body: none of them says which side of the twirl
+        // point the run is on, and unsure is a refusal.
+        for ahead in [
+            vec![Sighting::HardContent],
+            vec![Sighting::CollectBox],
+            vec![Sighting::EasyGate],
+            vec![],
+        ] {
+            assert!(!on_dressing_side(&twirled(), ahead, Direction::Left));
+        }
+    }
+
+    #[test]
+    fn test_a_box_with_no_twirl_point_offers_its_whole_easy_run() {
+        // The ordinary `ChangeBasis` shape: nothing propagates within the body, so no gate in it can be
+        // on an emission's path and none can be taken off one, whatever else stands on the wire.
+        let untwirled: EmissionTally = [Sighting::EasyGate, Sighting::HardContent]
+            .into_iter()
+            .collect();
+        assert!(on_dressing_side(
+            &untwirled,
+            [Sighting::HardContent],
+            Direction::Left
+        ));
+    }
 }
