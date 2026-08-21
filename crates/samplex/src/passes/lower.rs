@@ -486,11 +486,17 @@ fn attach_param_indices(
     }
     // The other direction: parameters minted for a collector no graph collector claimed. Those angles
     // would be in the template with nothing computing them.
-    if let Some(site) = by_site.keys().next() {
+    // Named in the template's own order rather than whichever key the map happens to yield, so the
+    // message is identical on every run of the same failing input; determinism is a crate invariant.
+    if let Some(entry) = params
+        .iter()
+        .find(|entry| by_site.contains_key(&entry.site))
+    {
         return Err(PyValueError::new_err(format!(
             "the template minted parameters for {} collector(s) the graph walk did not find, one at \
-             {site:?}; the two must be built from the same circuit",
-            by_site.len()
+             {:?}; the two must be built from the same circuit",
+            by_site.len(),
+            entry.site
         )));
     }
     Ok(())
