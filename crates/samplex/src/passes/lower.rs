@@ -31,7 +31,6 @@
 
 use std::sync::Arc;
 
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use qiskit_circuit::Qubit;
 use qiskit_circuit::circuit_data::{CircuitData, PyCircuitData};
@@ -52,7 +51,7 @@ use crate::emission_circuit::Emit;
 use crate::emission_circuit_navigation::{
     Site, block_body, collect_annotation, emission_spec, is_box, is_emission,
 };
-use crate::error::IntoPyResult;
+use crate::error::{Result, SamplexError};
 use crate::parameters::ParameterTable;
 use crate::sampling_graph::{
     AbsorbedGate, AbsorbedParam, Collect, CollectStep, Emission, LocalEmission, Measure, Node,
@@ -83,14 +82,13 @@ pub struct CollectorParams {
 /// Returns the template plus one [`CollectorParams`] per collector, each naming the collect box it
 /// came from. The order is circuit order, but nothing downstream depends on that: the site is what
 /// identifies a range.
-pub fn build_template(dag: &DAGCircuit) -> PyResult<(CircuitData, Vec<CollectorParams>)> {
+pub fn build_template(dag: &DAGCircuit) -> Result<(CircuitData, Vec<CollectorParams>)> {
     let mut out = CircuitData::with_capacity(
         dag.num_qubits() as u32,
         dag.num_clbits() as u32,
         dag.num_ops(),
         Param::Float(0.0),
-    )
-    .into_py_result()?;
+    )?;
     let mut collectors = Vec::new();
     let mut next_param = 0usize;
 
@@ -157,7 +155,7 @@ fn write_scope(
     global: &[usize],
     collectors: &mut Vec<CollectorParams>,
     next_param: &mut usize,
-) -> PyResult<()> {
+) -> Result<()> {
     // Topological order, which is the order parameters are minted in. `flatten` walks the same order,
     // but neither walk relies on that any more: each collector is reported under its own site.
     for node in src.topological_op_nodes(false) {
@@ -205,8 +203,7 @@ fn write_scope(
                 cargs.len() as u32,
                 body.num_ops(),
                 Param::Float(0.0),
-            )
-            .into_py_result()?;
+            )?;
             write_scope(
                 body,
                 &mut inner_out,
@@ -227,8 +224,7 @@ fn write_scope(
                 Some(qiskit_circuit::instruction::Parameters::Blocks(vec![block])),
                 &qargs,
                 &cargs,
-            )
-            .into_py_result()?;
+            )?;
             continue;
         }
 
@@ -253,7 +249,7 @@ fn write_synth_template(
     synthesizer: SynthesizerType,
     qubits: &[usize],
     param_indices: &[usize],
-) -> PyResult<()> {
+) -> Result<()> {
     for (position, qubit) in qubits.iter().enumerate() {
         let angles: Vec<Param> = param_indices
             [position * PARAMS_PER_QUBIT..(position + 1) * PARAMS_PER_QUBIT]
@@ -277,8 +273,7 @@ fn write_synth_template(
         };
         for (gate, angle) in sequence {
             let params: Vec<Param> = angle.into_iter().cloned().collect();
-            out.push_standard_gate(gate, &params, &target)
-                .into_py_result()?;
+            out.push_standard_gate(gate, &params, &target)?;
         }
     }
     Ok(())
@@ -307,7 +302,7 @@ fn descend(scope: &[NodeIndex], node: NodeIndex) -> Vec<NodeIndex> {
 fn plain_box_body<'a>(
     src: &'a DAGCircuit,
     inst: &PackedInstruction,
-) -> PyResult<Option<&'a DAGCircuit>> {
+) -> Result<Option<&'a DAGCircuit>> {
     if is_box(inst) {
         block_body(src, inst)
     } else {
@@ -323,20 +318,17 @@ fn copy_with_qargs(
     out: &mut CircuitData,
     qargs: &[Qubit],
     cargs: &[qiskit_circuit::Clbit],
-) -> PyResult<()> {
+) -> Result<()> {
     if !inst.blocks_view().is_empty() {
-        return Err(PyValueError::new_err(format!(
-            "cannot lower '{}' into a template: it carries a body but is not a `box`",
-            inst.op.name()
-        )));
+        return Err(SamplexError::BodyOnNonBox(inst.op.name().to_string()));
     }
     let params = (!inst.params_view().is_empty()).then(|| {
         qiskit_circuit::instruction::Parameters::Params(
             inst.params_view().iter().cloned().collect(),
         )
     });
-    out.push_packed_operation(inst.op.clone(), params, qargs, cargs)
-        .into_py_result()
+    out.push_packed_operation(inst.op.clone(), params, qargs, cargs)?;
+    Ok(())
 }
 
 // --- Sampling graph construction ----------------------------------------------------------------
@@ -352,7 +344,7 @@ pub fn build_sampling_graph(
     dag: &DAGCircuit,
     table: &DistributionTable,
     collectors: &[CollectorParams],
-) -> PyResult<(SamplingGraph, ParameterTable)> {
+) -> Result<(SamplingGraph, ParameterTable)> {
     let mut spine = Spine::default();
     let mut parameters = ParameterTable::new();
     let identity: Vec<usize> = (0..dag.num_qubits()).collect();
@@ -429,11 +421,9 @@ pub fn build_sampling_graph(
         // rather than skipped.
         let target = spine
             .resolve_collector(position, direction, emission, qubits, table)
-            .ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "emission on qubits {qubits:?} travelling {direction:?} has no compatible \
-                     collector ahead of it; its randomization could not be undone",
-                ))
+            .ok_or_else(|| SamplexError::EmissionWithoutCollector {
+                qubits: qubits.clone(),
+                direction,
             })?;
         spine.propagate(
             &mut sg,
@@ -462,26 +452,19 @@ pub fn build_sampling_graph(
 fn attach_param_indices(
     collectors: &mut [spine::Collector],
     params: &[CollectorParams],
-) -> PyResult<()> {
+) -> Result<()> {
     let mut by_site: HashMap<&Site, &CollectorParams> = HashMap::with_capacity(params.len());
     for entry in params {
         // A site names one collect box, so two ranges under one site means a walk visited a node
         // twice — the join would have no defined answer, so it is refused rather than resolved.
         if by_site.insert(&entry.site, entry).is_some() {
-            return Err(PyValueError::new_err(format!(
-                "the template reported two parameter ranges for the collector at {:?}",
-                entry.site
-            )));
+            return Err(SamplexError::DuplicateCollectorParams(entry.site.clone()));
         }
     }
     for info in collectors.iter_mut() {
-        let entry = by_site.remove(&info.site).ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "the graph walk found a collector at {:?} that the template did not; the two must be \
-                 built from the same circuit",
-                info.site
-            ))
-        })?;
+        let entry = by_site
+            .remove(&info.site)
+            .ok_or_else(|| SamplexError::CollectorNotInTemplate(info.site.clone()))?;
         info.param_indices = entry.param_indices.clone();
     }
     // The other direction: parameters minted for a collector no graph collector claimed. Those angles
@@ -492,12 +475,10 @@ fn attach_param_indices(
         .iter()
         .find(|entry| by_site.contains_key(&entry.site))
     {
-        return Err(PyValueError::new_err(format!(
-            "the template minted parameters for {} collector(s) the graph walk did not find, one at \
-             {:?}; the two must be built from the same circuit",
-            by_site.len(),
-            entry.site
-        )));
+        return Err(SamplexError::CollectorsNotInGraph {
+            count: by_site.len(),
+            site: entry.site.clone(),
+        });
     }
     Ok(())
 }
@@ -506,25 +487,20 @@ fn attach_param_indices(
 ///
 /// A fully bound expression folds to [`AbsorbedParam::Bound`]. A [`Param::Obj`] is refused
 /// outright.
-fn absorbed_param(table: &mut ParameterTable, param: &Param) -> PyResult<AbsorbedParam> {
+fn absorbed_param(table: &mut ParameterTable, param: &Param) -> Result<AbsorbedParam> {
     match param {
         Param::Float(value) => Ok(AbsorbedParam::Bound(*value)),
         Param::ParameterExpression(expr) if expr.num_symbols() == 0 => {
-            match expr.try_to_value(true).into_py_result()? {
+            match expr.try_to_value(true)? {
                 Value::Real(value) => Ok(AbsorbedParam::Bound(value)),
                 Value::Int(value) => Ok(AbsorbedParam::Bound(value as f64)),
                 // Reported rather than silently projected onto the real axis: a complex angle is
                 // not something a rotation can be given, so it means the circuit was already wrong.
-                Value::Complex(value) => Err(PyValueError::new_err(format!(
-                    "cannot absorb a gate whose angle evaluates to the complex value {value}"
-                ))),
+                Value::Complex(value) => Err(SamplexError::ComplexAbsorbedAngle(value)),
             }
         }
         Param::ParameterExpression(expr) => Ok(AbsorbedParam::Symbolic(table.intern(expr.clone()))),
-        Param::Obj(_) => Err(PyValueError::new_err(
-            "cannot absorb a gate whose parameter is an opaque Python object: the sampling graph is \
-             read without the GIL, so it cannot carry one",
-        )),
+        Param::Obj(_) => Err(SamplexError::OpaqueAbsorbedParameter),
     }
 }
 
@@ -538,7 +514,7 @@ fn flatten(
     frame: &[usize],
     spine: &mut Spine,
     parameters: &mut ParameterTable,
-) -> PyResult<()> {
+) -> Result<()> {
     // `scope` is the path of box nodes descended through to reach `src`, so that a collector read out
     // here carries the same site `write_scope` gave it. It is the join key, and it is the reason this
     // walk and the template's are free to differ in every other respect — as they already do, this one
@@ -567,7 +543,7 @@ fn flatten(
                             .params_view()
                             .iter()
                             .map(|param| absorbed_param(parameters, param))
-                            .collect::<PyResult<Vec<_>>>()?;
+                            .collect::<Result<Vec<_>>>()?;
                         steps.push(CollectStep::Gate(AbsorbedGate {
                             gate: standard,
                             qubits: body
@@ -642,13 +618,12 @@ fn flatten(
 }
 
 /// The graph node for one emission, resolved from the table entry its `dist` key points at.
-fn emission_kind(emission: &Emit, table: &DistributionTable) -> PyResult<NodeKind> {
-    let entry = table.get(emission.dist()).ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "emission (dist={}) references a missing table entry",
-            emission.dist().0
-        ))
-    })?;
+fn emission_kind(emission: &Emit, table: &DistributionTable) -> Result<NodeKind> {
+    let entry = table
+        .get(emission.dist())
+        .ok_or(SamplexError::MissingTableEntry {
+            dist: emission.dist(),
+        })?;
     Ok(NodeKind::Emission(Emission {
         key: emission.dist(),
         direction: emission.direction.expect(
@@ -674,8 +649,9 @@ mod tests {
     // --- The join, on the two sides built by hand ------------------------------------------------
     //
     // None of these needs a circuit: a `Site` is a path of node indices and both sides of the join are
-    // plain data, so what the join does with them can be pinned directly. Errors are only ever checked
-    // with `is_err` — reading a `PyErr`'s message would normalize it, which does need Python.
+    // plain data, so what the join does with them can be pinned directly. A failed join is a
+    // `SamplexError` variant, so a test names the failure it expects rather than only that there was
+    // one.
 
     /// A site at `node`, reached through the boxes `scope` names.
     fn site(scope: &[usize], node: usize) -> Site {
@@ -747,7 +723,10 @@ mod tests {
         // have.
         let template = vec![template_params(site(&[], 1), vec![0, 1, 2])];
         let mut collectors = vec![graph_collector(site(&[], 1)), graph_collector(site(&[], 9))];
-        assert!(attach_param_indices(&mut collectors, &template).is_err());
+        assert!(matches!(
+            attach_param_indices(&mut collectors, &template),
+            Err(SamplexError::CollectorNotInTemplate(missing)) if missing == site(&[], 9)
+        ));
     }
 
     #[test]
@@ -759,7 +738,11 @@ mod tests {
             template_params(site(&[], 9), vec![3, 4, 5]),
         ];
         let mut collectors = vec![graph_collector(site(&[], 1))];
-        assert!(attach_param_indices(&mut collectors, &template).is_err());
+        assert!(matches!(
+            attach_param_indices(&mut collectors, &template),
+            Err(SamplexError::CollectorsNotInGraph { count: 1, site: missing })
+                if missing == site(&[], 9)
+        ));
     }
 
     #[test]
@@ -770,7 +753,10 @@ mod tests {
             template_params(site(&[], 1), vec![3, 4, 5]),
         ];
         let mut collectors = vec![graph_collector(site(&[], 1))];
-        assert!(attach_param_indices(&mut collectors, &template).is_err());
+        assert!(matches!(
+            attach_param_indices(&mut collectors, &template),
+            Err(SamplexError::DuplicateCollectorParams(duplicated)) if duplicated == site(&[], 1)
+        ));
     }
 
     // --- The two walks over a real emission circuit ----------------------------------------------

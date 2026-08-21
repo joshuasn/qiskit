@@ -2522,6 +2522,7 @@ version = "2.6.0-dev"
 dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
+ "num-complex",
  "pyo3",
  "qiskit-circuit",
  "qiskit-util",

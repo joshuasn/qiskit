@@ -24,16 +24,15 @@
 //! building a spine directly with [`Spine::new`].
 
 use hashbrown::{HashMap, HashSet};
-use pyo3::PyResult;
-use pyo3::exceptions::PyValueError;
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
 
-use qiskit_circuit::operations::{Operation, StandardGate};
+use qiskit_circuit::operations::StandardGate;
 
 use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::DistributionTable;
 use crate::emission_circuit::Emit;
 use crate::emission_circuit_navigation::Site;
+use crate::error::{Result, SamplexError};
 use crate::partition::Partition;
 use crate::sampling_graph::{
     AbsorbedGate, CollectStep, Direction, Edge, Node, NodeKind, Propagate, SamplingGraph,
@@ -179,7 +178,7 @@ impl Spine {
         target_node: NodeIndex,
         gate_nodes: &mut HashMap<GateKey, NodeIndex>,
         table: &DistributionTable,
-    ) -> PyResult<()> {
+    ) -> Result<()> {
         let qubits: HashSet<usize> = emission_qubits.iter().copied().collect();
         let mut frontier: HashMap<usize, NodeIndex> = qubits.iter().map(|q| (*q, source)).collect();
         let direction = emission.direction.expect(
@@ -259,20 +258,14 @@ fn chain(
     gate: StandardGate,
     gate_qubits: &[usize],
     virtual_type: VirtualType,
-) -> PyResult<()> {
+) -> Result<()> {
     if !gate_qubits.iter().any(|q| tracked.contains(q)) {
         return Ok(());
     }
     // Refuse rather than emit a node that cannot be evaluated: conjugating this virtual type by
     // this gate leaves its group, so there is no rule to apply.
     if !propagates(virtual_type, gate) {
-        return Err(PyValueError::new_err(format!(
-            "cannot propagate a {} virtual gate through '{}': no propagation rule exists for that \
-             combination, so the randomization could not be undone. Only Cliffords (and RZZ) admit \
-             Pauli and local-C1 propagation; a local U2 element admits single-qubit gates only.",
-            virtual_type.name(),
-            gate.name(),
-        )));
+        return Err(SamplexError::NoPropagationRule { virtual_type, gate });
     }
     let key = (occurrence.0, occurrence.1, direction, virtual_type);
     let node = *gate_nodes.entry(key).or_insert_with(|| {
@@ -300,6 +293,7 @@ fn chain(
 mod tests {
     use super::*;
 
+    use qiskit_circuit::operations::Operation;
     use rustworkx_core::petgraph::Direction as PetDirection;
 
     use crate::annotated_circuit::DistributionType;
@@ -309,8 +303,8 @@ mod tests {
 
     // These tests are the reason the spine is its own module: none of them touches a `DAGCircuit` or
     // a `Python` token, so the propagation rules can be pinned on hand-built spines instead of on
-    // circuits built through the GIL. Errors are only ever checked with `is_err` — reading a
-    // `PyErr`'s message would normalize it, which does need Python.
+    // circuits built through the GIL. A refusal is now a `SamplexError` variant, so a test can name
+    // the failure it expects rather than only checking that there was one.
 
     /// A table holding one distribution, with the key to reach it.
     fn table_with(distribution: DistributionType) -> (DistributionTable, DistKey) {
@@ -370,7 +364,7 @@ mod tests {
         qubits: &[usize],
         target: usize,
         table: &DistributionTable,
-    ) -> PyResult<(SamplingGraph, NodeIndex, NodeIndex)> {
+    ) -> Result<(SamplingGraph, NodeIndex, NodeIndex)> {
         let mut sg = SamplingGraph::new();
         let source = sg.graph.add_node(Node::singletons(
             qubits.to_vec(),
@@ -623,7 +617,13 @@ mod tests {
             spine.resolve_collector(0, Direction::Right, &emission, &[0], &table),
             Some(0)
         );
-        assert!(wire(&spine, 0, &emission, &[0], 0, &table).is_err());
+        assert!(matches!(
+            wire(&spine, 0, &emission, &[0], 0, &table),
+            Err(SamplexError::NoPropagationRule {
+                virtual_type: VirtualType::U2,
+                gate: StandardGate::CX,
+            })
+        ));
     }
 
     #[test]

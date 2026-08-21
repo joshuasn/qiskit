@@ -31,7 +31,6 @@
 
 use hashbrown::{HashMap, HashSet};
 
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use qiskit_circuit::annotation::Annotation;
 use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder, NodeIndex};
@@ -49,7 +48,7 @@ use crate::annotated_circuit::{
 use crate::distributions::{DistEntry, DistKey, DistributionTable};
 use crate::emission_circuit::{Collect, CollectPart, Emit, EmitPart};
 use crate::emission_circuit_navigation::{append, append_instruction, new_dag_body, write_box};
-use crate::error::IntoPyResult;
+use crate::error::{Result, SamplexError};
 use crate::partition::Partition;
 use crate::sampling_graph::Direction;
 
@@ -119,41 +118,38 @@ struct Scope<'a> {
 }
 
 impl Scope<'_> {
-    fn out_qubits(&self, locals: &[Qubit]) -> PyResult<Vec<Qubit>> {
+    fn out_qubits(&self, locals: &[Qubit]) -> Result<Vec<Qubit>> {
         locals
             .iter()
             .map(|q| {
                 self.qubits
                     .get(q.index())
                     .map(|&i| Qubit(i as u32))
-                    .ok_or_else(|| {
-                        PyValueError::new_err(format!("qubit {} out of scope", q.index()))
-                    })
+                    .ok_or(SamplexError::QubitOutOfScope(q.index()))
             })
             .collect()
     }
 
-    fn out_clbits(&self, locals: &[Clbit]) -> PyResult<Vec<Clbit>> {
+    fn out_clbits(&self, locals: &[Clbit]) -> Result<Vec<Clbit>> {
         locals
             .iter()
             .map(|c| {
                 self.clbits
                     .get(c.index())
                     .map(|&i| Clbit(i as u32))
-                    .ok_or_else(|| {
-                        PyValueError::new_err(format!("clbit {} out of scope", c.index()))
-                    })
+                    .ok_or(SamplexError::ClbitOutOfScope(c.index()))
             })
             .collect()
     }
 
-    fn global_qubits(&self, locals: &[Qubit]) -> PyResult<Vec<usize>> {
+    fn global_qubits(&self, locals: &[Qubit]) -> Result<Vec<usize>> {
         locals
             .iter()
             .map(|q| {
-                self.global.get(q.index()).copied().ok_or_else(|| {
-                    PyValueError::new_err(format!("qubit {} out of scope", q.index()))
-                })
+                self.global
+                    .get(q.index())
+                    .copied()
+                    .ok_or(SamplexError::QubitOutOfScope(q.index()))
             })
             .collect()
     }
@@ -168,11 +164,11 @@ struct Build {
 #[pyfunction]
 #[pyo3(name = "build_lowered")]
 pub fn py_build(dag: &DAGCircuit) -> PyResult<(DAGCircuit, DistributionTable)> {
-    build(dag)
+    Ok(build(dag)?)
 }
 
 /// Build the emission circuit for an annotated circuit.
-pub fn build(dag: &DAGCircuit) -> PyResult<(DAGCircuit, DistributionTable)> {
+pub fn build(dag: &DAGCircuit) -> Result<(DAGCircuit, DistributionTable)> {
     let num_qubits = dag.num_qubits();
     let num_clbits = dag.num_clbits();
     let identity_q: Vec<usize> = (0..num_qubits).collect();
@@ -209,22 +205,13 @@ impl Build {
     }
 
     /// Emit the IR2 form of every op in `dag` into `out`.
-    fn walk(
-        &mut self,
-        dag: &DAGCircuit,
-        out: &mut DAGCircuitBuilder,
-        scope: &Scope,
-    ) -> PyResult<()> {
+    fn walk(&mut self, dag: &DAGCircuit, out: &mut DAGCircuitBuilder, scope: &Scope) -> Result<()> {
         for node in dag.topological_op_nodes(false) {
             let inst = dag.dag()[node].unwrap_operation();
             match inst.op.view() {
                 OperationRef::ControlFlow(cf) => {
                     if !matches!(cf.control_flow, ControlFlow::Box { .. }) {
-                        return Err(PyValueError::new_err(format!(
-                            "Unsupported control flow in a samplex circuit: '{}'. Only `box` is \
-                             supported.",
-                            cf.name()
-                        )));
+                        return Err(SamplexError::UnsupportedControlFlow(cf.name().to_string()));
                     }
                     self.walk_box(dag, inst, out, scope)?;
                 }
@@ -241,9 +228,9 @@ impl Build {
         inst: &PackedInstruction,
         out: &mut DAGCircuitBuilder,
         scope: &Scope,
-    ) -> PyResult<()> {
+    ) -> Result<()> {
         let (annotations, foreign) = box_annotations(inst);
-        let resolved = resolve_annotations(&annotations).into_py_result()?;
+        let resolved = resolve_annotations(&annotations)?;
         let duration = box_duration(inst);
 
         let locals = dag.qargs_interner().get(inst.qubits);
@@ -251,7 +238,7 @@ impl Build {
         let global = scope.global_qubits(locals)?;
         let body = match dag.try_view_control_flow(inst) {
             Some(ControlFlowView::Box { body, .. }) => body,
-            _ => return Err(PyValueError::new_err("box instruction is missing its body")),
+            _ => return Err(SamplexError::BoxMissingBody),
         };
         let body_clbits: Vec<usize> = dag
             .cargs_interner()
@@ -415,7 +402,7 @@ impl Build {
         global: &[usize],
         dressing: Option<Dressing>,
         inside: &ContentEmissions,
-    ) -> PyResult<DAGCircuit> {
+    ) -> Result<DAGCircuit> {
         let identity_q: Vec<usize> = (0..width).collect();
         let identity_c: Vec<usize> = (0..num_clbits).collect();
         let inner = Scope {
@@ -453,16 +440,15 @@ impl Build {
         nodes: &[NodeIndex],
         out: &mut DAGCircuitBuilder,
         inner: &Scope,
-    ) -> PyResult<()> {
+    ) -> Result<()> {
         for node in nodes {
             let inst = body.dag()[*node].unwrap_operation();
             match inst.op.view() {
                 OperationRef::ControlFlow(cf) => {
                     if !matches!(cf.control_flow, ControlFlow::Box { .. }) {
-                        return Err(PyValueError::new_err(format!(
-                            "Unsupported control flow in a samplex circuit: '{}'.",
-                            cf.name()
-                        )));
+                        return Err(SamplexError::UnsupportedControlFlowInBox(
+                            cf.name().to_string(),
+                        ));
                     }
                     // A nested annotated box is lowered in place, so its collect boxes and emissions
                     // land inside this content box, where an outer emission's walk crosses them.
@@ -666,7 +652,7 @@ fn copy_instruction(
     inst: &PackedInstruction,
     out: &mut DAGCircuitBuilder,
     scope: &Scope,
-) -> PyResult<()> {
+) -> Result<()> {
     let qargs = scope.out_qubits(dag.qargs_interner().get(inst.qubits))?;
     let cargs = scope.out_clbits(dag.cargs_interner().get(inst.clbits))?;
     append_instruction(out, inst, &qargs, &cargs)
@@ -681,14 +667,13 @@ fn write_emissions(
     out: &mut DAGCircuitBuilder,
     emissions: &[&Placed],
     qargs: &[Qubit],
-) -> PyResult<()> {
+) -> Result<()> {
     for spec in emissions.iter().map(|placed| &placed.spec) {
         if spec.partition.num_qubits() != qargs.len() {
-            return Err(PyValueError::new_err(format!(
-                "an emission on {} qubits cannot be written on {} of them",
-                spec.partition.num_qubits(),
-                qargs.len(),
-            )));
+            return Err(SamplexError::EmissionWidthMismatch {
+                qubits: spec.partition.num_qubits(),
+                wires: qargs.len(),
+            });
         }
         let op = PackedOperation::from_custom_operation(Box::new(spec.clone()));
         append(out, op, None, qargs, &[])?;
@@ -703,7 +688,7 @@ fn write_collect(
     body: DAGCircuit,
     qargs: &[Qubit],
     cargs: &[Clbit],
-) -> PyResult<()> {
+) -> Result<()> {
     write_box(out, body, vec![Arc::new(spec)], None, qargs, cargs)
 }
 
@@ -718,7 +703,7 @@ fn write_content_box(
     duration: Option<BoxDuration>,
     qargs: &[Qubit],
     cargs: &[Clbit],
-) -> PyResult<()> {
+) -> Result<()> {
     write_box(out, body, annotations, duration, qargs, cargs)
 }
 #[cfg(test)]

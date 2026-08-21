@@ -38,7 +38,9 @@
 //! cost rather than a rule, and merging is freely omitted either way.
 //!
 //! IR3 is plain data: the IR3 passes hold no `Python` token, and lowering pays the GIL once at the
-//! IR2 boundary.
+//! IR2 boundary. Which passes those are is readable off their signatures: everything that needs no
+//! token returns [`error::Result`] rather than `PyResult`, and `From<SamplexError> for PyErr` is the
+//! single seam where a refusal becomes a Python exception.
 
 use pyo3::prelude::*;
 

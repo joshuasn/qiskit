@@ -17,6 +17,7 @@ qiskit-circuit.workspace = true
 qiskit-util.workspace = true
 hashbrown.workspace = true
 indexmap.workspace = true
+num-complex.workspace = true
 rustworkx-core.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true

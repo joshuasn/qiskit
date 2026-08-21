@@ -49,8 +49,6 @@ use rustworkx_core::petgraph::Direction as PetDirection;
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
 use rustworkx_core::petgraph::visit::EdgeRef;
 
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
 use qiskit_circuit::annotation::Annotation;
 use qiskit_circuit::bit::{ShareableClbit, ShareableQubit};
 use qiskit_circuit::dag_circuit::{DAGCircuit, DAGCircuitBuilder, NodeType, Wire};
@@ -62,7 +60,7 @@ use qiskit_circuit::packed_instruction::{PackedInstruction, PackedOperation};
 use qiskit_circuit::{Block, Clbit, Qubit};
 
 use crate::emission_circuit::{Collect, Emit};
-use crate::error::IntoPyResult;
+use crate::error::{Result, SamplexError};
 use crate::sampling_graph::Direction;
 
 // --- What an instruction declares ---------------------------------------------------------------
@@ -122,13 +120,11 @@ pub fn emission_spec(inst: &PackedInstruction) -> Option<Emit> {
 pub fn block_body<'a>(
     src: &'a DAGCircuit,
     inst: &PackedInstruction,
-) -> PyResult<Option<&'a DAGCircuit>> {
+) -> Result<Option<&'a DAGCircuit>> {
     match inst.blocks_view() {
         [] => Ok(None),
         [block] => Ok(Some(&src.blocks()[*block])),
-        _ => Err(PyValueError::new_err(
-            "a box instruction should have exactly one body",
-        )),
+        _ => Err(SamplexError::BoxWithoutOneBody),
     }
 }
 
@@ -151,28 +147,28 @@ impl Site {
     ///
     /// For the flat work a pass still does within one scope; anything that crosses a box boundary
     /// goes through a [`WireCursor`] instead.
-    pub fn scope_dag<'a>(&self, root: &'a DAGCircuit) -> PyResult<&'a DAGCircuit> {
+    pub fn scope_dag<'a>(&self, root: &'a DAGCircuit) -> Result<&'a DAGCircuit> {
         scope_dag(root, &self.scope)
     }
 
     /// The instruction this site names.
-    pub fn instruction<'a>(&self, root: &'a DAGCircuit) -> PyResult<&'a PackedInstruction> {
+    pub fn instruction<'a>(&self, root: &'a DAGCircuit) -> Result<&'a PackedInstruction> {
         Ok(self.scope_dag(root)?.dag()[self.node].unwrap_operation())
     }
 
     /// The body of the box this site names, if it has one.
-    pub fn body<'a>(&self, root: &'a DAGCircuit) -> PyResult<Option<&'a DAGCircuit>> {
+    pub fn body<'a>(&self, root: &'a DAGCircuit) -> Result<Option<&'a DAGCircuit>> {
         let dag = self.scope_dag(root)?;
         block_body(dag, dag.dag()[self.node].unwrap_operation())
     }
 
     /// The [`Collect`] this site declares, if it is a collector.
-    pub fn collector(&self, root: &DAGCircuit) -> PyResult<Option<Collect>> {
+    pub fn collector(&self, root: &DAGCircuit) -> Result<Option<Collect>> {
         Ok(collect_annotation(self.instruction(root)?))
     }
 
     /// The wires this site covers, in its own scope's frame.
-    pub fn qubits(&self, root: &DAGCircuit) -> PyResult<Vec<Qubit>> {
+    pub fn qubits(&self, root: &DAGCircuit) -> Result<Vec<Qubit>> {
         let dag = self.scope_dag(root)?;
         let inst = dag.dag()[self.node].unwrap_operation();
         Ok(dag.qargs_interner().get(inst.qubits).to_vec())
@@ -184,11 +180,9 @@ impl Site {
     /// nested body has to be lifted through every box between. `base` must name a scope this site
     /// sits at or below — which a site a walk reached always does, since a cursor never ascends — and
     /// anything else is an error rather than a silent remapping.
-    pub fn qubits_in(&self, root: &DAGCircuit, base: &[NodeIndex]) -> PyResult<Vec<Qubit>> {
+    pub fn qubits_in(&self, root: &DAGCircuit, base: &[NodeIndex]) -> Result<Vec<Qubit>> {
         if base.len() > self.scope.len() {
-            return Err(PyValueError::new_err(
-                "a site cannot be lifted into a scope deeper than itself",
-            ));
+            return Err(SamplexError::LiftIntoDeeperScope);
         }
         lift_wires(
             scope_dag(root, base)?,
@@ -198,7 +192,7 @@ impl Site {
     }
 
     /// How many classical wires this site covers.
-    pub fn num_clbits(&self, root: &DAGCircuit) -> PyResult<usize> {
+    pub fn num_clbits(&self, root: &DAGCircuit) -> Result<usize> {
         let dag = self.scope_dag(root)?;
         let inst = dag.dag()[self.node].unwrap_operation();
         Ok(dag.cargs_interner().get(inst.clbits).len())
@@ -221,30 +215,29 @@ impl Site {
         root: &mut DAGCircuit,
         op: PackedOperation,
         body: DAGCircuit,
-    ) -> PyResult<()> {
+    ) -> Result<()> {
         let dag = scope_dag_mut(root, &self.scope)?;
         let block = dag.add_block(body);
-        dag.substitute_op(self.node, op, Some(Parameters::Blocks(vec![block])), None)
-            .into_py_result()
+        dag.substitute_op(self.node, op, Some(Parameters::Blocks(vec![block])), None)?;
+        Ok(())
     }
 
     /// Delete the instruction at this site from the scope it lives in.
     ///
     /// Every other site stays valid across a removal: a scope is a `StableDiGraph`, so the indices a
     /// plan is carrying do not shift under it.
-    pub fn remove(&self, root: &mut DAGCircuit) -> PyResult<()> {
+    pub fn remove(&self, root: &mut DAGCircuit) -> Result<()> {
         scope_dag_mut(root, &self.scope)?.remove_op_node(self.node);
         Ok(())
     }
 }
 
 /// The DAG of the scope a path names.
-pub fn scope_dag<'a>(root: &'a DAGCircuit, scope: &[NodeIndex]) -> PyResult<&'a DAGCircuit> {
+pub fn scope_dag<'a>(root: &'a DAGCircuit, scope: &[NodeIndex]) -> Result<&'a DAGCircuit> {
     let mut dag = root;
     for node in scope {
         let inst = dag.dag()[*node].unwrap_operation();
-        dag = block_body(dag, inst)?
-            .ok_or_else(|| PyValueError::new_err("a scope on the path has no body"))?;
+        dag = block_body(dag, inst)?.ok_or(SamplexError::ScopeWithoutBody)?;
     }
     Ok(dag)
 }
@@ -253,19 +246,12 @@ pub fn scope_dag<'a>(root: &'a DAGCircuit, scope: &[NodeIndex]) -> PyResult<&'a 
 ///
 /// Private: descending mutably is only ever wanted in order to rewrite at a site, and
 /// [`Site::substitute`] and [`Site::remove`] are the two ways a pass does that.
-fn scope_dag_mut<'a>(
-    root: &'a mut DAGCircuit,
-    scope: &[NodeIndex],
-) -> PyResult<&'a mut DAGCircuit> {
+fn scope_dag_mut<'a>(root: &'a mut DAGCircuit, scope: &[NodeIndex]) -> Result<&'a mut DAGCircuit> {
     let mut dag = root;
     for node in scope {
         let block = match dag.dag()[*node].unwrap_operation().blocks_view() {
             [block] => *block,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "a scope on the path should have exactly one body",
-                ));
-            }
+            _ => return Err(SamplexError::ScopeWithoutOneBody),
         };
         dag = dag.view_block_mut(block);
     }
@@ -276,22 +262,21 @@ fn scope_dag_mut<'a>(
 ///
 /// Private: a caller that has a [`Site`] wants [`Site::qubits_in`], which knows that the path to lift
 /// through is the tail of the site's own scope. Getting that slice wrong is the whole hazard here.
-fn lift_wires(root: &DAGCircuit, path: &[NodeIndex], wires: &[Qubit]) -> PyResult<Vec<Qubit>> {
+fn lift_wires(root: &DAGCircuit, path: &[NodeIndex], wires: &[Qubit]) -> Result<Vec<Qubit>> {
     // Each box's qargs, in the frame of the scope containing it.
     let mut frames: Vec<Vec<Qubit>> = Vec::with_capacity(path.len());
     let mut dag = root;
     for node in path {
         let inst = dag.dag()[*node].unwrap_operation();
         frames.push(dag.qargs_interner().get(inst.qubits).to_vec());
-        dag = block_body(dag, inst)?
-            .ok_or_else(|| PyValueError::new_err("a scope on the path has no body"))?;
+        dag = block_body(dag, inst)?.ok_or(SamplexError::ScopeWithoutBody)?;
     }
     let mut lifted = wires.to_vec();
     for frame in frames.iter().rev() {
         for wire in &mut lifted {
             *wire = *frame
                 .get(wire.index())
-                .ok_or_else(|| PyValueError::new_err("content sits on a wire outside its box"))?;
+                .ok_or(SamplexError::ContentOffItsBoxWires)?;
         }
     }
     Ok(lifted)
@@ -315,7 +300,7 @@ pub enum ScopeOrder {
 ///
 /// Descends through content boxes and never into a collector, so a collector's own body is not swept:
 /// what is in there already belongs to it.
-pub fn collectors(root: &DAGCircuit, order: ScopeOrder) -> PyResult<Vec<Site>> {
+pub fn collectors(root: &DAGCircuit, order: ScopeOrder) -> Result<Vec<Site>> {
     let mut sites = Vec::new();
     sweep_scope(root, &mut Vec::new(), order, &mut sites)?;
     Ok(sites)
@@ -326,7 +311,7 @@ fn sweep_scope(
     path: &mut Vec<NodeIndex>,
     order: ScopeOrder,
     out: &mut Vec<Site>,
-) -> PyResult<()> {
+) -> Result<()> {
     // Materialized because the recursion re-borrows `root` to reach each nested scope.
     let nodes: Vec<NodeIndex> = scope_dag(root, path)?.topological_op_nodes(false).collect();
     if order == ScopeOrder::Innermost {
@@ -352,7 +337,7 @@ fn sweep_bodies(
     order: ScopeOrder,
     nodes: &[NodeIndex],
     out: &mut Vec<Site>,
-) -> PyResult<()> {
+) -> Result<()> {
     for node in nodes {
         let inst = scope_dag(root, path)?.dag()[*node].unwrap_operation();
         if !is_box(inst) || is_collector(inst) {
@@ -451,7 +436,7 @@ impl WireCursor {
     ///
     /// A peek, not a step: the caller takes the probe only if it takes what the probe found, which is
     /// how a walk tests a candidate it is still free to refuse.
-    pub fn peek(&self, root: &DAGCircuit, direction: Direction) -> PyResult<Option<(Self, Site)>> {
+    pub fn peek(&self, root: &DAGCircuit, direction: Direction) -> Result<Option<(Self, Site)>> {
         let mut probe = self.clone();
         Ok(probe.advance(root, direction)?.map(|site| (probe, site)))
     }
@@ -463,7 +448,7 @@ impl WireCursor {
     /// A collect box is reported rather than descended into — it is a barrier, and that is not the
     /// caller's choice to make. A content box the cursor descends into and finds nothing on this wire
     /// is passed straight through: there is nothing there to reorder against, so it is not a barrier.
-    pub fn advance(&mut self, root: &DAGCircuit, direction: Direction) -> PyResult<Option<Site>> {
+    pub fn advance(&mut self, root: &DAGCircuit, direction: Direction) -> Result<Option<Site>> {
         loop {
             let dag = scope_dag(root, &self.path())?;
             match next_on_wire(dag, self.node, self.qubit, direction) {
@@ -473,9 +458,8 @@ impl WireCursor {
                         self.node = next;
                         return Ok(Some(self.site()));
                     }
-                    let body = block_body(dag, inst)?.ok_or_else(|| {
-                        PyValueError::new_err("cannot descend into a box with no body")
-                    })?;
+                    let body =
+                        block_body(dag, inst)?.ok_or(SamplexError::DescentIntoBodylessBox)?;
                     // The walk only offers nodes adjacent along this wire, so a box reached this way
                     // covers it.
                     let local = dag
@@ -619,7 +603,7 @@ impl EmissionTally {
     ///
     /// A collect box is descended into as well, unlike everywhere else in this module: what one holds
     /// has resolved in place, so it adds to no direction and needs no exception made for it.
-    pub fn subtree(dag: &DAGCircuit) -> PyResult<Self> {
+    pub fn subtree(dag: &DAGCircuit) -> Result<Self> {
         let mut tally = Self::default();
         for (_, inst) in dag.op_nodes(true) {
             if let Sighting::Emission(direction) = Sighting::of(inst) {
@@ -679,19 +663,17 @@ impl FromIterator<Sighting> for EmissionTally {
 // --- Writing ------------------------------------------------------------------------------------
 
 /// Create an empty `DAGCircuit` body with the given dimensions and anonymous wires.
-pub fn new_dag_body(num_qubits: usize, num_clbits: usize, capacity: usize) -> PyResult<DAGCircuit> {
+pub fn new_dag_body(num_qubits: usize, num_clbits: usize, capacity: usize) -> Result<DAGCircuit> {
     // Anonymous because a box body's qubits are positional, addressed only through the box's qargs,
     // so there is nothing outside for them to be identified with. `with_capacity` reserves space
     // but registers no wires, hence the explicit adds.
     let mut body =
         DAGCircuit::with_capacity(num_qubits, num_clbits, None, Some(capacity), None, None);
     for _ in 0..num_qubits {
-        body.add_qubit_unchecked(ShareableQubit::new_anonymous())
-            .into_py_result()?;
+        body.add_qubit_unchecked(ShareableQubit::new_anonymous())?;
     }
     for _ in 0..num_clbits {
-        body.add_clbit_unchecked(ShareableClbit::new_anonymous())
-            .into_py_result()?;
+        body.add_clbit_unchecked(ShareableClbit::new_anonymous())?;
     }
     Ok(body)
 }
@@ -703,7 +685,7 @@ pub fn append(
     params: Option<Parameters<Block>>,
     qargs: &[Qubit],
     cargs: &[Clbit],
-) -> PyResult<()> {
+) -> Result<()> {
     // Exists to keep `apply_operation_back`'s `cache_pygates` argument in one place: everything
     // samplex appends is built from a `PackedOperation`, never a live Python object, so there is
     // never a cached gate to pass. `CircuitData::push_packed_operation` is the same convenience on
@@ -716,8 +698,7 @@ pub fn append(
         None,
         #[cfg(feature = "cache_pygates")]
         None,
-    )
-    .into_py_result()?;
+    )?;
     Ok(())
 }
 
@@ -730,7 +711,7 @@ pub fn append_instruction(
     inst: &PackedInstruction,
     qargs: &[Qubit],
     cargs: &[Clbit],
-) -> PyResult<()> {
+) -> Result<()> {
     let params = (!inst.params_view().is_empty())
         .then(|| Parameters::Params(inst.params_view().iter().cloned().collect()));
     append(out, inst.op.clone(), params, qargs, cargs)
@@ -748,7 +729,7 @@ pub fn write_box(
     duration: Option<BoxDuration>,
     qargs: &[Qubit],
     cargs: &[Clbit],
-) -> PyResult<()> {
+) -> Result<()> {
     let op = PackedOperation::from_control_flow(Box::new(ControlFlowInstruction {
         control_flow: ControlFlow::Box {
             duration,
@@ -781,6 +762,8 @@ pub fn collect_op(annotation: Collect, num_qubits: usize, num_clbits: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pyo3::prelude::*;
+
     use crate::annotated_circuit::{DistributionType, Dressing, SynthesizerType, Twirl};
     use crate::distributions::DistKey;
     use crate::emission_circuit::{CollectPart, EmitPart};

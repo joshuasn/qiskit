@@ -48,7 +48,7 @@ use crate::emission_circuit_navigation::{
     EmissionTally, ScopeOrder, Site, WireCursor, append_instruction, collect_annotation,
     collect_op, collectors, is_box, new_dag_body, scope_dag,
 };
-use crate::error::IntoPyResult;
+use crate::error::Result;
 use crate::partition::Partition;
 use crate::sampling_graph::Direction;
 
@@ -139,11 +139,11 @@ impl Group {
 #[pyfunction]
 #[pyo3(name = "merge_collectors")]
 pub fn py_merge_collectors(dag: &mut DAGCircuit) -> PyResult<()> {
-    merge_collectors(dag)
+    Ok(merge_collectors(dag)?)
 }
 
 /// Merge adjacent collectors throughout an emission circuit, in place.
-pub fn merge_collectors(dag: &mut DAGCircuit) -> PyResult<()> {
+pub fn merge_collectors(dag: &mut DAGCircuit) -> Result<()> {
     // Escapes first, to a fixed point: taking one collector out of its box can leave the next level
     // down as its box's new head. Each round re-plans against the rewritten circuit rather than reusing
     // sites, and rounds are bounded by nesting depth.
@@ -166,7 +166,7 @@ struct Escape {
 }
 
 /// Do one round of escapes, reporting whether anything moved.
-fn escape_round(dag: &mut DAGCircuit) -> PyResult<bool> {
+fn escape_round(dag: &mut DAGCircuit) -> Result<bool> {
     let plans = plan_escapes(dag)?;
     for plan in &plans {
         escape(dag, plan)?;
@@ -179,7 +179,7 @@ fn escape_round(dag: &mut DAGCircuit) -> PyResult<bool> {
 /// A collector takes part in at most one escape per round, in either role: a middle collector in a
 /// two-level nest is both somebody's `inner` and somebody else's `outer`, and doing both at once would
 /// substitute a node this round also deletes. The fixed-point loop picks up the rest.
-fn plan_escapes(root: &DAGCircuit) -> PyResult<Vec<Escape>> {
+fn plan_escapes(root: &DAGCircuit) -> Result<Vec<Escape>> {
     let mut plans: Vec<Escape> = Vec::new();
     let mut claimed: HashSet<Site> = HashSet::new();
 
@@ -210,7 +210,7 @@ fn plan_escapes(root: &DAGCircuit) -> PyResult<Vec<Escape>> {
 }
 
 /// The collector that may leave its box and fold into `outer`, walking `direction`, if any.
-fn escapable(root: &DAGCircuit, outer: &Site, direction: Direction) -> PyResult<Option<Site>> {
+fn escapable(root: &DAGCircuit, outer: &Site, direction: Direction) -> Result<Option<Site>> {
     let spec = outer.collector(root)?.expect("only asked of a collector");
     let wires: Vec<Qubit> = outer.qubits(root)?;
 
@@ -286,7 +286,7 @@ fn first_site(
     from: &Site,
     wire: Qubit,
     direction: Direction,
-) -> PyResult<Option<Site>> {
+) -> Result<Option<Site>> {
     WireCursor::at(from, wire).advance(root, direction)
 }
 
@@ -320,12 +320,12 @@ fn hazards_clear(arriving: &EmissionTally, outward: Direction, moves_content: bo
 ///
 /// Before absorption every body is empty, which is why an escape pre-absorption is purely structural:
 /// it deletes a collector and re-points whatever that collector was catching, moving no content at all.
-fn body_is_empty(root: &DAGCircuit, site: &Site) -> PyResult<bool> {
+fn body_is_empty(root: &DAGCircuit, site: &Site) -> Result<bool> {
     Ok(site.body(root)?.is_none_or(|body| body.num_ops() == 0))
 }
 
 /// Move one collector's body into the collector outside its box, and delete it.
-fn escape(root: &mut DAGCircuit, plan: &Escape) -> PyResult<()> {
+fn escape(root: &mut DAGCircuit, plan: &Escape) -> Result<()> {
     // Everything is read before anything is written: the merged body is built while both collectors
     // are still in place.
     let (op, body) = {
@@ -378,7 +378,7 @@ fn order_contributions<'a>(
 }
 
 /// Merge collectors within one scope, then recurse into box bodies with fresh state.
-fn merge_scope(dag: &mut DAGCircuit) -> PyResult<()> {
+fn merge_scope(dag: &mut DAGCircuit) -> Result<()> {
     let all: Vec<Qubit> = (0..dag.num_qubits() as u32).map(Qubit).collect();
     let mut groups: Vec<Group> = Vec::new();
     let mut bodies: Vec<qiskit_circuit::Block> = Vec::new();
@@ -477,7 +477,7 @@ fn release(groups: &mut [Group], qubits: &[Qubit]) {
 }
 
 /// Contract one group into a single collector over its full span.
-fn fuse(dag: &mut DAGCircuit, group: &Group) -> PyResult<()> {
+fn fuse(dag: &mut DAGCircuit, group: &Group) -> Result<()> {
     let frame = group.frame();
     let clbits = merged_clbits(dag, group);
     let body = merged_body(dag, group, &frame, clbits.len())?;
@@ -503,8 +503,7 @@ fn fuse(dag: &mut DAGCircuit, group: &Group) -> PyResult<()> {
         true,
         &qubit_pos,
         &clbit_pos,
-    )
-    .into_py_result()?;
+    )?;
     Ok(())
 }
 
@@ -535,7 +534,7 @@ fn merged_body(
     group: &Group,
     frame: &[Qubit],
     num_clbits: usize,
-) -> PyResult<DAGCircuit> {
+) -> Result<DAGCircuit> {
     let capacity: usize = group
         .members
         .iter()
@@ -573,7 +572,7 @@ fn append_contribution(
     contribution: &DAGCircuit,
     wires: &[Qubit],
     frame: &[Qubit],
-) -> PyResult<()> {
+) -> Result<()> {
     for (_, gate) in contribution.op_nodes(true) {
         let qargs: Vec<Qubit> = contribution
             .qargs_interner()

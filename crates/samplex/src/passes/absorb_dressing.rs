@@ -60,20 +60,21 @@ use crate::emission_circuit_navigation::{
     EmissionTally, ScopeOrder, Sighting, Site, WireCursor, WireSights, append, append_instruction,
     collect_op, collectors, emission_spec, new_dag_body,
 };
+use crate::error::Result;
 use crate::sampling_graph::Direction;
 
 /// Absorb dressing into every collector, in place.
 #[pyfunction]
 #[pyo3(name = "absorb_dressing")]
 pub fn py_absorb_dressing(dag: &mut DAGCircuit) -> PyResult<()> {
-    absorb_dressing(dag)
+    Ok(absorb_dressing(dag)?)
 }
 
 /// Absorb dressing into every collector, in place.
 ///
 /// Planning reads the whole circuit and rewriting mutates it, so the two are separate sweeps: every
 /// plan is made against the original, and `StableDiGraph` keeps the sites carried between them valid.
-pub fn absorb_dressing(dag: &mut DAGCircuit) -> PyResult<()> {
+pub fn absorb_dressing(dag: &mut DAGCircuit) -> Result<()> {
     let plans = plan_absorptions(dag)?;
     for plan in &plans {
         let body = build_body(dag, plan)?;
@@ -124,7 +125,7 @@ struct Walk {
 /// twice. [`ScopeOrder::Innermost`] is what makes that fair — a collector inside a box gets first
 /// refusal on the content in there, being nearer to it than anything outside, and an outer collector
 /// reaching in would starve it.
-fn plan_absorptions(root: &DAGCircuit) -> PyResult<Vec<Absorption>> {
+fn plan_absorptions(root: &DAGCircuit) -> Result<Vec<Absorption>> {
     let mut plans: Vec<Absorption> = Vec::new();
     let mut claimed: HashSet<Site> = HashSet::new();
 
@@ -167,7 +168,7 @@ fn walk_absorb(
     direction: Direction,
     qubits: &[Qubit],
     claimed: &HashSet<Site>,
-) -> PyResult<Walk> {
+) -> Result<Walk> {
     // The direction an emission must have to face this collector.
     let facing = match direction {
         Direction::Right => Direction::Left,
@@ -288,7 +289,7 @@ fn unclaimed(
     cursor: &WireCursor,
     direction: Direction,
     claimed: &HashSet<Site>,
-) -> PyResult<Option<(WireCursor, Site)>> {
+) -> Result<Option<(WireCursor, Site)>> {
     match cursor.peek(root, direction)? {
         Some((probe, site)) if !claimed.contains(&site) => Ok(Some((probe, site))),
         _ => Ok(None),
@@ -338,7 +339,7 @@ fn on_dressing_side(
 }
 
 /// Build a collector's body from what it absorbed, remapped into its own frame.
-fn build_body(root: &DAGCircuit, plan: &Absorption) -> PyResult<DAGCircuit> {
+fn build_body(root: &DAGCircuit, plan: &Absorption) -> Result<DAGCircuit> {
     let frame = plan.collector.qubits(root)?;
     let num_clbits = plan.collector.num_clbits(root)?;
     let mut body = new_dag_body(frame.len(), num_clbits, plan.content.len())?.into_builder();
@@ -371,7 +372,7 @@ fn build_body(root: &DAGCircuit, plan: &Absorption) -> PyResult<DAGCircuit> {
 }
 
 /// The collector operation carrying the newly absorbed body.
-fn absorbed_op(root: &DAGCircuit, plan: &Absorption) -> PyResult<PackedOperation> {
+fn absorbed_op(root: &DAGCircuit, plan: &Absorption) -> Result<PackedOperation> {
     let annotation = Collect {
         // Absorption changes only what a collector composes, not what it is.
         partition: plan.spec.partition.clone(),

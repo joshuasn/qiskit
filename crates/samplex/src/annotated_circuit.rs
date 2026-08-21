@@ -26,7 +26,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyString;
 use qiskit_circuit::annotation::{Annotation, PyAnnotation};
 
-use crate::error::LowerError;
+use crate::error::{Result, SamplexError};
 
 use crate::virtual_type::VirtualType;
 
@@ -267,7 +267,7 @@ impl ResolvedBox {
 }
 
 /// Resolve a box's annotations, applying the vocabulary's validation rules.
-pub fn resolve_annotations(annotations: &[Arc<dyn Annotation>]) -> Result<ResolvedBox, LowerError> {
+pub fn resolve_annotations(annotations: &[Arc<dyn Annotation>]) -> Result<ResolvedBox> {
     // `seen` is a membership test only, never iterated, so its `HashSet` cannot leak an ordering
     // into anything downstream.
     let mut seen: HashSet<AnnotationKind> = HashSet::new();
@@ -277,23 +277,23 @@ pub fn resolve_annotations(annotations: &[Arc<dyn Annotation>]) -> Result<Resolv
             continue;
         };
         if !seen.insert(kind) {
-            return Err(LowerError::DuplicateAnnotation(kind));
+            return Err(SamplexError::DuplicateAnnotation(kind));
         }
     }
     if seen.contains(&AnnotationKind::ChangeBasis)
         && seen.contains(&AnnotationKind::InjectLocalClifford)
     {
-        return Err(LowerError::ChangeBasisConflict);
+        return Err(SamplexError::ChangeBasisConflict);
     }
     // Both injections happen *to* a twirled box's content, sitting just outside its twirl point, so
     // neither means anything without one. A `ChangeBasis` is the only annotation that stands alone: it
     // names a frame change for the box as a whole.
     if seen.contains(&AnnotationKind::InjectNoise) && !seen.contains(&AnnotationKind::Twirl) {
-        return Err(LowerError::InjectNoiseWithoutTwirl);
+        return Err(SamplexError::InjectNoiseWithoutTwirl);
     }
     if seen.contains(&AnnotationKind::InjectLocalClifford) && !seen.contains(&AnnotationKind::Twirl)
     {
-        return Err(LowerError::InjectLocalCliffordWithoutTwirl);
+        return Err(SamplexError::InjectLocalCliffordWithoutTwirl);
     }
 
     let mut resolved = ResolvedBox::default();
@@ -703,7 +703,7 @@ mod tests {
             site: InjectionSite::Before,
         })])
         .unwrap_err();
-        assert_eq!(err, LowerError::InjectLocalCliffordWithoutTwirl);
+        assert!(matches!(err, SamplexError::InjectLocalCliffordWithoutTwirl));
     }
 
     #[test]
@@ -746,7 +746,10 @@ mod tests {
             twirl(DistributionType::HaarU2),
         ])
         .unwrap_err();
-        assert_eq!(err, LowerError::DuplicateAnnotation(AnnotationKind::Twirl));
+        assert!(matches!(
+            err,
+            SamplexError::DuplicateAnnotation(AnnotationKind::Twirl)
+        ));
     }
 
     #[test]
@@ -757,7 +760,7 @@ mod tests {
             site: InjectionSite::Before,
         })])
         .unwrap_err();
-        assert_eq!(err, LowerError::InjectNoiseWithoutTwirl);
+        assert!(matches!(err, SamplexError::InjectNoiseWithoutTwirl));
     }
 
     #[test]
@@ -787,7 +790,7 @@ mod tests {
             }),
         ])
         .unwrap_err();
-        assert_eq!(err, LowerError::ChangeBasisConflict);
+        assert!(matches!(err, SamplexError::ChangeBasisConflict));
     }
 
     #[test]
