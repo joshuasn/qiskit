@@ -32,21 +32,25 @@ pub use set_virtual_types::set_virtual_types;
 use crate::sampling_graph::SamplingGraph;
 
 #[pyfunction]
+#[pyo3(name = "merge_parallel_nodes")]
 pub fn py_merge_parallel(sg: &mut SamplingGraph) {
     merge_parallel_nodes(sg);
 }
 
 #[pyfunction]
+#[pyo3(name = "prune_unreachable_from_sources")]
 pub fn py_prune_from_sources(sg: &mut SamplingGraph) {
     prune_unreachable_from_sources(sg);
 }
 
 #[pyfunction]
+#[pyo3(name = "prune_unreachable_from_sinks")]
 pub fn py_prune_from_sinks(sg: &mut SamplingGraph) {
     prune_unreachable_from_sinks(sg);
 }
 
 #[pyfunction]
+#[pyo3(name = "set_virtual_types")]
 pub fn py_set_virtual_types(sg: &mut SamplingGraph) {
     set_virtual_types(sg);
 }
