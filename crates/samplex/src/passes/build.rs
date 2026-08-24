@@ -286,7 +286,8 @@ impl Build {
             .map(|_| CollectPart { synthesizer })
             .collect();
 
-        // Collectors start empty — the absorb_dressing pass populates them by walking the spine.
+        // Collectors start empty — the absorb_dressing pass populates them, walking out from each
+        // along its own wires and descending into content, which reaches more than the spine.
         let empty_body = new_dag_body(width, body_clbits.len(), 0)?;
         let left = Collect {
             partition: partition.clone(),
