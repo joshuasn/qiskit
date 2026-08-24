@@ -375,9 +375,10 @@ class TestBuildShape(QiskitTestCase):
         self.assertEqual(real_gates(right_coll[1]), ["h"])
         self.assertTrue(body_locals(right_coll[1]))
 
-    def test_inject_local_clifford_resolves_to_a_basis_change(self):
+    def test_inject_local_clifford_builds_an_interned_basis_change(self):
         # Needs a `Twirl` beside it: an injection happens *to* a twirled box's content, so it means
-        # nothing on its own. What is under test is the resolution, not the pairing.
+        # nothing on its own. The resolution itself is pinned in `annotated_circuit.rs`; what is under
+        # test here is what `build` writes out of it — the emission, and the interned reference.
         circuit = QuantumCircuit(1)
         with circuit.box([Twirl(), InjectLocalClifford("c3", "before")]):
             circuit.h(0)
@@ -755,39 +756,18 @@ class TestNesting(QiskitTestCase):
 
 
 class TestRejections(QiskitTestCase):
-    """What the pass refuses rather than silently mangling."""
+    """That a refusal reaches Python as an exception, with its message intact.
+
+    One case, because one is what the claim needs: `From<SamplexError> for PyErr` is a single seam and
+    this is the tier that can see it. Which annotation combinations are refused is a rule about the
+    vocabulary, not about circuits, and `annotated_circuit.rs` pins each of them directly.
+    """
 
     def test_non_box_control_flow_is_rejected(self):
         circuit = QuantumCircuit(1, 1)
         with circuit.if_test((circuit.clbits[0], True)):
             circuit.x(0)
         with self.assertRaisesRegex(ValueError, "Unsupported control flow"):
-            lower(circuit)
-
-    def test_inject_noise_without_twirl_is_rejected(self):
-        circuit = QuantumCircuit(1)
-        with circuit.box([InjectNoise("n0")]):
-            circuit.h(0)
-        with self.assertRaisesRegex(ValueError, "InjectNoise requires a Twirl"):
-            lower(circuit)
-
-    def test_inject_local_clifford_without_twirl_is_rejected(self):
-        """Both injections happen *to* a twirled box's content, so neither stands alone.
-
-        A `ChangeBasis` is the exception, and the difference is what `BasisOrigin` records: it names a
-        frame change for the box as a whole rather than something done to its content.
-        """
-        circuit = QuantumCircuit(1)
-        with circuit.box([InjectLocalClifford("c0")]):
-            circuit.h(0)
-        with self.assertRaisesRegex(ValueError, "InjectLocalClifford requires a Twirl"):
-            lower(circuit)
-
-    def test_change_basis_and_inject_local_clifford_conflict(self):
-        circuit = QuantumCircuit(1)
-        with circuit.box([ChangeBasis("b0"), InjectLocalClifford("c0")]):
-            circuit.h(0)
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             lower(circuit)
 
 

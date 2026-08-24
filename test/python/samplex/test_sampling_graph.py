@@ -593,38 +593,24 @@ class TestDeterminism(QiskitTestCase):
 
 
 class TestVirtualTypePreservation(QiskitTestCase):
-    """The real limit on supported circuits: propagation must stay inside the virtual group."""
+    """The real limit on supported circuits: propagation must stay inside the virtual group.
 
-    def test_pauli_through_cliffords_is_accepted(self):
-        for entangler in ("cx", "cz", "ecr"):
-            with self.subTest(entangler=entangler):
-                circuit = QuantumCircuit(2)
-                with circuit.box([Twirl()]):
-                    getattr(circuit, entangler)(0, 1)
-                self.assertGreater(graph_of(circuit).num_nodes, 0)
+    Which gates each virtual type may cross is decided by `propagates` in `virtual_type.rs` and pinned
+    there, on gates rather than on circuits. What is left here needs a circuit to state: that the
+    refusal travels out of lowering to Python, and that absorption is not subject to the rule at all.
+    """
 
-    def test_pauli_through_a_fractional_entangler_is_accepted(self):
-        circuit = QuantumCircuit(2)
-        with circuit.box([Twirl()]):
-            circuit.rzz(0.3, 0, 1)
-        self.assertGreater(graph_of(circuit).num_nodes, 0)
-
-    def test_pauli_through_a_non_clifford_is_refused(self):
-        # Conjugating a Pauli by a T leaves the Pauli group, so there is no rule to apply. Refusing is
-        # the point: the alternative is a randomization that silently does not cancel.
-        circuit = QuantumCircuit(2)
-        with circuit.box([Twirl()]):
-            circuit.cx(0, 1)
-            circuit.t(0)
-        with self.assertRaisesRegex(ValueError, "cannot propagate a pauli virtual gate through 't'"):
-            graph_of(circuit)
-
-    def test_local_u2_through_an_entangler_is_refused(self):
-        # A local U2 element stays local under single-qubit gates but not under an entangler.
+    def test_a_refusal_from_inside_lowering_reaches_python(self):
+        # A local U2 element stays local under single-qubit gates but not under an entangler. The rule
+        # itself lives in `virtual_type.rs`; what this pins is the seam — a refusal raised deep inside
+        # lowering arrives as a Python exception still naming both the type and the gate that caused
+        # it, rather than as a mangled graph or a message that has lost what went wrong.
         circuit = QuantumCircuit(2)
         with circuit.box([Twirl(distribution="haar_u2")]):
             circuit.cx(0, 1)
-        with self.assertRaisesRegex(ValueError, "cannot propagate a u2 virtual gate"):
+        with self.assertRaisesRegex(
+            ValueError, "cannot propagate a u2 virtual gate through 'cx': no propagation rule"
+        ):
             graph_of(circuit)
 
     def test_absorbed_non_cliffords_are_fine(self):

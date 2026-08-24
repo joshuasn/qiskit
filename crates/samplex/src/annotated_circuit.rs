@@ -675,6 +675,9 @@ mod tests {
 
     #[test]
     fn test_resolve_inject_local_clifford_without_twirl_errors() {
+        // Both injections happen *to* a twirled box's content, so neither stands alone. A
+        // `ChangeBasis` is the exception, and the difference is what it records: a frame change for
+        // the box as a whole rather than something done to its content.
         let err = resolve_annotations(&[annotation(InjectLocalClifford {
             reference: "c3".to_string(),
             site: InjectionSite::Before,
@@ -759,6 +762,8 @@ mod tests {
 
     #[test]
     fn test_resolve_change_basis_conflict_errors() {
+        // Two ways to say what dresses the box, with no rule for composing them, so refusing is the
+        // only answer that cannot be silently wrong.
         let err = resolve_annotations(&[
             change_basis("0", Placement::Start),
             annotation(InjectLocalClifford {

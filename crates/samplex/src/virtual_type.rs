@@ -68,7 +68,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pauli_survives_cliffords() {
+    fn test_pauli_survives_the_gates_it_is_allowed_to_cross() {
         for gate in [
             StandardGate::H,
             StandardGate::S,
@@ -76,6 +76,10 @@ mod tests {
             StandardGate::CX,
             StandardGate::CZ,
             StandardGate::ECR,
+            // The fractional entangler belongs in the same list, even though it is the one entry
+            // that is not a Clifford: it is on the allowlist because samplomatic supports it under
+            // Pauli twirling, and an allowlist entry with no test is an entry nothing pins.
+            StandardGate::RZZ,
         ] {
             assert!(propagates(VirtualType::Pauli, gate), "{gate:?}");
         }
