@@ -126,12 +126,6 @@ pub enum Item {
     Opaque,
 }
 
-/// What identifies one conjugation node: a gate occurrence together with the flow crossing it.
-///
-/// The occurrence is `(track position, offset)`, the offset being the position within a collector's
-/// absorbed run and zero for a gate that stands on its own.
-type GateKey = (usize, usize, Direction, VirtualType);
-
 /// The circuit as a flat sequence, which is what makes the propagation walk a simple scan.
 #[derive(Default)]
 pub struct Track {
@@ -235,6 +229,12 @@ impl Track {
         None
     }
 }
+
+/// What identifies one conjugation node: a gate occurrence together with the flow crossing it.
+///
+/// The occurrence is `(track position, offset)`, the offset being the position within a collector's
+/// absorbed run and zero for a gate that stands on its own.
+type GateKey = (usize, usize, Direction, VirtualType);
 
 /// Writes a [`SamplingGraph`] out of a [`Track`], holding the bookkeeping the walk needs.
 ///
