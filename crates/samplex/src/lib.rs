@@ -26,7 +26,7 @@
 //!
 //! Most root modules hold one stage's vocabulary, and each file under [`passes`] is one transform.
 //! Two root modules are not stages but *readings* of IR2: [`emission_circuit_navigation`] is how a
-//! pass walks a nested emission circuit, and [`spine`] is the flat reading of one that lowering
+//! pass walks a nested emission circuit, and [`track`] is the flat reading of one that lowering
 //! resolves propagations along. Both optimizations must precede `lower`, which mints the template's
 //! parameters.
 //!
@@ -67,7 +67,7 @@ pub mod parameters;
 pub mod partition;
 pub mod passes;
 pub mod sampling_graph;
-pub mod spine;
+pub mod track;
 pub mod virtual_type;
 
 pub fn samplex_mod(m: &Bound<PyModule>) -> PyResult<()> {

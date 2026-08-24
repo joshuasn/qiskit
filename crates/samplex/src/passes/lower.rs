@@ -22,7 +22,7 @@
 //! width of collectors must already have run.
 //!
 //! Nothing here mutates its input. Two readers walk the same emission circuit — one writing the
-//! template, one reading the spine — and each records the [`Site`] of every collector it sees, so
+//! template, one reading the track — and each records the [`Site`] of every collector it sees, so
 //! [`build_sampling_graph`] pairs a graph collector with its template parameter range by identity
 //! rather than by the order the two walks happened to arrive in. A collector one reader sees and the
 //! other does not is then a failed lookup rather than a shifted range. Inside a collector body the
@@ -57,7 +57,7 @@ use crate::sampling_graph::{
     AbsorbedGate, AbsorbedParam, Collect, CollectStep, Emission, LocalEmission, Measure, Node,
     NodeKind, SamplingGraph,
 };
-use crate::spine::{self, Spine};
+use crate::track::{self, Track};
 
 /// How many angles a synthesizer needs per qubit; both are three-angle Euler decompositions.
 const PARAMS_PER_QUBIT: usize = 3;
@@ -345,17 +345,17 @@ pub fn build_sampling_graph(
     table: &DistributionTable,
     collectors: &[CollectorParams],
 ) -> Result<(SamplingGraph, ParameterTable)> {
-    let mut spine = Spine::default();
+    let mut track = Track::default();
     let mut parameters = ParameterTable::new();
     let identity: Vec<usize> = (0..dag.num_qubits()).collect();
-    flatten(dag, &[], &identity, &mut spine, &mut parameters)?;
-    attach_param_indices(&mut spine.collectors, collectors)?;
+    flatten(dag, &[], &identity, &mut track, &mut parameters)?;
+    attach_param_indices(&mut track.collectors, collectors)?;
 
     let mut sg = SamplingGraph::new();
 
     // Sinks first, so an emission's walk always has a node to terminate at.
-    let mut collector_nodes = Vec::with_capacity(spine.collectors.len());
-    for info in &spine.collectors {
+    let mut collector_nodes = Vec::with_capacity(track.collectors.len());
+    for info in &track.collectors {
         collector_nodes.push(sg.graph.add_node(Node::new(
             info.qubits.clone(),
             info.partition.clone(),
@@ -371,12 +371,12 @@ pub fn build_sampling_graph(
     // is the same conjugation. Direction and virtual type are in the key because they change what
     // the node computes, so sharing across them would fuse operations that cannot be evaluated as
     // one.
-    let mut gate_nodes: HashMap<spine::GateKey, NodeIndex> = HashMap::new();
+    let mut gate_nodes: HashMap<track::GateKey, NodeIndex> = HashMap::new();
     let mut emission_nodes: HashMap<usize, NodeIndex> = HashMap::new();
 
-    for (position, item) in spine.items.iter().enumerate() {
+    for (position, item) in track.items.iter().enumerate() {
         match item {
-            spine::Item::Emission(emission, qubits) => {
+            track::Item::Emission(emission, qubits) => {
                 let node = sg.graph.add_node(Node::new(
                     qubits.clone(),
                     emission.partition.clone(),
@@ -384,7 +384,7 @@ pub fn build_sampling_graph(
                 ));
                 emission_nodes.insert(position, node);
             }
-            spine::Item::Measure(qubits, clbits) => {
+            track::Item::Measure(qubits, clbits) => {
                 sg.graph.add_node(Node::singletons(
                     qubits.clone(),
                     NodeKind::Measure(Measure {
@@ -392,7 +392,7 @@ pub fn build_sampling_graph(
                     }),
                 ));
             }
-            spine::Item::Reset(qubits) => {
+            track::Item::Reset(qubits) => {
                 sg.graph
                     .add_node(Node::singletons(qubits.clone(), NodeKind::Reset));
             }
@@ -403,13 +403,13 @@ pub fn build_sampling_graph(
     // Walk each emission to its target collector, wiring the conjugation chain in between.
     // Target resolution is purely positional: scan from the emission in its travel direction to
     // find the nearest compatible collector.
-    for (position, item) in spine.items.iter().enumerate() {
-        let spine::Item::Emission(emission, qubits) = item else {
+    for (position, item) in track.items.iter().enumerate() {
+        let track::Item::Emission(emission, qubits) = item else {
             continue;
         };
         let source = emission_nodes[&position];
         // A local emission is resolved in place inside its collector's body, so it never reaches
-        // the top-level spine; anything here is still travelling.
+        // the top-level track; anything here is still travelling.
         let direction = emission.direction.expect(
             "a local emission never surfaces as a top-level Item::Emission — it lives inside its \
              collector's body",
@@ -419,13 +419,13 @@ pub fn build_sampling_graph(
         // broken between the two passes or a hand-built circuit has an emission nothing can collect,
         // which would otherwise show up as a randomization that is never undone — so it is reported
         // rather than skipped.
-        let target = spine
+        let target = track
             .resolve_collector(position, direction, emission, qubits, table)
             .ok_or_else(|| SamplexError::EmissionWithoutCollector {
                 qubits: qubits.clone(),
                 direction,
             })?;
-        spine.propagate(
+        track.propagate(
             &mut sg,
             position,
             emission,
@@ -444,13 +444,13 @@ pub fn build_sampling_graph(
 ///
 /// The join is on [`Site`] and not on position. The two readings of the emission circuit are
 /// deliberately different walks — the template keeps a content box and recurses into it, this side
-/// inlines a hard box onto the spine — so a shared arrival order is a convention neither walk is in a
-/// position to check, and comparing counts catches a collector that went missing but not one that
+/// dissolves it onto the track — so a shared arrival order is a convention neither walk is in a position
+/// to check, and comparing counts catches a collector that went missing but not one that
 /// moved. Keyed on identity a move is simply resolved, and the failure that remains is a collect box
 /// only one walk saw, which is reported: the alternative is a range landing on the wrong synth
 /// template, which mis-randomizes a circuit that still executes and still round-trips.
 fn attach_param_indices(
-    collectors: &mut [spine::Collector],
+    collectors: &mut [track::Collector],
     params: &[CollectorParams],
 ) -> Result<()> {
     let mut by_site: HashMap<&Site, &CollectorParams> = HashMap::with_capacity(params.len());
@@ -504,15 +504,16 @@ fn absorbed_param(table: &mut ParameterTable, param: &Param) -> Result<AbsorbedP
     }
 }
 
-/// Read a scope onto the spine, inlining hard boxes and reducing each collector to one position.
+/// Read a scope onto the track, dissolving every box but a collector and reducing each collector to
+/// one position.
 ///
-/// This is the adapter between IR2 and [`Spine`], and the only place the DAG is read: everything the
+/// This is the adapter between IR2 and [`Track`], and the only place the DAG is read: everything the
 /// propagation walk needs is flat data by the time it sees it.
 fn flatten(
     src: &DAGCircuit,
     scope: &[NodeIndex],
     frame: &[usize],
-    spine: &mut Spine,
+    track: &mut Track,
     parameters: &mut ParameterTable,
 ) -> Result<()> {
     // `scope` is the path of box nodes descended through to reach `src`, so that a collector read out
@@ -571,7 +572,7 @@ fn flatten(
                     }));
                 }
             }
-            spine.push_collector(spine::Collector {
+            track.push_collector(track::Collector {
                 site: Site {
                     scope: scope.to_vec(),
                     node,
@@ -586,20 +587,22 @@ fn flatten(
         }
 
         if let Some(emission) = emission_spec(inst) {
-            spine.items.push(spine::Item::Emission(emission, qubits));
+            track.items.push(track::Item::Emission(emission, qubits));
             continue;
         }
 
-        // A hard box is a grouping: inline it so its gates sit on the same spine.
+        // Any box left by here is a grouping and nothing more — a collector and an emission have
+        // both already been handled, so this catches a content box as well as a hard one. Dissolve
+        // it, so its gates sit on the same track as the gates that surrounded it.
         if let Some(body) = plain_box_body(src, inst)? {
-            flatten(body, &descend(scope, node), &qubits, spine, parameters)?;
+            flatten(body, &descend(scope, node), &qubits, track, parameters)?;
             continue;
         }
 
-        spine.items.push(match inst.op.view() {
-            OperationRef::StandardGate(gate) => spine::Item::Gate(gate, qubits),
+        track.items.push(match inst.op.view() {
+            OperationRef::StandardGate(gate) => track::Item::Gate(gate, qubits),
             OperationRef::StandardInstruction(StandardInstruction::Measure) => {
-                spine::Item::Measure(
+                track::Item::Measure(
                     qubits,
                     src.cargs_interner()
                         .get(inst.clbits)
@@ -609,9 +612,9 @@ fn flatten(
                 )
             }
             OperationRef::StandardInstruction(StandardInstruction::Reset) => {
-                spine::Item::Reset(qubits)
+                track::Item::Reset(qubits)
             }
-            _ => spine::Item::Opaque,
+            _ => track::Item::Opaque,
         });
     }
     Ok(())
@@ -656,8 +659,8 @@ mod tests {
     }
 
     /// One collector as the graph walk reports it, with no range attached yet.
-    fn graph_collector(site: Site) -> spine::Collector {
-        spine::Collector {
+    fn graph_collector(site: Site) -> track::Collector {
+        track::Collector {
             site,
             qubits: vec![0],
             partition: Partition::singletons(1),

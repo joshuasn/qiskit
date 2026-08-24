@@ -10,18 +10,18 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
-//! The spine: an emission circuit read as one flat run of positions.
+//! The track: an emission circuit read as one flat run of positions.
 //!
 //! Propagation is never recorded in the emission circuit — it is derived from where an emission
 //! stands, and this module is what that derivation reads. Flattening the box nesting away is what
-//! makes it a scan rather than a tree walk: hard boxes are inlined so their gates sit in line, and
-//! each collector is reduced to a single position carrying its absorbed run, so "the nearest
+//! makes it a scan rather than a tree walk: every box but a collector is dissolved so its gates sit in
+//! line, and each collector is reduced to a single position carrying its absorbed run, so "the nearest
 //! collector ahead" is just the next [`Item::Collector`] in the travel direction.
 //!
-//! A spine holds no `Python` token and no `DAGCircuit`. Reading one out of IR2 is the job of the
+//! A track holds no `Python` token and no `DAGCircuit`. Reading one out of IR2 is the job of the
 //! adapter in [`lower`](crate::passes::lower), which is the only place that touches the DAG;
 //! everything here works on the flat reading alone, so the propagation rules can be exercised by
-//! building a spine directly with [`Spine::new`].
+//! building a track directly with [`Track::new`].
 
 use hashbrown::{HashMap, HashSet};
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
@@ -43,7 +43,7 @@ use crate::virtual_type::{VirtualType, propagates};
 pub struct Collector {
     /// Where this collector stood in the emission circuit, which is what identifies it across the
     /// two readings of that circuit. A `Site` is a path of node indices, so it survives the borrow
-    /// that produced it and a spine carrying one still holds no `DAGCircuit`.
+    /// that produced it and a track carrying one still holds no `DAGCircuit`.
     pub site: Site,
     pub qubits: Vec<usize>,
     /// How those qubits group into subsystems, by index into `qubits`.
@@ -92,40 +92,40 @@ impl Collector {
     }
 }
 
-/// What stands at one position on the spine.
+/// What stands at one position on the track.
 pub enum Item {
     Emission(Emit, Vec<usize>),
-    /// One collector, by index into [`Spine::collectors`].
+    /// One collector, by index into [`Track::collectors`].
     Collector(usize),
     Gate(StandardGate, Vec<usize>),
     Measure(Vec<usize>, Vec<usize>),
     Reset(Vec<usize>),
-    /// A real operation with no virtual effect, kept so that a position on the spine still stands for
+    /// A real operation with no virtual effect, kept so that a position on the track still stands for
     /// one instruction of the circuit it was read from.
     Opaque,
 }
 
 /// What identifies one conjugation node: a gate occurrence together with the flow crossing it.
 ///
-/// The occurrence is `(spine position, offset)`, the offset being the position within a collector's
+/// The occurrence is `(track position, offset)`, the offset being the position within a collector's
 /// absorbed run and zero for a gate that stands on its own.
 pub type GateKey = (usize, usize, Direction, VirtualType);
 
 /// The circuit as a flat sequence, which is what makes the propagation walk a simple scan.
 #[derive(Default)]
-pub struct Spine {
+pub struct Track {
     /// The positions, in circuit order.
     pub items: Vec<Item>,
     /// The collectors, in the order the positions refer to them.
     pub collectors: Vec<Collector>,
 }
 
-impl Spine {
-    /// Build a spine from a flat reading already in hand.
+impl Track {
+    /// Build a track from a flat reading already in hand.
     ///
     /// This is the constructor that keeps the propagation rules reachable without a `DAGCircuit`.
     /// The index in every [`Item::Collector`] must be a position in `collectors`; that is the one
-    /// invariant a caller upholds, and the reason [`Spine::push_collector`] exists for the
+    /// invariant a caller upholds, and the reason [`Track::push_collector`] exists for the
     /// incremental case.
     pub fn new(items: Vec<Item>, collectors: Vec<Collector>) -> Self {
         Self { items, collectors }
@@ -301,8 +301,8 @@ mod tests {
     use crate::emission_circuit::EmitPart;
     use crate::sampling_graph::{AbsorbedParam, Collect, Emission};
 
-    // These tests are the reason the spine is its own module: none of them touches a `DAGCircuit` or
-    // a `Python` token, so the propagation rules can be pinned on hand-built spines instead of on
+    // These tests are the reason the track is its own module: none of them touches a `DAGCircuit` or
+    // a `Python` token, so the propagation rules can be pinned on hand-built tracks instead of on
     // circuits built through the GIL. A refusal is now a `SamplexError` variant, so a test can name
     // the failure it expects rather than only checking that there was one.
 
@@ -358,7 +358,7 @@ mod tests {
     /// Wire the emission standing at `from` towards collector `target`, returning the graph it built
     /// along with the two nodes the walk runs between.
     fn wire(
-        spine: &Spine,
+        track: &Track,
         from: usize,
         emission: &Emit,
         qubits: &[usize],
@@ -375,8 +375,8 @@ mod tests {
             }),
         ));
         let target_node = sg.graph.add_node(Node::new(
-            spine.collectors[target].qubits.clone(),
-            spine.collectors[target].partition.clone(),
+            track.collectors[target].qubits.clone(),
+            track.collectors[target].partition.clone(),
             NodeKind::Collect(Collect {
                 synthesizer: SynthesizerType::RzSx,
                 param_indices: Vec::new(),
@@ -384,7 +384,7 @@ mod tests {
             }),
         ));
         let mut gate_nodes = HashMap::new();
-        spine.propagate(
+        track.propagate(
             &mut sg,
             from,
             emission,
@@ -421,7 +421,7 @@ mod tests {
     fn test_an_emission_resolves_to_the_nearest_collector_ahead() {
         let (table, key) = table_with(DistributionType::UniformPauli);
         let emission = emit(Direction::Right, 1, key);
-        let spine = Spine::new(
+        let track = Track::new(
             vec![
                 Item::Emission(emission.clone(), vec![0]),
                 Item::Gate(StandardGate::H, vec![0]),
@@ -431,7 +431,7 @@ mod tests {
             vec![collector(&[0], vec![]), collector(&[0], vec![])],
         );
         assert_eq!(
-            spine.resolve_collector(0, Direction::Right, &emission, &[0], &table),
+            track.resolve_collector(0, Direction::Right, &emission, &[0], &table),
             Some(0)
         );
     }
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn test_resolution_scans_the_way_the_emission_travels() {
         let (table, key) = table_with(DistributionType::UniformPauli);
-        let spine = Spine::new(
+        let track = Track::new(
             vec![Item::Collector(0), Item::Opaque, Item::Collector(1)],
             vec![collector(&[0], vec![]), collector(&[0], vec![])],
         );
@@ -447,11 +447,11 @@ mod tests {
         let far = emit(Direction::Right, 1, key);
         let near = emit(Direction::Left, 1, key);
         assert_eq!(
-            spine.resolve_collector(1, Direction::Right, &far, &[0], &table),
+            track.resolve_collector(1, Direction::Right, &far, &[0], &table),
             Some(1)
         );
         assert_eq!(
-            spine.resolve_collector(1, Direction::Left, &near, &[0], &table),
+            track.resolve_collector(1, Direction::Left, &near, &[0], &table),
             Some(0)
         );
     }
@@ -460,7 +460,7 @@ mod tests {
     fn test_a_collector_that_does_not_cover_the_emission_is_crossed() {
         let (table, key) = table_with(DistributionType::UniformPauli);
         let emission = emit(Direction::Right, 2, key);
-        let spine = Spine::new(
+        let track = Track::new(
             vec![
                 Item::Emission(emission.clone(), vec![0, 1]),
                 Item::Collector(0),
@@ -470,10 +470,10 @@ mod tests {
             // synthesize the whole of what was emitted and the emission travels past it.
             vec![collector(&[0], vec![]), collector(&[0, 1], vec![])],
         );
-        assert!(!spine.collectors[0].accepts(&emission, &[0, 1], &table));
-        assert!(spine.collectors[1].accepts(&emission, &[0, 1], &table));
+        assert!(!track.collectors[0].accepts(&emission, &[0, 1], &table));
+        assert!(track.collectors[1].accepts(&emission, &[0, 1], &table));
         assert_eq!(
-            spine.resolve_collector(0, Direction::Right, &emission, &[0, 1], &table),
+            track.resolve_collector(0, Direction::Right, &emission, &[0, 1], &table),
             Some(1)
         );
     }
@@ -482,7 +482,7 @@ mod tests {
     fn test_an_emission_with_nothing_to_collect_it_does_not_resolve() {
         let (table, key) = table_with(DistributionType::UniformPauli);
         let emission = emit(Direction::Right, 1, key);
-        let spine = Spine::new(
+        let track = Track::new(
             vec![
                 Item::Emission(emission.clone(), vec![0]),
                 Item::Gate(StandardGate::H, vec![0]),
@@ -491,7 +491,7 @@ mod tests {
         );
         // The caller turns this into the "randomization could not be undone" error.
         assert_eq!(
-            spine.resolve_collector(0, Direction::Right, &emission, &[0], &table),
+            track.resolve_collector(0, Direction::Right, &emission, &[0], &table),
             None
         );
     }
@@ -502,7 +502,7 @@ mod tests {
     fn test_each_wire_chains_through_its_own_gates() {
         let (table, key) = table_with(DistributionType::UniformPauli);
         let emission = emit(Direction::Right, 2, key);
-        let spine = Spine::new(
+        let track = Track::new(
             vec![
                 Item::Emission(emission.clone(), vec![0, 1]),
                 Item::Gate(StandardGate::H, vec![0]),
@@ -511,7 +511,7 @@ mod tests {
             ],
             vec![collector(&[0, 1], vec![])],
         );
-        let (sg, _source, target) = wire(&spine, 0, &emission, &[0, 1], 0, &table).unwrap();
+        let (sg, _source, target) = wire(&track, 0, &emission, &[0, 1], 0, &table).unwrap();
 
         // One conjugation per gate, each on its own wire: the two wires never met, so nothing joins.
         let mut found = conjugations(&sg);
@@ -528,7 +528,7 @@ mod tests {
     fn test_a_gate_spanning_both_wires_joins_their_chains() {
         let (table, key) = table_with(DistributionType::UniformPauli);
         let emission = emit(Direction::Right, 2, key);
-        let spine = Spine::new(
+        let track = Track::new(
             vec![
                 Item::Emission(emission.clone(), vec![0, 1]),
                 Item::Gate(StandardGate::CX, vec![0, 1]),
@@ -536,7 +536,7 @@ mod tests {
             ],
             vec![collector(&[0, 1], vec![])],
         );
-        let (sg, source, target) = wire(&spine, 0, &emission, &[0, 1], 0, &table).unwrap();
+        let (sg, source, target) = wire(&track, 0, &emission, &[0, 1], 0, &table).unwrap();
 
         // A conjugation by a two-qubit gate mixes its wires, so it is one joint node rather than two.
         assert_eq!(conjugations(&sg), vec![(StandardGate::CX, vec![0, 1])]);
@@ -554,7 +554,7 @@ mod tests {
     fn test_a_gate_off_the_emissions_wires_is_not_chained() {
         let (table, key) = table_with(DistributionType::UniformPauli);
         let emission = emit(Direction::Right, 1, key);
-        let spine = Spine::new(
+        let track = Track::new(
             vec![
                 Item::Emission(emission.clone(), vec![0]),
                 Item::Gate(StandardGate::H, vec![1]),
@@ -562,7 +562,7 @@ mod tests {
             ],
             vec![collector(&[0], vec![])],
         );
-        let (sg, source, target) = wire(&spine, 0, &emission, &[0], 0, &table).unwrap();
+        let (sg, source, target) = wire(&track, 0, &emission, &[0], 0, &table).unwrap();
 
         assert!(conjugations(&sg).is_empty());
         // Nothing stood between them, so the emission feeds its collector directly.
@@ -573,7 +573,7 @@ mod tests {
     fn test_a_crossed_collectors_absorbed_gates_still_conjugate() {
         let (table, key) = table_with(DistributionType::UniformPauli);
         let emission = emit(Direction::Right, 2, key);
-        let spine = Spine::new(
+        let track = Track::new(
             vec![
                 Item::Emission(emission.clone(), vec![0, 1]),
                 Item::Collector(0),
@@ -585,12 +585,12 @@ mod tests {
                 collector(&[0, 1], vec![]),
             ],
         );
-        let target = spine
+        let target = track
             .resolve_collector(0, Direction::Right, &emission, &[0, 1], &table)
             .unwrap();
         assert_eq!(target, 1);
         let (sg, _source, target_node) =
-            wire(&spine, 0, &emission, &[0, 1], target, &table).unwrap();
+            wire(&track, 0, &emission, &[0, 1], target, &table).unwrap();
 
         assert_eq!(conjugations(&sg), vec![(StandardGate::H, vec![0])]);
         // Wire 0 ends on the conjugation, wire 1 still on the emission itself.
@@ -604,7 +604,7 @@ mod tests {
         // A local U2 element admits single-qubit gates only, so a CX on its wire has no rule.
         let (table, key) = table_with(DistributionType::HaarU2);
         let emission = emit(Direction::Right, 1, key);
-        let spine = Spine::new(
+        let track = Track::new(
             vec![
                 Item::Emission(emission.clone(), vec![0]),
                 Item::Gate(StandardGate::CX, vec![0, 1]),
@@ -614,11 +614,11 @@ mod tests {
         );
         // Resolution still succeeds — it is the walk that discovers there is no rule.
         assert_eq!(
-            spine.resolve_collector(0, Direction::Right, &emission, &[0], &table),
+            track.resolve_collector(0, Direction::Right, &emission, &[0], &table),
             Some(0)
         );
         assert!(matches!(
-            wire(&spine, 0, &emission, &[0], 0, &table),
+            wire(&track, 0, &emission, &[0], 0, &table),
             Err(SamplexError::NoPropagationRule {
                 virtual_type: VirtualType::U2,
                 gate: StandardGate::CX,
@@ -628,11 +628,11 @@ mod tests {
 
     #[test]
     fn test_a_pauli_survives_the_same_gate_a_u2_element_does_not() {
-        // The refusal is a property of the virtual type, not of the spine's shape: the same spine
+        // The refusal is a property of the virtual type, not of the track's shape: the same track
         // with a Pauli emission wires cleanly.
         let (table, key) = table_with(DistributionType::UniformPauli);
         let emission = emit(Direction::Right, 1, key);
-        let spine = Spine::new(
+        let track = Track::new(
             vec![
                 Item::Emission(emission.clone(), vec![0]),
                 Item::Gate(StandardGate::CX, vec![0, 1]),
@@ -640,7 +640,7 @@ mod tests {
             ],
             vec![collector(&[0], vec![])],
         );
-        let (sg, _source, _target) = wire(&spine, 0, &emission, &[0], 0, &table).unwrap();
+        let (sg, _source, _target) = wire(&track, 0, &emission, &[0], 0, &table).unwrap();
         assert_eq!(conjugations(&sg), vec![(StandardGate::CX, vec![0, 1])]);
     }
 }
