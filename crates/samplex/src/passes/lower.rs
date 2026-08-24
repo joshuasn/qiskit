@@ -40,42 +40,24 @@ use qiskit_circuit::packed_instruction::PackedInstruction;
 use qiskit_circuit::parameter::parameter_expression::ParameterExpression;
 use qiskit_circuit::parameter::symbol_expr::{Symbol, Value};
 
-use hashbrown::HashMap;
 use rustworkx_core::petgraph::stable_graph::NodeIndex;
 
 use qiskit_circuit::operations::StandardInstruction;
 
 use crate::annotated_circuit::SynthesizerType;
 use crate::distributions::DistributionTable;
-use crate::emission_circuit::Emit;
 use crate::emission_circuit_navigation::{
     Site, block_body, collect_annotation, emission_spec, is_box, is_emission,
 };
 use crate::error::{Result, SamplexError};
 use crate::parameters::ParameterTable;
 use crate::sampling_graph::{
-    AbsorbedGate, AbsorbedParam, Collect, CollectStep, Emission, LocalEmission, Measure, Node,
-    NodeKind, SamplingGraph,
+    AbsorbedGate, AbsorbedParam, CollectStep, LocalEmission, SamplingGraph,
 };
-use crate::track::{self, Track};
+use crate::track::{Collector, CollectorParams, Item, SamplingGraphBuilder, Track};
 
 /// How many angles a synthesizer needs per qubit; both are three-angle Euler decompositions.
 const PARAMS_PER_QUBIT: usize = 3;
-
-/// Where one collector's angles live in the template's parameter vector.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CollectorParams {
-    /// The collect box these angles were minted for. This is the join key: it is what lets
-    /// [`build_sampling_graph`] find the range belonging to a given graph collector without relying
-    /// on the two walks reporting their collectors in the same order.
-    pub site: Site,
-    /// The collector's qubits, ascending.
-    pub qubits: Vec<usize>,
-    pub synthesizer: SynthesizerType,
-    /// Indices into the template's parameter vector, `qubits.len() * PARAMS_PER_QUBIT` of them,
-    /// grouped per qubit in `qubits` order.
-    pub param_indices: Vec<usize>,
-}
 
 /// Build the template circuit for an emission circuit.
 ///
@@ -340,6 +322,11 @@ fn copy_with_qargs(
 /// `collectors` must come from [`build_template`] over the same circuit. Each is matched to the graph
 /// collector standing at the same [`Site`], so the two walks agreeing on *which* collect boxes exist
 /// is what is required of them, not agreeing on the order they report them in.
+///
+/// An adapter and nothing else: [`flatten`] reads the circuit into a [`Track`] and
+/// [`SamplingGraphBuilder`] takes it from there over flat data. The parameter table comes back
+/// untouched by the graph — it is minted by the reading, since the reading is what sees the absorbed
+/// angles.
 pub fn build_sampling_graph(
     dag: &DAGCircuit,
     table: &DistributionTable,
@@ -349,138 +336,8 @@ pub fn build_sampling_graph(
     let mut parameters = ParameterTable::new();
     let identity: Vec<usize> = (0..dag.num_qubits()).collect();
     flatten(dag, &[], &identity, &mut track, &mut parameters)?;
-    attach_param_indices(&mut track.collectors, collectors)?;
-
-    let mut sg = SamplingGraph::new();
-
-    // Sinks first, so an emission's walk always has a node to terminate at.
-    let mut collector_nodes = Vec::with_capacity(track.collectors.len());
-    for info in &track.collectors {
-        collector_nodes.push(sg.graph.add_node(Node::new(
-            info.qubits.clone(),
-            info.partition.clone(),
-            NodeKind::Collect(Collect {
-                synthesizer: info.synthesizer,
-                param_indices: info.param_indices.clone(),
-                steps: info.steps.clone(),
-            }),
-        )));
-    }
-
-    // One Propagate node per *conjugation*, created lazily and shared by the emissions for which it
-    // is the same conjugation. Direction and virtual type are in the key because they change what
-    // the node computes, so sharing across them would fuse operations that cannot be evaluated as
-    // one.
-    let mut gate_nodes: HashMap<track::GateKey, NodeIndex> = HashMap::new();
-    let mut emission_nodes: HashMap<usize, NodeIndex> = HashMap::new();
-
-    for (position, item) in track.items.iter().enumerate() {
-        match item {
-            track::Item::Emission(emission, qubits) => {
-                let node = sg.graph.add_node(Node::new(
-                    qubits.clone(),
-                    emission.partition.clone(),
-                    emission_kind(emission, table)?,
-                ));
-                emission_nodes.insert(position, node);
-            }
-            track::Item::Measure(qubits, clbits) => {
-                sg.graph.add_node(Node::singletons(
-                    qubits.clone(),
-                    NodeKind::Measure(Measure {
-                        clbit_indices: clbits.clone(),
-                    }),
-                ));
-            }
-            track::Item::Reset(qubits) => {
-                sg.graph
-                    .add_node(Node::singletons(qubits.clone(), NodeKind::Reset));
-            }
-            _ => {}
-        }
-    }
-
-    // Walk each emission to its target collector, wiring the conjugation chain in between.
-    // Target resolution is purely positional: scan from the emission in its travel direction to
-    // find the nearest compatible collector.
-    for (position, item) in track.items.iter().enumerate() {
-        let track::Item::Emission(emission, qubits) = item else {
-            continue;
-        };
-        let source = emission_nodes[&position];
-        // A local emission is resolved in place inside its collector's body, so it never reaches
-        // the top-level track; anything here is still travelling.
-        let direction = emission.direction.expect(
-            "a local emission never surfaces as a top-level Item::Emission — it lives inside its \
-             collector's body",
-        );
-        // Unreachable in well-formed IR2: build writes both of a box's collectors, so an emission
-        // always has a compatible collector ahead of it. Reaching this means either the pairing was
-        // broken between the two passes or a hand-built circuit has an emission nothing can collect,
-        // which would otherwise show up as a randomization that is never undone — so it is reported
-        // rather than skipped.
-        let target = track
-            .resolve_collector(position, direction, emission, qubits, table)
-            .ok_or_else(|| SamplexError::EmissionWithoutCollector {
-                qubits: qubits.clone(),
-                direction,
-            })?;
-        track.propagate(
-            &mut sg,
-            position,
-            emission,
-            qubits,
-            source,
-            target,
-            collector_nodes[target],
-            &mut gate_nodes,
-            table,
-        )?;
-    }
-    Ok((sg, parameters))
-}
-
-/// Give each graph collector the parameter range the template minted for the same collect box.
-///
-/// The join is on [`Site`] and not on position. The two readings of the emission circuit are
-/// deliberately different walks — the template keeps a content box and recurses into it, this side
-/// dissolves it onto the track — so a shared arrival order is a convention neither walk is in a position
-/// to check, and comparing counts catches a collector that went missing but not one that
-/// moved. Keyed on identity a move is simply resolved, and the failure that remains is a collect box
-/// only one walk saw, which is reported: the alternative is a range landing on the wrong synth
-/// template, which mis-randomizes a circuit that still executes and still round-trips.
-fn attach_param_indices(
-    collectors: &mut [track::Collector],
-    params: &[CollectorParams],
-) -> Result<()> {
-    let mut by_site: HashMap<&Site, &CollectorParams> = HashMap::with_capacity(params.len());
-    for entry in params {
-        // A site names one collect box, so two ranges under one site means a walk visited a node
-        // twice — the join would have no defined answer, so it is refused rather than resolved.
-        if by_site.insert(&entry.site, entry).is_some() {
-            return Err(SamplexError::DuplicateCollectorParams(entry.site.clone()));
-        }
-    }
-    for info in collectors.iter_mut() {
-        let entry = by_site
-            .remove(&info.site)
-            .ok_or_else(|| SamplexError::CollectorNotInTemplate(info.site.clone()))?;
-        info.param_indices = entry.param_indices.clone();
-    }
-    // The other direction: parameters minted for a collector no graph collector claimed. Those angles
-    // would be in the template with nothing computing them.
-    // Named in the template's own order rather than whichever key the map happens to yield, so the
-    // message is identical on every run of the same failing input; determinism is a crate invariant.
-    if let Some(entry) = params
-        .iter()
-        .find(|entry| by_site.contains_key(&entry.site))
-    {
-        return Err(SamplexError::CollectorsNotInGraph {
-            count: by_site.len(),
-            site: entry.site.clone(),
-        });
-    }
-    Ok(())
+    track.attach_param_indices(collectors)?;
+    Ok((SamplingGraphBuilder::new(track, table).build()?, parameters))
 }
 
 /// Read one absorbed gate parameter, interning it only if it is genuinely symbolic.
@@ -572,7 +429,7 @@ fn flatten(
                     }));
                 }
             }
-            track.push_collector(track::Collector {
+            track.push_collector(Collector {
                 site: Site {
                     scope: scope.to_vec(),
                     node,
@@ -587,7 +444,7 @@ fn flatten(
         }
 
         if let Some(emission) = emission_spec(inst) {
-            track.items.push(track::Item::Emission(emission, qubits));
+            track.push_item(Item::Emission(emission, qubits));
             continue;
         }
 
@@ -599,160 +456,19 @@ fn flatten(
             continue;
         }
 
-        track.items.push(match inst.op.view() {
-            OperationRef::StandardGate(gate) => track::Item::Gate(gate, qubits),
-            OperationRef::StandardInstruction(StandardInstruction::Measure) => {
-                track::Item::Measure(
-                    qubits,
-                    src.cargs_interner()
-                        .get(inst.clbits)
-                        .iter()
-                        .map(|c| c.index())
-                        .collect(),
-                )
-            }
-            OperationRef::StandardInstruction(StandardInstruction::Reset) => {
-                track::Item::Reset(qubits)
-            }
-            _ => track::Item::Opaque,
+        track.push_item(match inst.op.view() {
+            OperationRef::StandardGate(gate) => Item::Gate(gate, qubits),
+            OperationRef::StandardInstruction(StandardInstruction::Measure) => Item::Measure(
+                qubits,
+                src.cargs_interner()
+                    .get(inst.clbits)
+                    .iter()
+                    .map(|c| c.index())
+                    .collect(),
+            ),
+            OperationRef::StandardInstruction(StandardInstruction::Reset) => Item::Reset(qubits),
+            _ => Item::Opaque,
         });
     }
     Ok(())
-}
-
-/// The graph node for one emission, resolved from the table entry its `dist` key points at.
-fn emission_kind(emission: &Emit, table: &DistributionTable) -> Result<NodeKind> {
-    let entry = table
-        .get(emission.dist())
-        .ok_or(SamplexError::MissingTableEntry {
-            dist: emission.dist(),
-        })?;
-    Ok(NodeKind::Emission(Emission {
-        key: emission.dist(),
-        direction: emission.direction.expect(
-            "a local emission never surfaces as a top-level Item::Emission — it lives inside its \
-             collector's body",
-        ),
-        virtual_type: entry.virtual_type(),
-    }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::partition::Partition;
-
-    // --- The join, on the two sides built by hand ------------------------------------------------
-    //
-    // None of these needs a circuit: a `Site` is a path of node indices and both sides of the join are
-    // plain data, so what the join does with them can be pinned directly. A failed join is a
-    // `SamplexError` variant, so a test names the failure it expects rather than only that there was
-    // one.
-
-    /// A site at `node`, reached through the boxes `scope` names.
-    fn site(scope: &[usize], node: usize) -> Site {
-        Site {
-            scope: scope.iter().map(|index| NodeIndex::new(*index)).collect(),
-            node: NodeIndex::new(node),
-        }
-    }
-
-    /// One collector as the graph walk reports it, with no range attached yet.
-    fn graph_collector(site: Site) -> track::Collector {
-        track::Collector {
-            site,
-            qubits: vec![0],
-            partition: Partition::singletons(1),
-            synthesizer: SynthesizerType::RzSx,
-            param_indices: Vec::new(),
-            steps: Vec::new(),
-        }
-    }
-
-    /// One collector as the template reports it, carrying the range it minted.
-    fn template_params(site: Site, param_indices: Vec<usize>) -> CollectorParams {
-        CollectorParams {
-            site,
-            qubits: vec![0],
-            synthesizer: SynthesizerType::RzSx,
-            param_indices,
-        }
-    }
-
-    #[test]
-    fn test_a_collector_keeps_its_own_range_when_the_walks_disagree_on_order() {
-        // This is the divergence a count comparison cannot see: the same number of collectors on both
-        // sides, in opposite orders. Positionally the second collector would take the first one's
-        // angles, mis-randomizing a circuit that still executes. Keyed on the site there is nothing to
-        // get wrong — the reorder is resolved rather than carried through.
-        let template = vec![
-            template_params(site(&[], 1), vec![0, 1, 2]),
-            template_params(site(&[], 7), vec![3, 4, 5]),
-        ];
-        let mut collectors = vec![graph_collector(site(&[], 7)), graph_collector(site(&[], 1))];
-        attach_param_indices(&mut collectors, &template).unwrap();
-        assert_eq!(collectors[0].param_indices, vec![3, 4, 5]);
-        assert_eq!(collectors[1].param_indices, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn test_the_same_node_index_in_two_scopes_is_two_collectors() {
-        // Node indices are per-scope, so identity is the whole path and not its last step. A join keyed
-        // on the node alone would fuse a nested collector with a top-level one.
-        let template = vec![
-            template_params(site(&[], 3), vec![0, 1, 2]),
-            template_params(site(&[4], 3), vec![3, 4, 5]),
-        ];
-        let mut collectors = vec![
-            graph_collector(site(&[4], 3)),
-            graph_collector(site(&[], 3)),
-        ];
-        attach_param_indices(&mut collectors, &template).unwrap();
-        assert_eq!(collectors[0].param_indices, vec![3, 4, 5]);
-        assert_eq!(collectors[1].param_indices, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn test_a_collector_only_the_graph_walk_found_is_refused() {
-        // Nothing minted its angles, so there is no honest range to give it. Reported, never skipped: a
-        // collector left with an empty range would synthesize from parameters the template does not
-        // have.
-        let template = vec![template_params(site(&[], 1), vec![0, 1, 2])];
-        let mut collectors = vec![graph_collector(site(&[], 1)), graph_collector(site(&[], 9))];
-        assert!(matches!(
-            attach_param_indices(&mut collectors, &template),
-            Err(SamplexError::CollectorNotInTemplate(missing)) if missing == site(&[], 9)
-        ));
-    }
-
-    #[test]
-    fn test_a_collector_only_the_template_found_is_refused() {
-        // The other direction: angles standing in the template with nothing in the graph computing
-        // them.
-        let template = vec![
-            template_params(site(&[], 1), vec![0, 1, 2]),
-            template_params(site(&[], 9), vec![3, 4, 5]),
-        ];
-        let mut collectors = vec![graph_collector(site(&[], 1))];
-        assert!(matches!(
-            attach_param_indices(&mut collectors, &template),
-            Err(SamplexError::CollectorsNotInGraph { count: 1, site: missing })
-                if missing == site(&[], 9)
-        ));
-    }
-
-    #[test]
-    fn test_two_ranges_for_one_site_is_refused() {
-        // A site names one collect box, so the join would have no defined answer here.
-        let template = vec![
-            template_params(site(&[], 1), vec![0, 1, 2]),
-            template_params(site(&[], 1), vec![3, 4, 5]),
-        ];
-        let mut collectors = vec![graph_collector(site(&[], 1))];
-        assert!(matches!(
-            attach_param_indices(&mut collectors, &template),
-            Err(SamplexError::DuplicateCollectorParams(duplicated)) if duplicated == site(&[], 1)
-        ));
-    }
 }

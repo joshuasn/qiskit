@@ -27,8 +27,9 @@
 //! Most root modules hold one stage's vocabulary, and each file under [`passes`] is one transform.
 //! Two root modules are not stages but *readings* of IR2: [`emission_circuit_navigation`] is how a
 //! pass walks a nested emission circuit, and [`track`] is the flat reading of one that lowering
-//! resolves propagations along. Both optimizations must precede `lower`, which mints the template's
-//! parameters.
+//! resolves propagations along — together with the builder that writes IR3 out of that reading, so
+//! `lower` itself only has to get IR2 into it. Both optimizations must precede `lower`, which mints
+//! the template's parameters.
 //!
 //! `absorb_dressing` should precede `merge_collectors`, and the reason is what merging needs rather
 //! than what it does to bodies: two collectors merge only with nothing between them, and absorption is
