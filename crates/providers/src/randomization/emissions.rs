@@ -10,7 +10,7 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
-//! Emit and collect operations.
+//! The operations a lowered circuit is written in.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -29,6 +29,9 @@ pub const EMIT_NAME: &str = "emit";
 
 /// The name of the collect operation.
 pub const COLLECT_NAME: &str = "collect";
+
+/// The name of the hem operation.
+pub const HEM_NAME: &str = "hem";
 
 /// Why an emit could not be built.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -239,6 +242,8 @@ pub struct Collect {
     qubit_idxs: Vec<u32>,
 }
 
+/// Identity rather than value, since a collect stores `PackedInstruction`s and those do not
+/// compare.
 impl PartialEq for Collect {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self, other)
@@ -336,6 +341,41 @@ impl Operation for Collect {
 }
 
 impl CustomOperation for Collect {
+    fn is_unitary(&self) -> bool {
+        false
+    }
+}
+
+/// The marker standing at a twirl point, on one wire.
+///
+/// A dressing is folded in as far as its hem and no further. One per wire of a twirled box, written
+/// between the halves travelling backward and the halves travelling forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hem;
+
+impl Operation for Hem {
+    fn name(&self) -> &str {
+        HEM_NAME
+    }
+
+    fn num_qubits(&self) -> u32 {
+        1
+    }
+
+    fn num_clbits(&self) -> u32 {
+        0
+    }
+
+    fn num_params(&self) -> u32 {
+        0
+    }
+
+    fn directive(&self) -> bool {
+        true
+    }
+}
+
+impl CustomOperation for Hem {
     fn is_unitary(&self) -> bool {
         false
     }

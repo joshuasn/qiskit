@@ -16,6 +16,8 @@ pub mod annotations;
 pub mod distributions;
 pub mod emissions;
 pub mod flags;
+pub mod lower_annotations;
+pub mod navigation;
 pub mod partition;
 pub mod synthesizer;
 pub mod virtual_type;
@@ -28,4 +30,14 @@ pub use synthesizer::{Synthesizer, SynthesizerError, SynthesizerKind};
 pub enum Direction {
     Forward,
     Backward,
+}
+
+impl Direction {
+    /// The other way.
+    pub fn reverse(self) -> Self {
+        match self {
+            Self::Forward => Self::Backward,
+            Self::Backward => Self::Forward,
+        }
+    }
 }

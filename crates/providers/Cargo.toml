@@ -12,13 +12,12 @@ name = "qiskit_providers"
 num-complex.workspace = true
 rand.workspace = true
 rand_philox.workspace = true
+rustworkx-core.workspace = true
 thiserror.workspace = true
 qiskit-circuit.workspace = true
 
 [dev-dependencies]
 num-traits.workspace = true
-# Only a test uses this, to check the promotion table against the dtype lattice as a graph.
-rustworkx-core.workspace = true
 
 [dependencies.approx]
 workspace = true

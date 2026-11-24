@@ -21,9 +21,43 @@ use std::sync::Arc;
 use super::partition::Partition;
 use super::virtual_type::VirtualType;
 
+#[cfg(test)]
+use crate::program::ProgramFunction;
+
 pub use distribution::Distribution;
 pub use noise::Noise;
 pub use uniform::{HaarU2, UniformPauli};
+
+/// A distribution whose factorization the caller hands it, for test use.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Given {
+    factorization: Partition<u32>,
+}
+
+#[cfg(test)]
+impl Given {
+    pub(crate) fn new(parts: impl IntoIterator<Item = Vec<u32>>) -> Self {
+        Given {
+            factorization: Partition::new(parts).expect("a partition the test means"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Distribution for Given {
+    fn virtual_type(&self) -> VirtualType {
+        VirtualType::Pauli
+    }
+
+    fn factorization(&self) -> &Partition<u32> {
+        &self.factorization
+    }
+
+    fn program_function(&self) -> ProgramFunction {
+        unimplemented!("a given factorization is for reading rather than sampling")
+    }
+}
 
 /// The kind of distribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
